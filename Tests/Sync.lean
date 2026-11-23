@@ -1081,6 +1081,52 @@ def unitTests (c : Ctx) : IO Unit := do
     | .send _ (.have [h]) => h == h32 600 | _ => false)
   check c "late inventory: converges once the inventory arrives" w.violations.isEmpty
     (fun _ => toString w.violations)
+  -- 11d. a failed persist: notice, no retry in the same step, retry with the latest state later
+  let (_, w) ← runW (unitWorld 1) do
+    boot 0; ackPersist 0
+    putOp 0 "f" (h32 700)
+    clearLog
+    failPersist 0                       -- the host reports the write failed
+  let effs := logOf w 0
+  check c "persistFailed: saveFailed notice" (hasNotice effs (fun | .saveFailed => true | _ => false))
+  check c "persistFailed: no persist in the same step" (!effs.any (fun | .persist _ _ => true | _ => false))
+  let (_, w) ← runW { w with log := #[] } do
+    for t in [0:5] do feed 0 (.persistFailed (100 + t))   -- stale or duplicated failures
+    putOp 0 "g" (h32 701)              -- the next real event
+  let effs := logOf w 0
+  let persists := effs.filterMap (fun | .persist _ s => some s | _ => none)
+  check c "stale failures alone trigger no write" (persists.length == 1)
+    (fun _ => s!"{persists.length} persists")
+  check c "the next event retries with the latest state" (match persists, nodeOr w 0 with
+    | [s], some n => s.beq n.current && (n.current.versions "f").length == 1 && (n.current.versions "g").length == 1
+    | _, _ => false)
+  -- 11e. a host whose storage always fails: failure events alone end the exchange
+  let (_, w) ← runW (unitWorld 1) do
+    boot 0; ackPersist 0
+    clearLog
+    putOp 0 "h" (h32 702)
+  let mut m := (w.devs[0]!).m
+  let mut pending : List Nat := ((logOf w 0).filterMap (fun | .persist t _ => some t | _ => none))
+  let mut rounds := 0
+  while !pending.isEmpty && rounds < 100 do
+    let t := pending.head!
+    let (m', effs) := step m (.persistFailed t)
+    m := m'
+    pending := pending.tail ++ effs.filterMap (fun | .persist t _ => some t | _ => none)
+    rounds := rounds + 1
+  check c "always-failing host: the failure loop ends after one round" (pending.isEmpty && rounds == 1)
+    (fun _ => s!"{rounds} rounds")
+  -- 11f. operations that change nothing schedule no write and no notice
+  let (_, w) ← runW (unitWorld 1) do
+    boot 0; ackPersist 0
+    putOp 0 "k" (h32 703); ackPersist 0
+    clearLog
+    feed 0 (.localOp (.putMany []))
+    feed 0 (.localOp (.deleteMany [{ path := "absent", supersedes := none }]))
+  let effs := logOf w 0
+  check c "no-op operations: no persist" (!effs.any (fun | .persist _ _ => true | _ => false))
+  check c "no-op operations: no indexChanged" (!hasNotice effs (fun | .indexChanged => true | _ => false))
+  check c "no-op operations: not dirty" (match nodeOr w 0 with | some n => !n.dirty | none => false)
   -- 12. too many peers
   let (_, w) ← runW (unitWorld 1) do
     boot 0; ackPersist 0
@@ -1164,12 +1210,12 @@ def randomEffects (st : State) : RM (List Effect) := do
     let hs ← randomHashes (1 + (← rr 30))
     let t ← rr 100
     let hi ← rr 10
-    let ni ← rr 13
+    let ni ← rr 14
     let ri ← rr 3
     let notices : Array Notice := #[Notice.indexChanged, .blobsChanged, .peerStatus p .inSync (some ⟨1, 2⟩),
       .peerClosed p .incompatible true, .peerLeft p, .peerError p (.badVersion 7), .rollbackDetected,
       .opRejected "nope é", .badEvent .trailing, .startupFailed .nonCanonical, .notInitialized,
-      .alreadyInitialized, .pendingSummary 3 5 4]
+      .alreadyInitialized, .pendingSummary 3 5 4, .saveFailed]
     let replies : Array Reply := #[Reply.snapshot [("a", [⟨h32 1, true⟩, ⟨h32 2, false⟩]), ("b", [])],
       .pending [(h32 3, .waiting), (h32 4, .requested p), (h32 5, .queued)], .status true false true [(p, .syncing)]]
     let e : Effect :=

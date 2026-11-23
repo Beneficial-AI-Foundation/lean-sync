@@ -121,6 +121,7 @@ Notices for the UI:
 - `peerStatus p (handshaking|syncing|inSync) replica`, `peerClosed`, `peerLeft`, `peerError`;
 - `pendingSummary fetching queued waiting`, which separates "being fetched", "queued behind a
   peer whose request slots are full", and "nobody reachable has it" (§5);
+- `saveFailed`: the host could not store the state; changes are not durable yet (§3);
 - `rollbackDetected`, `opRejected`, `badEvent`, `startupFailed`, `notInitialized`,
   `alreadyInitialized`.
 
@@ -147,8 +148,14 @@ acknowledged.
 - When no persist is in flight, the end-of-step pass emits `persist nextTag current`.
 - On `persisted tag d` with the in-flight tag, `published := ⟨that state, d⟩`. Other tags, stale
   or duplicate, are ignored.
-- `persistFailed tag` clears the in-flight persist and sets `dirty`. The next event retries; the
-  host decides when to call again.
+- `persistFailed tag` clears the in-flight persist, keeps the state `dirty`, and notifies
+  `saveFailed`: recent changes are not durable, and nothing newer is sent to peers.
+  - **No retry in the same step** (proved: `persistFailed_no_retry_in_step`). Any `persistFailed`
+    event sets `holdPersist`, and the persist pass of that step only clears it. The retry, with
+    the latest state, comes on the next event.
+  - So a host whose storage keeps failing cannot be driven into a write loop by failure events
+    alone. It decides when to try again, by sending any event after its back-off; `query .status`
+    works as a no-op nudge.
 
 **At most one persist is ever in flight.** Later changes are folded into the next persist. The
 host therefore never has two writes racing, and an earlier write can never overtake a later one.
@@ -199,6 +206,15 @@ is idempotent and only grows the state.
 
 **Local edit mid-session.** The edit is persisted; once acknowledged, the peer gets `digest`, and
 gets `state` unless it already announced that digest.
+
+**Operations that change nothing** schedule no write and no notice: an empty batch, or deleting an
+absent path. The new state is compared with `current` by `State.beq`, one loop over both lists,
+before the size check. That costs O(n), like the operation itself, about a millisecond at 20k
+entries. The blobs the operation names are still recorded.
+- A received state whose merge changes nothing was already handled this way: no write, no
+  `indexChanged`.
+- It is still encoded once for the size check before that comparison. That costs one encoding per
+  duplicate state, and I left it.
 
 **Cost (accepted for the demo).** One edit costs one whole-state send per connected peer. Each
 entry encodes to about 37 bytes plus its path, so 20k files with short paths come to about 1 MB
@@ -380,7 +396,9 @@ synced; blobs on disk are kept. The same event is used for a first start on empt
 1. **The record.** Store `{replicaId, stateBytes}` in **one** atomic IndexedDB transaction for each
    `persist tag stateBytes`, replacing the previous record.
    - Only after the transaction commits, send `persisted tag SHA-256(stateBytes)`.
-   - If it fails, send `persistFailed tag`; back-off is the host's job.
+   - If it fails, send `persistFailed tag`. Lean will not retry in that step; after your back-off,
+     send any event (for example `query .status`) and Lean issues the retry with the latest
+     state. Show the `saveFailed` notice to the user until a later persist succeeds.
    - Lean never has two persists outstanding. Do not reorder writes.
 2. **Blobs.** Store a blob durably, after verifying its SHA-256, *before* sending `blobStored`.
    For a local edit, store the blob *before* sending the `localOp` that refers to it.
@@ -479,12 +497,25 @@ All of these are proved in `LeanSync/Laws.lean`, with lemmas in `StepProofs.lean
   only that they fit the size limits. This makes `effects_executable` stronger.
 - `decodeEffects_encodeEffects`, `step_effects_ok` and `process_output_decodes` are new.
 
+**After the second review (no theorem statement changed):**
+- `Node` gains the field `holdPersist`.
+- `persistPass` emits nothing on a step that handled `persistFailed`.
+- `Notice.saveFailed` is new, effects notice tag 13.
+- `persistFailed_no_retry_in_step` is new.
+
 **Re-run the no-placeholder claim:** `scripts/check-proofs.sh`.
 - **Forbidden constructs.** `scripts/check-forbidden.sh` looks for `sorry`, `axiom`,
   `native_decide`, `implemented_by`, `unsafe` and `partial` as whole words anywhere outside
-  comments and string literals. It therefore catches `private partial def`, `@[inline] unsafe def`
-  and `protected axiom`. The script first self-tests on four planted constructs.
-- **Axioms.** It runs `#print axioms` on every theorem listed in `scripts/Axioms.lean` (26). Each
+  comments, character literals and string literals. Character literals are handled first, so
+  `'"'` does not open a string. It therefore catches `private partial def`,
+  `@[inline] unsafe def` and `protected axiom`. The script first self-tests on five planted
+  constructs, one of them after a `'"'` literal.
+- **Build log.** Independently of the scanner, `lake build` must report no "declaration uses
+  `sorry`" warning; Lake replays the warnings of cached modules. The pattern is self-tested on a
+  file that uses `sorry`. `test-crdt.sh` checks the build log the same way.
+  - A `sorry` planted in `Laws.lean` was caught by both the scanner and the build-log check, then
+    removed.
+- **Axioms.** It runs `#print axioms` on every theorem listed in `scripts/Axioms.lean` (27). Each
   must report, and the only axioms allowed are `propext`, `Classical.choice` and `Quot.sound`.
   Fewer, or none, is accepted.
 
@@ -505,7 +536,7 @@ All of these are proved in `LeanSync/Laws.lean`, with lemmas in `StepProofs.lean
 All of these passed in the final run, both with the default stack and with
 `LEAN_STACK_SIZE_KB=256`.
 
-**`unit`** (53 checks) covers every flow of §4 to §7:
+**`unit`** (61 checks) covers every flow of §4 to §7:
 - the persist-before-send ordering;
 - stale and duplicate acknowledgements;
 - protocol errors: before hello, bad version, own id;
@@ -517,6 +548,13 @@ All of these passed in the final run, both with the default stack and with
 - the pending summary and the queries;
 - **queued versus waiting:** 33 missing blobs and one peer give summary (32, 1, 0), and the
   `pending` reply lists 32 requested, 1 queued, 0 waiting;
+- **failed persist:**
+  - a `saveFailed` notice, and no persist in the same step;
+  - five stale failure events trigger no write;
+  - the next event writes the latest state;
+- **always-failing host:** the failure loop ends after one round;
+- **no-op operations** (empty batch, delete of an absent path): no persist, no `indexChanged`,
+  not dirty;
 - **late inventory:** a restart with an empty `init` inventory and a peer connecting early. The
   blob shows as waiting, then a `blobsStored` batch makes Lean send `have`, and the devices
   converge.
