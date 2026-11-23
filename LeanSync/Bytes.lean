@@ -183,8 +183,8 @@ theorem readVar_sound : ∀ f, Sound (readVar f) encVar (fun _ => True)
         obtain ⟨rfl, rfl⟩ := h
         have hx : b[pos].toNat < 128 := hsmall
         refine ⟨trivial, ?_, ?_⟩
-        · rw [encVar, if_pos hx]; simp
-        · rw [bytesFrom_of_lt hlt, encVar, if_pos hx]
+        · rw [encVar, ite_eq_left hx]; simp
+        · rw [bytesFrom_of_lt hlt, encVar, ite_eq_left hx]
           simp [Nat.toUInt8, UInt8.ofNat_toNat]
       · next hbig =>
         split at h
@@ -203,8 +203,8 @@ theorem readVar_sound : ∀ f, Sound (readVar f) encVar (fun _ => True)
             have hmod : (b[pos].toNat - 128 + 128 * v) % 128 = b[pos].toNat - 128 := by omega
             have hdiv : (b[pos].toNat - 128 + 128 * v) / 128 = v := by omega
             refine ⟨trivial, ?_, ?_⟩
-            · rw [encVar, if_neg hge, hmod, hdiv]; simp [hp]; omega
-            · rw [bytesFrom_of_lt hlt, encVar, if_neg hge, hmod, hdiv, hb]
+            · rw [encVar, ite_eq_right hge, hmod, hdiv]; simp [hp]; omega
+            · rw [bytesFrom_of_lt hlt, encVar, ite_eq_right hge, hmod, hdiv, hb]
               have : (b[pos].toNat - 128 + 128).toUInt8 = b[pos] := by
                 rw [Nat.sub_add_cancel hx]; simp [Nat.toUInt8, UInt8.ofNat_toNat]
               simp [this]
@@ -216,18 +216,18 @@ theorem readVar_complete : ∀ f n b pos rest, (encVar n).length ≤ f →
   | 0, n, _, _, _, hl, _ => by have := encVar_ne_nil n; cases h : encVar n <;> simp_all
   | f + 1, n, b, pos, rest, hl, h => by
     by_cases hn : n < 128
-    · rw [encVar, if_pos hn] at h hl ⊢
+    · rw [encVar, ite_eq_left hn] at h hl ⊢
       obtain ⟨hlt, hx, _⟩ := bytesFrom_cons h
       have : b[pos].toNat = n := by rw [hx]; exact toUInt8_toNat_of_lt (by omega)
       simp [readVar, hlt, UInt8.lt_iff_toNat_lt, this, hn]
-    · rw [encVar, if_neg hn] at h hl
+    · rw [encVar, ite_eq_right hn] at h hl
       obtain ⟨hlt, hx, hrest⟩ := bytesFrom_cons h
       have hxn : b[pos].toNat = n % 128 + 128 := by rw [hx]; exact toUInt8_toNat_of_lt (by omega)
       have ih := readVar_complete f (n / 128) b (pos + 1) rest (by simp at hl; omega) hrest
       have hnz : n / 128 ≠ 0 := by omega
       have hbig : ¬ b[pos] < 128 := by rw [UInt8.lt_iff_toNat_lt]; simp [hxn]
-      rw [encVar, if_neg hn]
-      simp only [readVar, hlt, dite_true, hbig, if_false, ih, hnz, Except.ok.injEq, Prod.mk.injEq,
+      rw [encVar, ite_eq_right hn]
+      simp only [readVar, hlt, dite_true, hbig, ite_false, ih, hnz, Except.ok.injEq, Prod.mk.injEq,
         List.length_cons]
       constructor
       · rw [hxn]; omega
@@ -324,7 +324,7 @@ theorem readBytes_complete (n : Nat) :
   have hxl : x.data.toList.length = n := by rw [Array.length_toList, ByteArray.size_data]; exact hx
   have hle : pos + n ≤ b.size := by have := le_size_of_bytesFrom hpos h; rw [hxl] at this; exact this
   unfold readBytes
-  rw [if_pos hle, hxl]
+  rw [ite_eq_left hle, hxl]
   congr
   apply ByteArray.eq_of_toList
   rw [toList_extract, show pos + n - pos = n by omega]
@@ -372,7 +372,7 @@ theorem readDigest_sound : Sound readDigest encDigest (fun _ => True) := by
   · next hle =>
     simp only [Except.ok.injEq, Prod.mk.injEq] at h
     obtain ⟨rfl, rfl⟩ := h
-    have := readBytes_sound 32 b pos _ _ (by unfold readBytes; rw [if_pos hle])
+    have := readBytes_sound 32 b pos _ _ (by unfold readBytes; rw [ite_eq_left hle])
     exact ⟨trivial, this.2⟩
   · cases h
 
@@ -384,12 +384,12 @@ theorem readDigest_complete : Complete readDigest encDigest (fun _ => True) := b
   · next hle =>
     simp only [Except.ok.injEq, Prod.mk.injEq] at this
     unfold readDigest
-    rw [dif_pos hle]
+    rw [dite_eq_left hle]
     have hl : (encDigest x).length = 32 := by
       simp [encDigest, ByteArray.size_data, x.size_eq]
     rw [hl]
     congr
-    cases x; simp only [Digest.mk.injEq]; exact this.1
+    cases x; exact this.1
   · cases this
 
 /-! ## Strings: varint byte length, then UTF-8 (validated) -/

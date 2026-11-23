@@ -126,7 +126,7 @@ theorem decodeTop_complete {α} {p : Parser α} {enc : α → List UInt8} {ok : 
   have hsz : b.size = (enc x).length := by rw [← ByteArray.size_data, ← Array.length_toList, hb]
   have := hp b 0 x [] (Nat.zero_le _) hx (by rw [bytesFrom_zero, hb]; simp)
   unfold decodeTop
-  rw [if_pos (by omega), this]
+  rw [ite_eq_left (by omega), this]
   simp [hsz]
 
 /-! ## Context (version vector) entries -/
@@ -797,7 +797,7 @@ theorem readMsgBody_complete : Complete readMsgBody encMsgBody Message.WireOk :=
     simp only [encState, List.length_append, List.length_cons, List.length_nil] at hsz
     simp only [readMsgBody, e0, readStateMsg, e1, e2]
     simp [encMsgBody]
-    rw [if_pos (by omega)]
+    rw [ite_eq_left (by omega)]
     congr 2; omega
   | want hs =>
     obtain ⟨e0, h1, hp1⟩ := tagOk 3 (encBatch hs) (by rw [h]; rfl)

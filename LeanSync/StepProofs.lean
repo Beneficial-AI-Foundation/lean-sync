@@ -1177,7 +1177,7 @@ theorem onMessage_effs (n : Node) (s : Session) (msg : Message) :
             · exact heff_ite_notify _ _ e he
             · trivial
       · split at he <;>
-        · simp only [List.mem_append, List.mem_cons, List.mem_singleton, List.not_mem_nil, or_false] at he
+        · simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false] at he
           rcases he with ((rfl | rfl) | he) | rfl
           · trivial
           · trivial
@@ -1454,7 +1454,7 @@ theorem finish_keeps {n : Node} (h : n.Inv) {x : Nat × State} (hi : n.inflight 
   · rw [(finish_frame n).2]; unfold persistPass; simp [hi]
   · have := (finish_persist h he).1; rw [hi] at this; cases this
 
-theorem finish_inflight_cases {n : Node} (h : n.Inv) {t : Nat} {s : State}
+theorem finish_inflight_cases {n : Node} (_h : n.Inv) {t : Nat} {s : State}
     (hi : (finish n).1.inflight = some (t, s)) : .persist t s ∈ (finish n).2 ∨ n.inflight = some (t, s) := by
   rw [(finish_frame n).1] at hi
   unfold persistPass at hi
@@ -2060,9 +2060,9 @@ theorem closeWith_exec {v : HostView} {n : Node} (hr : PreRel v n) {p : PeerId} 
     (r : CloseReason) (extra : List Effect) (hextra : ∀ e ∈ extra, ∃ x, e = .notify x) :
     ∃ v', v.execAll (closeWith n p r extra).2 = some v' ∧ PreRel v' (closeWith n p r extra).1 := by
   refine ⟨{ v with peers := v.peers.filter (· ≠ p) }, ?_, ?_⟩
-  · simp only [closeWith, List.cons_append, List.singleton_append, HostView.execAll]
+  · simp only [closeWith, List.cons_append, HostView.execAll]
     rw [exec_send (m := .bye r) hp trivial]
-    simp only [HostView.exec, hp, ite_true, HostView.execAll]
+    simp only [HostView.exec, hp, ite_true]
     rw [execAll_append, List.nil_append, execAll_benign _ extra (fun e he => by obtain ⟨x, rfl⟩ := hextra e he; rfl)]
     rfl
   · refine ⟨fun x hx => ?_, hr.2.1, hr.2.2⟩
@@ -2275,10 +2275,10 @@ theorem handle_exec {v : HostView} {n : Node} (hn : n.Inv) (hr : PreRel v n) (ev
       · next ht => subst ht; exact ⟨_, rfl, hrel _ rfl rfl (by simp [hr.2.2, hi])⟩
       · next ht =>
         have : v.pendingPersist ≠ some t := by rw [hr.2.2, hi]; simp; exact ht
-        exact ⟨_, rfl, hrel _ rfl rfl (by rw [if_neg this, hr.2.2])⟩
+        exact ⟨_, rfl, hrel _ rfl rfl (by rw [ite_eq_right this, hr.2.2])⟩
     · next hi =>
       have : v.pendingPersist = none := by rw [hr.2.2]; cases h : n.inflight <;> simp_all
-      exact ⟨_, rfl, hrel _ rfl rfl (by rw [if_neg (by rw [this]; simp), hr.2.2])⟩
+      exact ⟨_, rfl, hrel _ rfl rfl (by rw [ite_eq_right (by rw [this]; simp), hr.2.2])⟩
   | persistFailed t =>
     have hrel := answer_rel hr t (.persistFailed t) (.inr rfl)
     simp only [handle]
@@ -2288,10 +2288,10 @@ theorem handle_exec {v : HostView} {n : Node} (hn : n.Inv) (hr : PreRel v n) (ev
       · next ht => subst ht; exact ⟨_, rfl, hrel _ rfl rfl (by simp [hr.2.2, hi])⟩
       · next ht =>
         have : v.pendingPersist ≠ some t := by rw [hr.2.2, hi]; simp; exact ht
-        exact ⟨_, rfl, hrel _ rfl rfl (by rw [if_neg this, hr.2.2])⟩
+        exact ⟨_, rfl, hrel _ rfl rfl (by rw [ite_eq_right this, hr.2.2])⟩
     · next hi =>
       have : v.pendingPersist = none := by rw [hr.2.2]; cases h : n.inflight <;> simp_all
-      exact ⟨_, rfl, hrel _ rfl rfl (by rw [if_neg (by rw [this]; simp), hr.2.2])⟩
+      exact ⟨_, rfl, hrel _ rfl rfl (by rw [ite_eq_right (by rw [this]; simp), hr.2.2])⟩
   | blobStored h src =>
     have hr1 : PreRel (v.onEvent (.blobStored h src)) n :=
       preRel_mono hr (fun p hp => hp) (fun z hz => by simp only [HostView.onEvent]; rw [mem_addBlobs]; exact .inl hz) rfl
@@ -2344,7 +2344,7 @@ theorem step_exec {v : HostView} {m : Machine} (hm : m.Inv) (hr : HostRel v m) (
     have hpend : ∀ ev, (v.onEvent ev).pendingPersist = none := by
       intro ev
       cases ev <;> simp only [HostView.onEvent] <;> (try split) <;> (try cases ‹LocalOp›) <;>
-        simp_all [HostRel, HostView.onEvent, HostView.addBlobs]
+        simp_all [HostRel, HostView.addBlobs]
     -- starting a node: `finish` on the fresh node
     have hstart : ∀ (self : ReplicaId) (s : State) (bs : List Hash), s.WireOk →
         (∀ z ∈ bs, z ∈ (v.onEvent ev).blobs) →
