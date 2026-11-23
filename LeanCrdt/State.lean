@@ -63,7 +63,11 @@ def beq (a b : State) : Bool := a.entries == b.entries && a.context.entries == b
 /-! ## Merge -/
 
 /-- Join: `context` is the pointwise max. An entry survives iff it is in both states, or it is
-in one state and the other has not seen its dot. One linear pass over both entry lists. -/
+in one state and the other has not seen its dot. One pass over both entry lists, but not
+linear: cost O(n + m) entry comparisons plus, for every entry present on one side only, one
+`covers` lookup that scans the other context, i.e. O((n + m) · r) in the worst case, for n, m
+entries and r replica ids in the contexts (plus O(r) for the context merge). Effectively linear
+while r stays small (a handful of replica ids) or the states mostly agree. -/
 def merge (a b : State) : State where
   entries := mergeWith (fun e => !b.context.covers e.dot) (fun e => !a.context.covers e.dot)
     a.entries b.entries
@@ -99,7 +103,8 @@ def versionsOf (l : List Entry) (p : String) : List Hash :=
   sortedSetOf ((l.filter (fun e => e.path == p)).map (·.hash))
 
 /-- Distinct hashes of the current versions of `p`, strictly sorted by `Hash` order (bytes).
-`[]` means the path does not exist. Linear in the number of entries. -/
+`[]` means the path does not exist. Cost: O(n) to scan the n entries, plus O(k²) to sort and
+deduplicate the k entries at `p` (`sortedSetOf`). -/
 def versions (s : State) (p : String) : List Hash := versionsOf s.entries p
 
 /-- More than one distinct current version: a conflict for the user to resolve. -/
@@ -118,8 +123,10 @@ def snapStep (acc : List (String × List Hash)) (e : Entry) : List (String × Li
   | (q, hs) :: rest => if q = e.path then (q, union [e.hash] hs) :: rest else (e.path, [e.hash]) :: acc
   | [] => [(e.path, [e.hash])]
 
-/-- Every existing path with its versions, in one linear pass (proved equal to
-`s.paths.map (fun p => (p, s.versions p))`). -/
+/-- Every existing path with its versions, in one pass over the entries (proved equal to
+`s.paths.map (fun p => (p, s.versions p))`). Cost: O(n + Σ_p k_p²), where k_p is the number of
+entries at path `p` (each sibling is inserted into its path's sorted list); O(n) while
+siblings are rare. -/
 def snapshot (s : State) : List (String × List Hash) := s.entries.reverse.foldl snapStep []
 
 /-! ## Local operations
@@ -134,7 +141,8 @@ theorem sorted_single (e : Entry) : StrictlySorted [e] := List.pairwise_singleto
 
 /-- Write version `h` of `p`, superseding the local versions of `p` whose hash is in
 `supersedes` (normally: the versions the host had seen). Versions not listed, including any
-that arrived by merge after the host looked, are kept as siblings. -/
+that arrived by merge after the host looked, are kept as siblings. Cost: O(n + r + k·|S|) for
+n entries, r context entries and k entries at `p`. -/
 def put (s : State) (self : ReplicaId) (p : String) (h : Hash) (supersedes : List Hash) : State where
   entries := union [⟨p, ⟨self, s.context.get self + 1⟩, h⟩]
     (s.entries.filter (fun x => !superseded p supersedes x))
@@ -153,7 +161,7 @@ def put (s : State) (self : ReplicaId) (p : String) (h : Hash) (supersedes : Lis
 
 /-- Delete the local versions of `p` whose hash is in `supersedes`. Issues no dot and leaves no
 per-path tombstone: the deleted entries stay covered by `context`. Pass `s.versions p` to
-delete everything seen. -/
+delete everything seen. Cost: O(n + k·|S|). -/
 def delete (s : State) (p : String) (supersedes : List Hash) : State where
   entries := s.entries.filter (fun x => !superseded p supersedes x)
   context := s.context
@@ -326,9 +334,10 @@ theorem bound_of_mem_sorted {items : List PutItem} {c : Nat} {t : PutItem × Nat
   simp only; omega
 
 /-- Batch put, in one pass: equal to `putSeq` (the `put`s one after the other, item `i`
-getting counter `context.get self + 1 + i`), as proved by `putMany_eq_putSeq`. Cost:
-O(k log k) to sort the k items, plus one merge-like pass over the state. If two items have
-the same path, it falls back to `putSeq`. -/
+getting counter `context.get self + 1 + i`), as proved by `putMany_eq_putSeq`. Cost, for b
+items and n entries: O(b log b) to sort the items, plus one pass over the state, i.e.
+O(b log b + n + r) plus O(|S|) per entry at a batch path. If two items have the same path, it
+falls back to `putSeq`, which costs O(b · n). -/
 def putMany (s : State) (self : ReplicaId) (items : List PutItem) : State :=
   let sortedT := (items.zipIdx (s.context.get self + 1)).mergeSort itemLe
   if h : strictPaths sortedT = true then

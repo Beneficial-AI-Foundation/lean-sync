@@ -74,7 +74,8 @@ The proofs follow one pattern:
 Why this beats a hash map up to equivalence:
 - no quotient, and no congruence proofs for every operation and query;
 - no `Std` import, so no `HashMap` lemma modules are linked into the wasm (see the spike);
-- merge is a single linear pass;
+- merge is a single pass over both entry lists. It is linear only while the number of replica ids
+  r stays small; see "Cost" below;
 - every observable order is a byte or number order that is the same on native and wasm:
   - `String` uses `lean_string_compare` (UTF-8 bytes, the same as code-point order);
   - `ByteArray` uses `lean_byte_array_compare`;
@@ -90,13 +91,13 @@ bytes. A decoder must re-check sortedness, positivity and coverage to rebuild th
 |---|---|
 | `empty`, `merge a b`, `mergeAll l` | join; `mergeAll` folds `merge` from `empty` |
 | `put s self p h supersedes` | write version `h` of `p` with dot `(self, ctx(self)+1)`; drop the local versions of `p` whose hash is in `supersedes` |
-| `putMany s self items` | batch put in one pass; **proved equal** to the `put`s one after the other (`putSeq`) |
+| `putMany s self items` | batch put: sort the batch, then one pass over the state; **proved equal** to the `put`s one after the other (`putSeq`) |
 | `delete s p supersedes` | drop the local versions of `p` whose hash is in `supersedes`; issues no dot |
 | `resolve s self p h` | `put s self p h (s.versions p)`: supersede every seen version (also the normal "edit") |
 | `paths s` | existing paths, strictly sorted by UTF-8 bytes |
 | `versions s p` | distinct current hashes of `p`, strictly sorted; `[]` = absent |
 | `isConflicted s p` | `(versions s p).length ≥ 2` |
-| `snapshot s` | every path with its versions, in one pass |
+| `snapshot s` | every path with its versions, in one pass over the entries |
 | `beq a b` | literal equality, computed with loops |
 
 `self` is passed explicitly: the state is shared data and carries no notion of which replica owns it.
@@ -193,6 +194,9 @@ forbidden constructs and runs the following tests:
   - the non-tail *specification* `mergeSpec` must crash on the scale sizes, at about 4,850
     elements per list;
   - scale, unit and sim must pass.
+  - "Crash" means exit status 134 (SIGABRT) **and** the runtime's "Stack overflow detected"
+    message. Any other failure counts as a test failure. A self-check confirms that a bogus
+    subcommand, which exits 2, is not mistaken for an overflow.
 
   The 20k scale test also passes at 64 KB (about 6,000 trivial frames), as does a 100k-path run.
   Caveat: native and wasm frame sizes differ. The calibration is in frames of a trivial function.
@@ -207,6 +211,34 @@ Measured on this machine with `crdt-tests bench [n]` (native, indicative):
 
 The whole 20k scale test takes about 0.6 s. Most of that is its 2,858 single deletes: each one is O(n).
 
+## Cost (true bounds)
+
+Notation:
+- n, m: number of entries (live versions) in each state;
+- r: entries in a context, i.e. replica ids that have **ever** edited, including retired devices,
+  reinstalls and fresh ids;
+- k: entries at one path, i.e. its siblings;
+- b: items in a batch;
+- |S|: length of a `supersedes` list.
+
+Costs count comparisons of paths, hashes and ids.
+
+| Operation | Cost | Effectively linear when |
+|---|---|---|
+| `merge` | O(n + m) comparisons, plus one `covers` lookup (an O(r) scan of the other context) per entry present on one side only: **O((n + m)·r)** worst case, plus O(r) for the context | r is a handful, or the states mostly agree |
+| `versions`, `isConflicted` | O(n) scan + **O(k²)** sort and dedup of the path's hashes | siblings are rare (k ≤ a few) |
+| `snapshot` | **O(n + Σₚ kₚ²)** | siblings are rare |
+| `paths` | O(n) | always |
+| `put` | O(n + r + k·\|S\|) | always, for small r and k |
+| `delete` | O(n + k·\|S\|) | always, for small k |
+| `putMany` | O(b log b + n + r), plus O(\|S\|) per entry at a batch path; repeated paths fall back to `putSeq`, which is O(b·n) | paths in a batch are distinct |
+| `VersionVector.merge` | O(r) | always |
+
+With as many writer ids as entries, `merge` becomes quadratic. A path with many siblings makes
+`versions` and `snapshot` quadratic in that path's sibling count. These bounds are acceptable under
+the user's operating assumptions (a handful of replicas, rare siblings), and are listed as known
+limits below.
+
 ## Remaining risks and limitations
 
 1. **Host rule** (above). This is the one integration rule whose violation loses data.
@@ -218,6 +250,17 @@ The whole 20k scale test takes about 0.6 s. Most of that is its 2,858 single del
    wasm are not yet measured.
 4. **Deltas later** need non-contiguous contexts (dot sets) or causal delivery. The version-vector
    context is correct for whole-state merges only.
-5. **Stack.** Executable code uses only self tail calls and core functions that have tail-recursive
+5. **`merge` is O((n + m)·r)** (see "Cost"). `covers` scans the context list for every one-sided
+   entry. It is fine for a handful of replica ids, but r counts every id ever used and never shrinks.
+   Suggested fix, not implemented: index the other context once per merge, for example as a sorted
+   `Array` searched by binary search, giving O((n + m)·log r). It needs a new lemma that the indexed
+   lookup equals `VersionVector.get`; the merge laws themselves would not change.
+6. **`versions`/`snapshot` are quadratic in the siblings of one path** (`sortedSetOf` and
+   `snapStep` insert each hash into a sorted list). Suggested fix, not implemented: collect the
+   path's hashes, then sort once (`List.mergeSort`, tail-recursive in core) and drop adjacent
+   duplicates, giving O(k log k). Its proof obligations are the same kind as `putMany`'s
+   (permutation, sortedness, then strict sortedness after dedup), and `versionsOf_eq` would carry
+   the rest over unchanged.
+7. **Stack.** Executable code uses only self tail calls and core functions that have tail-recursive
    implementations. `Tests/` itself uses a `partial def` of logarithmic depth. The stack test guards
    this; it is calibrated natively, not in a browser.

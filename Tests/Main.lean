@@ -315,8 +315,14 @@ def scaleTests (c : Ctx) (n : Nat) : IO Unit := do
   let m2 := m.resolve A p0 (hs "r")
   check c "scale: resolve" (m2.versions p0 == [hs "r"] && !m2.isConflicted p0)
   let m3 := m2.put B "zzz/new" (hs "n") [] |>.delete "dir1/file1.txt" [hs "a1"]
-  check c "scale: single ops" (m3.paths.length == ps.length && m3.versions "zzz/new" == [hs "n"]
-    && m3.versions "dir1/file1.txt" == [])
+  -- expected path count from the paths actually present in `m2` (correct for any `n`):
+  -- "zzz/new" is added if absent; "dir1/file1.txt" disappears iff its only version is "a1"
+  let added := if m2.versions "zzz/new" == [] then 1 else 0
+  let removed := if m2.versions "dir1/file1.txt" == [hs "a1"] then 1 else 0
+  let expectedM3 := m2.paths.length + added - removed
+  check c "scale: single ops" (m3.paths.length == expectedM3 && m3.versions "zzz/new" == [hs "n"]
+    && (m3.versions "dir1/file1.txt").all (· != hs "a1"))
+    (fun _ => s!"{m3.paths.length} vs {expectedM3}")
   -- single puts on a state built one put at a time (small, quadratic)
   let small := (List.range 300).foldl (fun s i => s.put A s!"p{i}" (hs s!"{i}") []) State.empty
   check c "single puts" (small.paths.length == 300 && small.beq (State.empty.putMany A

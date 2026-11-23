@@ -3,8 +3,8 @@ import LeanCrdt.Types
 /-!
 # Strictly sorted lists as finite sets
 
-Executable module (imports `Init` only). Provides the one generic linear merge used for
-entries, plus its correctness theory:
+Executable module (imports `Init` only). Provides the one generic merge used for entries
+(one pass: O(|xs| + |ys|) comparisons and predicate calls), plus its correctness theory:
 
 * `eq_of_sorted_of_mem_iff`: two strictly sorted lists with the same members are equal
   (this is what makes the representation canonical);
@@ -108,8 +108,10 @@ def mergeGo (ka kb : α → Bool) : List α → List α → List α → List α
     | .eq => mergeGo ka kb xs ys (x :: acc)
 termination_by xs ys => xs.length + ys.length
 
-/-- Linear merge of two strictly sorted lists: keep elements in both; keep elements of only
-`xs` satisfying `ka`; keep elements of only `ys` satisfying `kb`. -/
+/-- One-pass merge of two strictly sorted lists: keep elements in both; keep elements of only
+`xs` satisfying `ka`; keep elements of only `ys` satisfying `kb`. Cost: O(|xs| + |ys|)
+comparisons, plus one call of `ka`/`kb` per element present on one side only (the predicates'
+own cost is the caller's). -/
 @[inline] def mergeWith (ka kb : α → Bool) (xs ys : List α) : List α := mergeGo ka kb xs ys []
 
 /-- Sorted union of two strictly sorted lists. -/
@@ -263,7 +265,9 @@ section SetOf
 variable {α : Type} [Ord α] [TransOrd α] [LawfulEqOrd α]
 
 /-- Strictly sorted, duplicate-free list of the elements of `l` (tail-recursive fold of
-`union`; quadratic in `l.length`, meant for short lists such as the siblings of one path). -/
+`union`). Cost O(k²) comparisons for k = `l.length`: each insertion rebuilds the accumulator.
+Meant for short lists, such as the sibling hashes of one path; a collect-sort-dedup
+implementation would make it O(k log k). -/
 def sortedSetOf (l : List α) : List α := l.foldl (fun acc x => union [x] acc) []
 
 theorem sortedSetOf_spec (l : List α) :

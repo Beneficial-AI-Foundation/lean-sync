@@ -31,11 +31,21 @@ echo "== full tests, default stack"
 "$BIN" all || fail=1
 
 echo "== stack test, LEAN_STACK_SIZE_KB=$STACK_KB"
+# Run under the small stack; succeed only if the run died the way a Lean stack overflow does:
+# SIGABRT (exit status 134) *and* the runtime's "Stack overflow detected" diagnostic on stderr.
+# Any other failure (usage error, panic, wrong exit code) is NOT an overflow.
+last_rc=0
+overflowed() {
+  local err
+  err=$( { LEAN_STACK_SIZE_KB=$STACK_KB "$BIN" "$@" >/dev/null; } 2>&1 )
+  last_rc=$?
+  [ "$last_rc" -eq 134 ] && grep -q "Stack overflow detected" <<<"$err"
+}
 expect_crash() {
-  if LEAN_STACK_SIZE_KB=$STACK_KB "$BIN" "$@" >/dev/null 2>&1; then
-    echo "FAIL: '$*' did not overflow: the stack limit is not tight enough to be meaningful"; fail=1
-  else
+  if overflowed "$@"; then
     echo "ok: '$*' overflowed as expected"
+  else
+    echo "FAIL: '$*' did not die of a stack overflow (exit $last_rc): the calibration did not run or the limit is not tight enough"; fail=1
   fi
 }
 expect_pass() {
@@ -45,6 +55,12 @@ expect_pass() {
     echo "FAIL: '$*' failed under the small stack"; fail=1
   fi
 }
+# Harness self-check: a bogus subcommand exits with a usage error, which must not count as an overflow.
+if overflowed no-such-subcommand; then
+  echo "FAIL: harness self-check: a bogus subcommand was taken for a stack overflow"; fail=1
+else
+  echo "ok: harness self-check: bogus subcommand (exit $last_rc) is not taken for an overflow"
+fi
 expect_crash deep 13000
 expect_crash control 20000
 expect_pass scale 20000
