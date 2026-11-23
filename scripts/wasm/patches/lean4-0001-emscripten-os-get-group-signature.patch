@@ -1,0 +1,20 @@
+Emscripten-only stub of lean_uv_os_get_group in src/runtime/uv/system.cpp takes no
+argument, while its declaration (and the libuv build) take `uint64_t gid`; the
+Emscripten build does not compile without this.
+Upstream status (checked 2026-11-23): not covered by leanprover/lean4#16089 (whose
+table lists the IO-world mismatches, not this stub) nor by the open PR #13298
+(io.cpp only). Re-check on every Lean upgrade; drop when system.cpp's stub matches.
+
+diff --git a/src/runtime/uv/system.cpp b/src/runtime/uv/system.cpp
+index 5982a3d..974acfe 100644
+--- a/src/runtime/uv/system.cpp
++++ b/src/runtime/uv/system.cpp
+@@ -630,7 +630,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_get_passwd() {
+ }
+ 
+ // Std.Internal.UV.System.osGetGroup : IO (Option GroupInfo)
+-extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_get_group() {
++extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_get_group(uint64_t gid) {
+     lean_always_assert(
+         false && ("Please build a version of Lean4 with libuv to invoke this.")
+     );

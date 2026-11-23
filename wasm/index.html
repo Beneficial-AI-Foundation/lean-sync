@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lean wasm spike</title>
+<style>
+  body { font: 15px/1.4 system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
+  textarea { width: 100%; height: 5rem; font: inherit; }
+  pre { background: #f4f4f4; padding: .75rem; white-space: pre-wrap; word-break: break-all; }
+  .err { color: #b00; }
+</style>
+</head>
+<body>
+<h1>Lean → WebAssembly spike</h1>
+<p>Loads <code>lean_demo.wasm</code> built from Lean 4 and calls the exported
+<code>WasmDemo.process : ByteArray → ByteArray</code>.
+<span id="status">loading…</span></p>
+<textarea id="input">héllo wörld — ∀ε>0 🙂</textarea>
+<button id="run" disabled>Run</button>
+<pre id="out"></pre>
+<script type="module">
+import { loadLean } from './host.mjs';
+
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+if (params.has('input')) $('input').value = params.get('input');   // used by headless checks
+
+let lean;
+try {
+  const t0 = performance.now();
+  const { default: createLeanDemo } = await import('./lean_demo.mjs');
+  lean = await loadLean(createLeanDemo);
+  const total = performance.now() - t0;
+  $('status').textContent = `ready: fetch+compile+instantiate ${lean.timings.instantiateMs.toFixed(1)} ms, ` +
+    `Lean init ${lean.timings.leanInitMs.toFixed(1)} ms, total ${total.toFixed(1)} ms`;
+  $('run').disabled = false;
+  const { input, out, display } = run();
+  report({ ok: true, status: $('status').textContent, input, out, display });
+} catch (e) {
+  $('status').innerHTML = `<span class="err">failed: ${e}</span>`;
+  console.error(e);
+  report({ ok: false, status: 'failed', error: String(e) });
+}
+
+// With ?report=1, POST the result to the dev server (wasm/serve.mjs) for headless checks.
+function report({ ok, status, input, out, display, error }) {
+  if (!params.has('report')) return;
+  const b64 = (u8) => btoa(Array.from(u8, (c) => String.fromCharCode(c)).join(''));
+  const text = out ? new TextDecoder('latin1').decode(out) : '';
+  fetch('/report', { method: 'POST', body: JSON.stringify({
+    ok, status, error, display, run: params.get('run'), userAgent: navigator.userAgent,
+    platform: (text.match(/numBits=[^\n]*/) ?? [''])[0],
+    inputB64: input ? b64(input) : '', outputB64: out ? b64(out) : '',
+  }) });
+}
+
+function run() {
+  const input = new TextEncoder().encode($('input').value);
+  const t = performance.now();
+  const out = lean.process(input);
+  const ms = performance.now() - t;
+  // Normal results are a text report followed by the reversed input bytes; probe results
+  // (`!panic`, `!deep N`) are text only.
+  const isReport = new TextDecoder().decode(out.subarray(0, 6)) === 'bytes=';
+  const report = new TextDecoder().decode(isReport ? out.subarray(0, out.length - input.length) : out);
+  $('out').textContent = `${report}\n[${out.length} bytes out, ${ms.toFixed(2)} ms]`;
+  // Machine-readable marker for headless checks.
+  document.title = `done:${out.length}`;
+  return { input, out, display: report };
+}
+$('run').onclick = run;
+</script>
+</body>
+</html>
