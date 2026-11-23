@@ -97,17 +97,23 @@ export function createCore(o) {
       await o.storage.saveRecord(replica, state, { clearRotate });   // resolves only on `complete`
       return digest;
     })();
-    st.persist = job.then((digest) => {
+    // The slot is cleared BEFORE the acknowledgement is emitted, and only if it still holds this
+    // write: processing `persisted` can start the next persist, which takes the slot.
+    const done = () => { if (st.persist === slot) st.persist = null; };
+    const slot = job.then((digest) => {
+      done();
       if (ep !== st.epoch) return;
       if (clearRotate) st.clearRotateOnSave = false;
       if (st.saveFailed) { st.saveFailed = false; st.saveBackoff = 0; clearTimeout(st.nudgeTimer); st.nudgeTimer = null; log('saving works again'); ui.onNotice({ notice: 'saveRecovered' }); }
       emit({ type: 'persisted', tag, digest }, ep);
       refresh('status', ...st.refreshWhat);
     }, (err) => {
+      done();
       if (ep !== st.epoch) return;
       log(`persist ${tag} failed: ${err?.message ?? err}`);
       emit({ type: 'persistFailed', tag }, ep);
-    }).finally(() => { if (st.epoch === ep) st.persist = null; });
+    });
+    st.persist = slot;
   }
 
   function notice(e) {
@@ -225,6 +231,7 @@ export function createCore(o) {
 
   async function restart(why, opts = {}) {
     log(`restarting the engine: ${why}`);
+    setPhase('starting');                  // leave `running` first: no edits, no pump, no queries
     st.epoch++;
     st.queue = [];
     o.links.setAccepting(false);
@@ -263,14 +270,21 @@ export function createCore(o) {
     epoch: () => st.epoch,
     replica: () => st.replica,
     canEdit,
+    // Supersession rule: every operation supersedes exactly the versions the user was shown when
+    // acting. They are captured synchronously, before any await; a version that arrives later
+    // (e.g. a peer's edit during an upload) is not superseded and becomes a conflict.
+    // `shown` (path -> [hash]) comes from the UI; versionsOf() is the snapshot the UI last rendered.
+
     /** Store each file (verified), then one putMany superseding the versions shown for that name. */
     async addFiles(files) {
       if (!canEdit()) throw new Error('editing is not possible right now');
+      const seen = files.map((f) => f.supersedes ?? versionsOf(f.name));     // before the first await
       const items = [], errors = [];
-      for (const { name, blob } of files) {
+      for (let i = 0; i < files.length; i++) {
+        const { name, blob } = files[i];
         try {
           const r = await o.storage.storeLocal(blob);
-          items.push({ path: name, hash: r.hash, supersedes: versionsOf(name) });
+          items.push({ path: name, hash: r.hash, supersedes: seen[i] });
         } catch (e) { errors.push({ name, error: e.message ?? String(e) }); log(`could not add ${name}: ${e.message}`); }
       }
       if (items.length) {
@@ -279,24 +293,33 @@ export function createCore(o) {
       }
       return { added: items.length, errors };
     },
-    deleteFiles(paths) {
+    /** items: [{path, versions: [hash] shown}] */
+    deleteFiles(items) {
       if (!canEdit()) throw new Error('editing is not possible right now');
-      emit({ type: 'deleteMany', items: paths.map((p) => ({ path: p, supersedes: versionsOf(p) })) });
+      emit({ type: 'deleteMany', items: items.map(({ path, versions }) => ({ path, supersedes: versions ?? versionsOf(path) })) });
     },
-    keepVersion(path, hash) {
+    keepVersion(path, hash, shown) {
       if (!canEdit()) throw new Error('editing is not possible right now');
-      emit({ type: 'putMany', items: [{ path, hash, supersedes: versionsOf(path) }] });
+      emit({ type: 'putMany', items: [{ path, hash, supersedes: shown ?? versionsOf(path) }] });
     },
-    keepBoth(path, keepHash, otherHash, otherName) {
+    keepBoth(path, keepHash, otherHash, otherName, shown) {
       if (!canEdit()) throw new Error('editing is not possible right now');
       if (st.lastSnapshot?.some((f) => f.path === otherName)) throw new Error(`${otherName} already exists`);
-      emit({ type: 'putMany', items: [{ path, hash: keepHash, supersedes: versionsOf(path) }, { path: otherName, hash: otherHash, supersedes: [] }] });
+      emit({ type: 'putMany', items: [{ path, hash: keepHash, supersedes: shown ?? versionsOf(path) }, { path: otherName, hash: otherHash, supersedes: [] }] });
     },
-    /** Read a stored version, verify it, return a Blob (or throw). A corrupt copy is reported lost. */
+    /** Read a stored version, verify it, return a Blob (or throw). A missing or damaged copy is
+     *  reported lost (Lean then fetches it again); other read errors are treated as transient. */
     async readVerified(hash) {
       const hx = hex(hash);
-      const file = await o.storage.blobFile(hx);
-      const data = new Uint8Array(await file.arrayBuffer());
+      let data;
+      try { data = new Uint8Array(await (await o.storage.blobFile(hx)).arrayBuffer()); }
+      catch (e) {
+        if (e?.name === 'NotFoundError') {
+          emit({ type: 'blobLost', hash });
+          throw new Error('the stored copy is missing; it will be fetched again');
+        }
+        throw new Error(`could not read the stored copy (${e?.name ?? e}); try again`);
+      }
       if (hex(await sha256(data)) !== hx) {
         await o.storage.deleteBlob(hx);
         emit({ type: 'blobLost', hash });

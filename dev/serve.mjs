@@ -5,7 +5,8 @@
 // shape the topology and inject faults. No dependencies: the WebSocket protocol (RFC 6455) is
 // implemented here on node:http / node:net.
 //
-// Relay protocol, one WebSocket per device, at /relay?room=<room>&label=<label>:
+// Relay protocol, one WebSocket per device, at /relay?room=<room>&label=<label> (only from pages of
+// this server's origin; without `room`, a random room fixed at start-up):
 //   server -> client (text JSON): {op:'welcome', id} · {op:'devices', list:[{id,label}]} ·
 //                                 {op:'link-up', link, remote:{id,label}} · {op:'link-down', link}
 //   client -> server (text JSON): {op:'link', to} (ask for a link; created if allowed and both
@@ -15,7 +16,7 @@
 // Admin API (POST JSON, all 127.0.0.1): /admin/topology {room, allow:[[labelA,labelB],...]|null}
 //   /admin/cut {room, a, b, afterBytes?}  /admin/corrupt {room, from, to}  (flip a byte in the next
 //   BLOB_DATA frame from->to)  /admin/garbage {room, from, to}  (inject a garbage Lean message)
-//   GET /admin/state
+//   GET /admin/state   (only with --admin / {admin:true}; requests with a foreign Origin are refused)
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
 import { createHash, randomBytes } from 'node:crypto';
@@ -26,7 +27,15 @@ const HOST = '127.0.0.1';
 const TYPES = { '.html': 'text/html; charset=utf-8', '.mjs': 'text/javascript', '.js': 'text/javascript',
   '.css': 'text/css', '.wasm': 'application/wasm', '.json': 'application/json', '.svg': 'image/svg+xml' };
 
-export async function startServer({ port = 0, root } = {}) {
+export async function startServer({ port = 0, root, admin: adminEnabled = false } = {}) {
+  // Loopback is not an access control: any page open in the user's browser can reach 127.0.0.1.
+  // So the relay accepts WebSocket upgrades only from pages of this server's own origin (browsers
+  // always send Origin on WebSocket handshakes), devices without an explicit room join a random
+  // room chosen at start-up, and the admin API (fault injection, used by the tests) is off unless
+  // asked for, and refuses any request that carries a foreign Origin.
+  const defaultRoom = randomBytes(16).toString('hex');
+  let ownOrigins = new Set();
+  const originOk = (o) => o !== undefined && ownOrigins.has(o);
   root = resolve(root ?? join(dirname(fileURLToPath(import.meta.url)), '../build/site'));
   const rooms = new Map();          // room -> { devices: Map id -> dev, links: Map linkId -> link, allow: Set|null }
   let nextDevice = 1, nextLink = 1;
@@ -39,7 +48,10 @@ export async function startServer({ port = 0, root } = {}) {
   const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x');
-      if (url.pathname.startsWith('/admin/')) return await admin(req, res, url);
+      if (url.pathname.startsWith('/admin/')) {
+        if (!adminEnabled || (req.headers.origin !== undefined && !originOk(req.headers.origin))) { res.writeHead(403); return res.end(); }
+        return await admin(req, res, url);
+      }
       let rel = normalize(decodeURIComponent(url.pathname)).replace(/^\/+/, '');
       if (rel === '' || rel.endsWith('/')) rel += 'index.html';
       const file = join(root, rel);
@@ -56,7 +68,7 @@ export async function startServer({ port = 0, root } = {}) {
       try { body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') ?? {}; } catch { res.writeHead(400); return res.end('bad json'); }
       if (typeof body !== 'object') { res.writeHead(400); return res.end('bad body'); }
     }
-    const r = room(body.room ?? url.searchParams.get('room') ?? 'dev');
+    const r = room(body.room ?? url.searchParams.get('room') ?? defaultRoom);
     const byLabel = (l) => [...r.devices.values()].find((d) => d.label === l);
     const linkBetween = (a, b) => [...r.links.values()].find((k) => (k.a === a && k.b === b) || (k.a === b && k.b === a));
     const reply = (o) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
@@ -139,10 +151,11 @@ export async function startServer({ port = 0, root } = {}) {
     const url = new URL(req.url, 'http://x');
     const key = req.headers['sec-websocket-key'];
     if (url.pathname !== '/relay' || !key) { sock.destroy(); return; }
+    if (!originOk(req.headers.origin)) { sock.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); return; }
     const accept = createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
     sock.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
     sock.setNoDelay(true);
-    const r = room(url.searchParams.get('room') || 'dev');
+    const r = room(url.searchParams.get('room') || defaultRoom);
     const d = { id: `d${nextDevice++}-${randomBytes(3).toString('hex')}`, label: url.searchParams.get('label') || 'device', sock, links: new Set(), online: true };
     r.devices.set(d.id, d);
     log('device', d.id, d.label);
@@ -163,6 +176,7 @@ export async function startServer({ port = 0, root } = {}) {
   });
 
   await new Promise((res) => server.listen(port, HOST, res));
+  ownOrigins = new Set([`http://${HOST}:${server.address().port}`, `http://localhost:${server.address().port}`]);
   return { server, port: server.address().port, url: `http://${HOST}:${server.address().port}`,
     close: () => new Promise((res) => { for (const r of rooms.values()) for (const d of r.devices.values()) d.sock.destroy(); server.close(res); }) };
 }
@@ -207,6 +221,6 @@ function readFrames(sock, onMessage, onError) {
 if (import.meta.url === `file://${process.argv[1]}`) {
   const args = process.argv.slice(2);
   const get = (n, d) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : d; };
-  const s = await startServer({ port: Number(get('--port', 8000)), root: get('--root') });
+  const s = await startServer({ port: Number(get('--port', 8000)), root: get('--root'), admin: args.includes('--admin') });
   console.log(`serving ${s.url}/ (relay at ws://127.0.0.1:${s.port}/relay); Ctrl-C to stop`);
 }

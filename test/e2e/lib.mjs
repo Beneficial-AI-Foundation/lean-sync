@@ -11,10 +11,8 @@
 //   IDB_FAULT   (Chromium storage-failure test) aborts the IndexedDB transaction that writes the
 //               record, as a quota failure would; Chromium ignores the CDP quota override for IDB
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { launch, browserVersion } from './driver.mjs';
+import { tempDir, removeDir } from '../proc.mjs';
 
 export const sha = (b) => createHash('sha256').update(b).digest('hex');
 export const randomFile = (name, size) => { const bytes = randomBytes(size); return { name, bytes, sha: sha(bytes) }; };
@@ -55,27 +53,47 @@ export const TRAP = `${SS}
     return r instanceof WebAssembly.Instance ? __wrapInstance(r) : { module: r.module, instance: __wrapInstance(r.instance) }; };`;
 
 export const IDB_FAULT = `${SS}
+  // __idbFail: abort the transaction writing the record (a transaction-level failure, like quota)
+  // __idbReqFail: make the request writing the record fail on its own (ConstraintError from add()
+  //   on an existing key), leaving the transaction to its default behaviour: a correct host lets
+  //   that abort the transaction; one that suppresses the error would see it complete.
   window.__idbFail = __ss('__idbFail') === '1';
-  window.__idbFailed = 0;
+  window.__idbFailed = 0; window.__idbReqFail = false; window.__idbReqFailed = 0;
   const __put = IDBObjectStore.prototype.put;
   IDBObjectStore.prototype.put = function (value, key) {
+    if (window.__idbReqFail && key === 'record') { window.__idbReqFailed++; return this.add(value, key); }
     const r = __put.call(this, value, key);
     if (window.__idbFail && key === 'record') { window.__idbFailed++; const tx = this.transaction; queueMicrotask(() => { try { tx.abort(); } catch {} }); }
     return r;
   };`;
+
+// __holdClose: OPFS writes of new files stay pending (at close) until __releaseCloses(), so a test can
+// make something happen while a local add is being stored.
+export const SLOW_STORE = `
+  window.__holdClose = false; window.__held = [];
+  const __close = FileSystemWritableFileStream.prototype.close;
+  FileSystemWritableFileStream.prototype.close = function () {
+    if (!window.__holdClose) return __close.call(this);
+    return new Promise((res, rej) => window.__held.push(() => __close.call(this).then(res, rej)));
+  };
+  window.__releaseCloses = () => { window.__holdClose = false; const h = window.__held; window.__held = []; for (const f of h) f(); return h.length; };`;
+
+const INIT_SCRIPTS = [DOWNLOADS, TRAP, IDB_FAULT, SLOW_STORE];
 
 export const versions = {};
 export function versionOf(kind) { return (versions[kind] ??= browserVersion(kind)); }
 
 /** Open (or reopen, with `profile`) a device: a browser process + the app page. */
 export async function openDevice(server, kind, label, { room, prefs, profile, waitRunning = true } = {}) {
-  const dir = profile ?? mkdtempSync(join(tmpdir(), `lsync-${label}-`));
+  const dir = profile ?? tempDir(`lsync-${label}-`);
   const browser = await launch(kind, { profile: dir, prefs });
-  const url = `${server.url}/?device=${encodeURIComponent(label)}&room=${encodeURIComponent(room)}`;
-  const page = await browser.newPage(url, { initScripts: [DOWNLOADS, TRAP, IDB_FAULT].map((src) => `(() => {${src}\n})();`) });
-  const d = makeDevice({ browser, page, kind, label, profile: dir, url, server, room, prefs });
-  if (waitRunning) await d.waitFor(`window.leansync && window.leansync.phase === 'running'`, 30000, 'app running');
-  return d;
+  try {
+    const url = `${server.url}/?device=${encodeURIComponent(label)}&room=${encodeURIComponent(room)}`;
+    const page = await browser.newPage(url, { initScripts: INIT_SCRIPTS.map((src) => `(() => {${src}\n})();`) });
+    const d = makeDevice({ browser, page, kind, label, profile: dir, url, server, room, prefs });
+    if (waitRunning) await d.waitFor(`window.leansync && window.leansync.phase === 'running'`, 30000, 'app running');
+    return d;
+  } catch (e) { await browser.close(); throw e; }
 }
 
 function makeDevice(d) {
@@ -110,7 +128,7 @@ function makeDevice(d) {
       })()`);
     },
     /** The file list as displayed. */
-    rows: () => page().eval(`[...document.querySelectorAll('#files tr:not(.version)')].map((tr) => ({ path: tr.dataset.path, status: tr.dataset.status,
+    rows: () => page().eval(`[...document.querySelectorAll('#files tr:not(.version)')].map((tr) => ({ path: tr.dataset.path, status: tr.dataset.status, hashes: (tr.dataset.hashes || '').split(',').filter(Boolean),
       versions: [...document.querySelectorAll('#files tr.version')].filter((v) => v.dataset.path === tr.dataset.path).map((v) => ({ hex: v.dataset.version, status: v.dataset.status })) }))`),
     async waitRows(pred, ms = 30000, what = 'rows') {
       const t0 = Date.now(); let rows;
@@ -142,7 +160,7 @@ function makeDevice(d) {
       Object.assign(d, { browser: nd.browser, page: nd.page });
       return d;
     },
-    destroy() { try { rmSync(d.profile, { recursive: true, force: true }); } catch {} },
+    destroy() { removeDir(d.profile); },
   });
   return d;
 }

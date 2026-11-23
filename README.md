@@ -25,7 +25,7 @@ scripts/build-site.sh        # app/ + engine -> build/site/
 WebSocket relay); it listens on 127.0.0.1 only and is not part of the app:
 
 ```sh
-node dev/serve.mjs --port 8000
+node dev/serve.mjs --port 8000        # add --admin only for the tests' fault-injection API
 ```
 
 **Open two devices.** Each device is a browser profile with its own storage, e.g.:
@@ -35,7 +35,7 @@ chromium --user-data-dir=/tmp/dev-a 'http://127.0.0.1:8000/?device=laptop'
 firefox --no-remote --profile "$(mktemp -d)" 'http://127.0.0.1:8000/?device=phone'
 ```
 
-Devices in the same room (`?room=`, default `default`) connect to each other through the relay.
+Devices in the same room connect to each other through the relay: without `?room=`, all devices of this server share a random room chosen when it starts. The relay accepts only pages served by itself (it checks `Origin`); `--admin` enables the fault-injection API the tests use.
 Add files with the button or by dropping them; untick "online" to edit offline. A second tab of the
 same profile shows "open in another tab" and does nothing.
 
@@ -50,4 +50,5 @@ scripts/wasm/check-engine.sh # wasm engine: Node smoke, native-vs-wasm replay, l
 scripts/test-app.sh          # the app: codec vs Lean vectors, unit tests, engine checks,
                              # end-to-end scenarios in headless Chromium and Firefox
 node test/e2e/run.mjs --only storage-failure --browsers chromium   # one scenario, one browser
+node test/mutations.mjs      # breaks each host obligation in turn; its test must fail (~10 min)
 ```

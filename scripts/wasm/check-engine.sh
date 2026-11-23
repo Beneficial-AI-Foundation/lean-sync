@@ -25,6 +25,8 @@ else
   echo "ok: the heap-growth check caught the leaking variant"
 fi
 node test/wasm-scale.mjs "$SCALE_N" || fail=1
-node test/browser-smoke.mjs || fail=1
+node test/browser-smoke.mjs; rc=$?
+[ $rc -eq 2 ] && echo "browser smoke: tests passed, CLEANUP FAILED"
+[ $rc -eq 0 ] || fail=1
 [ $fail -eq 0 ] && echo "ENGINE CHECKS OK" || echo "ENGINE CHECKS FAILED"
 exit $fail

@@ -7,6 +7,7 @@
 // usage: node test/e2e/probe-features.mjs
 import { createServer } from 'node:http';
 import { launch, hasBrowser, browserVersion } from './driver.mjs';
+import { cleanupAll, reportCleanup } from '../proc.mjs';
 
 const server = createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<!doctype html><title>probe</title><p>probe'); });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -73,3 +74,4 @@ for (const kind of ['chromium', 'firefox', 'firefox-esr'].filter(hasBrowser)) {
   await b.close();
 }
 server.close();
+reportCleanup(await cleanupAll());

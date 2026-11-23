@@ -6,6 +6,7 @@ import { startServer } from '../../dev/serve.mjs';
 import { openDevice, versionOf } from './lib.mjs';
 import { hasBrowser } from './driver.mjs';
 import { scenarios } from './scenarios.mjs';
+import { cleanupAll, reportCleanup } from '../proc.mjs';
 
 const args = process.argv.slice(2);
 const opt = (n) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : null; };
@@ -20,7 +21,7 @@ for (const s of scenarios) {
 }
 if (args.includes('--list')) { for (const t of todo) console.log(t.s.name, t.kinds.join('+')); process.exit(0); }
 
-const server = await startServer({ port: 0 });
+const server = await startServer({ port: 0, admin: true });
 console.log(`dev server ${server.url}; ${todo.length} runs`);
 const results = [];
 let n = 0;
@@ -50,4 +51,8 @@ for (const { s, kinds } of todo) {
 await server.close();
 const failed = results.filter((r) => !r.ok);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);
-process.exit(failed.length ? 1 : 0);
+// Hygiene is checked and reported separately from the results: exit 1 for test failures, 2 for a
+// cleanup failure alone (so neither can hide the other).
+const c = await cleanupAll();
+reportCleanup(c);
+process.exit(failed.length ? 1 : c.ok ? 0 : 2);

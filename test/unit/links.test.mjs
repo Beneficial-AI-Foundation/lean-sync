@@ -150,3 +150,27 @@ test('serving: an unreadable blob is aborted and reported lost; a readable one i
   await sleep(5);
   assert.equal(link.sent.at(-1)[0], 4, 'END after the last byte');
 });
+
+test('PeerIds are never reused; connected/disconnected once per link', async () => {
+  const events = []; const storage = memoryStorage();
+  const links = createLinks({ emit: (ev) => events.push(ev), storage, self: () => ({ replica: ME, label: 'me' }), epoch: () => 0, log: () => {} });
+  links.setAccepting(true);
+  const l1 = fakeLink(1), l2 = fakeLink(2), l3 = fakeLink(3);
+  links.attach(l1); l1.deliver(hello(OTHER));
+  links.attach(l2); l2.deliver(hello({ hi: 5n, lo: 6n }));
+  l1.drop(); l1.drop();
+  links.attach(l3); l3.deliver(hello(OTHER));
+  assert.deepEqual(events.map((e) => `${e.type} ${e.peer}`), ['connected 1', 'connected 2', 'disconnected 1', 'connected 3']);
+});
+
+test('close goes out after the bytes already queued', async () => {
+  const { link, links } = setup(); link.deliver(hello(OTHER));
+  link.sent.length = 0;
+  link.bufferedAmount = 2 * 1024 * 1024;                 // congested: frames wait in the queue
+  links.sendMessage(1, new Uint8Array(100));
+  links.closePeer(1);
+  assert.equal(link.closed, false, 'not closed before the queued message');
+  link.bufferedAmount = 0;
+  await sleep(5);
+  assert.deepEqual(link.sent.map((f) => f[0]), [1]); assert.equal(link.closed, true);
+});

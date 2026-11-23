@@ -18,7 +18,7 @@
 
 const DRAIN_POLL_MS = 30;
 
-export function createRelayTransport({ url, room = 'default', label = 'device' }) {
+export function createRelayTransport({ url, room = '', label = 'device' }) {
   let ws = null, myId = null, handlers = null, online = true, stopped = false;
   let reconnectDelay = 500, reconnectTimer = null;
   const links = new Map();            // link id -> link object
@@ -29,7 +29,7 @@ export function createRelayTransport({ url, room = 'default', label = 'device' }
 
   function connect() {
     if (stopped) return;
-    const u = new URL(url); u.searchParams.set('room', room); u.searchParams.set('label', label);
+    const u = new URL(url); if (room) u.searchParams.set('room', room); u.searchParams.set('label', label);
     try { ws = new WebSocket(u); } catch (e) { status(`no relay (${e.message})`); return scheduleReconnect(); }
     ws.binaryType = 'arraybuffer';
     ws.onopen = () => { reconnectDelay = 500; status('relay connected'); if (!online) ws.send(JSON.stringify({ op: 'online', value: false })); };

@@ -10,6 +10,12 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 fail=0
+# One directory for every temporary browser profile of this run (honours TMPDIR); every process
+# whose command line mentions it is ours. Both are checked at the end, separately from the results.
+export LEANSYNC_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/leansync-app-XXXXXX")"
+ours() { pgrep -f -- "$LEANSYNC_TEST_DIR" || true; }
+cleanup() { local p; p=$(ours); [ -n "$p" ] && kill -9 $p 2>/dev/null; rm -rf "$LEANSYNC_TEST_DIR" 2>/dev/null || true; }
+trap 'cleanup; exit 130' INT TERM
 scripts/build-site.sh || exit 1
 lake build sync-tests >/dev/null || exit 1
 mkdir -p build/vectors
@@ -22,5 +28,15 @@ echo "== engine checks"
 scripts/wasm/check-engine.sh || fail=1
 echo "== end-to-end"
 node test/e2e/run.mjs ${E2E_ARGS:-} || fail=1
+echo "== hygiene"
+left=$(ours)
+clean=0
+if [ -n "$left" ]; then echo "CLEANUP FAILED: processes still running:"; ps -o pid,args -p $(echo $left | tr ' ' ,) || true; clean=1; fi
+rm -rf "$LEANSYNC_TEST_DIR" 2>/dev/null
+for i in 1 2 3 4 5; do [ -e "$LEANSYNC_TEST_DIR" ] || break; sleep 1; rm -rf "$LEANSYNC_TEST_DIR" 2>/dev/null; done
+if [ -e "$LEANSYNC_TEST_DIR" ]; then echo "CLEANUP FAILED: $LEANSYNC_TEST_DIR not removed"; clean=1; fi
+[ $clean -eq 0 ] && echo "hygiene: no process left, $LEANSYNC_TEST_DIR removed"
+cleanup
 [ $fail -eq 0 ] && echo "APP CHECKS OK" || echo "APP CHECKS FAILED"
-exit $fail
+[ $clean -eq 0 ] || echo "(test results above are independent of the cleanup failure)"
+[ $fail -eq 0 ] && [ $clean -eq 0 ]

@@ -122,28 +122,28 @@ export function createUI({ storage, getCore, transport, label }) {
     $('#empty').hidden = rows.length > 0;
     for (const row of rows) {
       const name = el('td', { class: 'name' }, row.dir ? el('span', { class: 'dir' }, row.dir) : null, row.base);
-      const tr = el('tr', { 'data-path': row.path, 'data-status': row.status });
+      const tr = el('tr', { 'data-path': row.path, 'data-status': row.status, 'data-hashes': row.versions.map((v) => v.hex).join(',') });
       if (row.status !== 'conflicted') {
         const v = row.versions[0];
         tr.append(name, el('td', { class: 'size' }, fmtSize(state.sizes.get(v.hex))),
           el('td', { class: 'status', 'data-status': v.status }, statusText(v)),
           el('td', { class: 'actions' },
             el('button', { 'data-action': 'download', disabled: !v.present, onclick: () => download(row, v) }, 'Download'), ' ',
-            el('button', { 'data-action': 'delete', disabled: !editable, onclick: () => getCore().deleteFiles([row.path]) }, 'Delete')));
+            el('button', { 'data-action': 'delete', disabled: !editable, onclick: () => getCore().deleteFiles([{ path: row.path, versions: row.versions.map((x) => x.hash) }]) }, 'Delete')));
         tbody.append(tr);
       } else {
         tr.append(name, el('td', {}), el('td', { class: 'status', 'data-status': 'conflicted' }, `conflict: ${row.versions.length} versions`),
           el('td', { class: 'actions' },
             el('button', { 'data-action': 'keep-both', disabled: !editable || row.versions.length !== 2 || row.versions.some((v) => !v.present),
               onclick: () => keepBoth(row) }, 'Keep both'), ' ',
-            el('button', { 'data-action': 'delete', disabled: !editable, onclick: () => getCore().deleteFiles([row.path]) }, 'Delete')));
+            el('button', { 'data-action': 'delete', disabled: !editable, onclick: () => getCore().deleteFiles([{ path: row.path, versions: row.versions.map((x) => x.hash) }]) }, 'Delete')));
         tbody.append(tr);
         row.versions.forEach((v, i) => tbody.append(el('tr', { class: 'version', 'data-path': row.path, 'data-version': v.hex, 'data-status': v.status },
           el('td', { class: 'name' }, `version ${String.fromCharCode(97 + i)} · ${v.hex.slice(0, 8)}`),
           el('td', { class: 'size' }, fmtSize(state.sizes.get(v.hex))),
           el('td', { class: 'status', 'data-status': v.status }, statusText(v)),
           el('td', { class: 'actions' },
-            el('button', { 'data-action': 'keep', disabled: !editable || !v.present, onclick: () => getCore().keepVersion(row.path, v.hash) }, 'Keep this one'), ' ',
+            el('button', { 'data-action': 'keep', disabled: !editable || !v.present, onclick: () => getCore().keepVersion(row.path, v.hash, row.versions.map((x) => x.hash)) }, 'Keep this one'), ' ',
             el('button', { 'data-action': 'download', disabled: !v.present, onclick: () => download(row, v, v.hex.slice(0, 8)) }, 'Download')))));
       }
     }
@@ -171,7 +171,7 @@ export function createUI({ storage, getCore, transport, label }) {
     const [a, b] = row.versions;
     const taken = new Set(state.files.map((f) => f.path));
     const other = uniqueName(row.path, taken);
-    try { getCore().keepBoth(row.path, a.hash, b.hash, other); message(`Kept both: version b is now "${other}".`); }
+    try { getCore().keepBoth(row.path, a.hash, b.hash, other, row.versions.map((x) => x.hash)); message(`Kept both: version b is now "${other}".`); }
     catch (e) { message(e.message, 'error'); }
   }
 
@@ -181,7 +181,9 @@ export function createUI({ storage, getCore, transport, label }) {
       const name = f.name.normalize('NFC');
       if (f.size > MAX_FILE_BYTES) { message(`"${name}" was not added: it is ${fmtSize(f.size)}, and this version accepts files up to ${MAX_FILE_BYTES / 1048576} MB (each file is hashed in memory).`, 'error'); continue; }
       if (!name) { message('A file without a name was not added.', 'error'); continue; }
-      files.push({ name, blob: f });
+      // the versions of this name the user is looking at right now (superseded by the add)
+      const shownFile = state.files.find((x) => x.path === name);
+      files.push({ name, blob: f, supersedes: shownFile ? shownFile.versions.map((v) => v.hash) : [] });
     }
     if (!files.length) return;
     try {

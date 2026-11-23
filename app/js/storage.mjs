@@ -66,9 +66,11 @@ export async function openStorage() {
         const st = tx.objectStore('kv');
         for (const [k, v] of Object.entries(entries)) { if (v === undefined) st.delete(k); else st.put(v, k); }
       } catch (e) { try { tx.abort(); } catch {} reject(new StorageError(`save failed: ${e.name ?? e}`, e)); return; }
+      // A failed request aborts the whole transaction (its default action, which must NOT be
+      // prevented), so `complete` fires only if every request succeeded: it is the only point
+      // where the save is acknowledged.
       tx.oncomplete = () => resolve();
       tx.onabort = () => reject(new StorageError(`save failed: ${tx.error?.name ?? 'transaction aborted'}`, tx.error));
-      tx.onerror = (ev) => { ev.preventDefault?.(); /* onabort follows and rejects */ };
     });
   }
 
@@ -85,8 +87,9 @@ export async function openStorage() {
     const h = await sha256(new Uint8Array(await file.arrayBuffer()));
     const hx = hex(h);
     if (expectedHex && hx !== expectedHex) { await removeIncoming(name); return { ok: false, hash: h, hex: hx }; }
-    if (await hasBlob(hx)) await removeIncoming(name);
-    else await fh.move(blobsDir, hx);
+    // Publish the verified copy even if blobs/<hash> exists: the existing one may be damaged.
+    if (await hasBlob(hx)) await blobsDir.removeEntry(hx);
+    await fh.move(blobsDir, hx);
     return { ok: true, hash: h, hex: hx, size: file.size };
   }
   async function removeIncoming(name) { try { await incomingDir.removeEntry(name); } catch {} }

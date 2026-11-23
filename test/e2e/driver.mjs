@@ -6,11 +6,11 @@
 //   await p.eval('expr')                     // evaluates `expr` (awaited), returns JSON-decoded value
 //   await p.reload(); await p.close(); await b.close();  // b.kill() = SIGKILL (crash)
 // Each browser is a separate process with its own profile directory (= its own storage).
-import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnTracked, killGroup, tempDir, removeDir } from '../proc.mjs';
 
 export const browserVersion = (bin) => execFileSync(bin, ['--version']).toString().trim();
 export function hasBrowser(bin) { try { execFileSync('sh', ['-c', `command -v ${bin}`]); return true; } catch { return false; } }
@@ -48,12 +48,19 @@ const unwrapJson = (s) => (s === undefined || s === 'undefined' ? undefined : JS
 const wrap = (expr) => `(async () => { const __v = await (${expr}); return __v === undefined ? 'undefined' : JSON.stringify(__v); })()`;
 
 export async function launch(kind, { profile, prefs = {}, keepProfile = false } = {}) {
-  const dir = profile ?? mkdtempSync(join(tmpdir(), `e2e-${kind}-`));
+  const dir = profile ?? tempDir(`e2e-${kind}-`);
+  let proc = null;
+  try { return await launchIn(kind, dir, prefs, profile, keepProfile, (p) => { proc = p; }); }
+  catch (e) { if (proc) await killGroup(proc.pid); if (!profile && !keepProfile) removeDir(dir); throw e; }
+}
+
+async function launchIn(kind, dir, prefs, profile, keepProfile, onSpawn) {
   let proc, send, close;
   if (kind === 'chromium') {
-    proc = spawn('chromium', ['--headless=new', '--no-sandbox', `--user-data-dir=${dir}`, '--no-first-run',
+    proc = spawnTracked('chromium', ['--headless=new', '--no-sandbox', `--user-data-dir=${dir}`, '--no-first-run',
       '--no-default-browser-check', '--remote-debugging-port=0', '--remote-allow-origins=*', 'about:blank'],
     { stdio: ['ignore', 'pipe', 'pipe'] });
+    onSpawn(proc);
     const [, wsUrl] = await waitLine(proc, /DevTools listening on (ws:\/\/\S+)/);
     const ws = new WebSocket(wsUrl);
     await new Promise((r, j) => { ws.onopen = r; ws.onerror = j; });
@@ -64,8 +71,9 @@ export async function launch(kind, { profile, prefs = {}, keepProfile = false } 
       .map(([k, v]) => `user_pref(${JSON.stringify(k)}, ${JSON.stringify(v)});`);
     writeFileSync(join(dir, 'user.js'), lines.join('\n') + '\n');
     const port = await freePort();
-    proc = spawn(kind, ['--headless', '--no-remote', '--profile', dir, `--remote-debugging-port=${port}`, 'about:blank'],
+    proc = spawnTracked(kind, ['--headless', '--no-remote', '--profile', dir, `--remote-debugging-port=${port}`, 'about:blank'],
       { stdio: ['ignore', 'pipe', 'pipe'] });
+    onSpawn(proc);
     await waitLine(proc, /WebDriver BiDi listening on ws:\/\//);
     const ws = new WebSocket(`ws://127.0.0.1:${port}/session`);
     await new Promise((r, j) => { ws.onopen = r; ws.onerror = j; });
@@ -126,7 +134,16 @@ export async function launch(kind, { profile, prefs = {}, keepProfile = false } 
   }
   return {
     kind, profile: dir, newPage, send,
-    async close() { try { close(); } catch {} proc.kill('SIGTERM'); await Promise.race([exited, new Promise((r) => setTimeout(r, 5000))]); proc.kill('SIGKILL'); await exited; if (!keepProfile && !profile) rmSync(dir, { recursive: true, force: true }); },
-    async kill() { try { close(); } catch {} proc.kill('SIGKILL'); await exited; },
+    /** Graceful stop, then the whole process group is killed and awaited; the profile is removed
+     *  if the driver created it. Never throws: leftovers are reported by proc.cleanupAll(). */
+    async close() {
+      try { close(); } catch {}
+      try { proc.kill('SIGTERM'); } catch {}
+      await Promise.race([exited, new Promise((r) => setTimeout(r, 5000))]);
+      await killGroup(proc.pid);
+      if (!keepProfile && !profile) removeDir(dir);
+    },
+    /** Crash: SIGKILL the whole group, wait until no process of it is left. Keeps the profile. */
+    async kill() { try { close(); } catch {} await killGroup(proc.pid); },
   };
 }

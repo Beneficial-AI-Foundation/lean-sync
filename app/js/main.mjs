@@ -39,7 +39,7 @@ async function run() {
   navigator.storage.persisted().then((p) => { showPersist(p); if (!p) navigator.storage.persist().then(showPersist, () => {}); }, () => {});
 
   const relayUrl = params.get('relay') || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/relay`;
-  const transport = createRelayTransport({ url: relayUrl, room: params.get('room') || 'default', label });
+  const transport = createRelayTransport({ url: relayUrl, room: params.get('room') || '', label });
   let core = null;
   const ui = createUI({ storage, getCore: () => core, transport, label });
   const links = createLinks({

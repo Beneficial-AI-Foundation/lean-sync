@@ -3,9 +3,9 @@
 // and check each run's report against the path assigned to that run.
 // usage: node test/browser-smoke.mjs   (after scripts/wasm/build.sh)
 import { createServer } from 'node:http';
-import { readFile, mkdtemp, rm } from 'node:fs/promises';
-import { spawn, execFileSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
+import { readFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { spawnTracked, killGroup, tempDir, removeDir, cleanupAll, reportCleanup } from './proc.mjs';
 import { join, dirname, normalize, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
@@ -40,24 +40,25 @@ let fail = 0;
 for (const b of browsers) {
   const run = randomBytes(6).toString('hex');
   const path = `dir/π-${run}.txt`;
-  const profile = await mkdtemp(join(tmpdir(), `smoke-${b}-`));
+  const profile = tempDir(`smoke-${b}-`);
   const url = `http://127.0.0.1:${port}/test/browser-smoke.html?run=${run}&path=${encodeURIComponent(path)}`;
   const args = b === 'chromium'
     ? ['--headless=new', '--no-sandbox', `--user-data-dir=${profile}`, '--no-first-run', url]
     : ['--headless', '--no-remote', '--profile', profile, url];
   const version = execFileSync(b, ['--version']).toString().trim();
-  const proc = spawn(b, args, { stdio: 'ignore' });
+  const proc = spawnTracked(b, args, { stdio: 'ignore' });
   const body = await Promise.race([
     new Promise((r) => waiters.set(run, r)),
     new Promise((r) => setTimeout(() => r({ error: 'timeout (30 s)' }), 30000)),
   ]);
-  proc.kill('SIGKILL');
-  await new Promise((r) => proc.once('exit', r));
-  await rm(profile, { recursive: true, force: true });
+  await killGroup(proc.pid);          // the whole process group, awaited
+  removeDir(profile);
   const ok = !body.error && Array.isArray(body.files) && body.files.length === 1 && body.files[0] === path;
   if (!ok) fail++;
   console.log(`${ok ? 'OK  ' : 'FAIL'} ${version}: ${ok ? `startup ${body.startupMs.toFixed(0)} ms` : JSON.stringify(body)}`);
 }
 server.close();
 if (!browsers.length) { console.log('no browsers found'); fail++; }
-process.exit(fail ? 1 : 0);
+const c = await cleanupAll();
+reportCleanup(c);
+process.exit(fail ? 1 : c.ok ? 0 : 2);

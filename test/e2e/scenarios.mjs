@@ -2,9 +2,8 @@
 // processes with their own profiles) in its own relay room. `kinds` is the list of browsers for
 // the devices A, B, C...; test/e2e/run.mjs runs each scenario on each of its configurations.
 import assert from 'node:assert/strict';
-import { cpSync, mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { cpSync } from 'node:fs';
+import { tempDir, removeDir } from '../proc.mjs';
 import { openDevice, randomFile, sleep, admin, sha } from './lib.mjs';
 
 const CH = 'chromium', FF = 'firefox', ESR = 'firefox-esr';
@@ -34,7 +33,81 @@ const writeRecord = (dev, rec) => dev.eval(`new Promise((res, rej) => { const r 
   tx.oncomplete = () => { r.result.close(); res(true); }; tx.onabort = () => rej(tx.error); }; })`);
 const incomingCount = (dev) => dev.eval(`navigator.storage.getDirectory().then((r) => r.getDirectoryHandle('incoming')).then(async (d) => { let n = 0; for await (const _ of d.keys()) n++; return n; })`);
 
+const blobsDir = `navigator.storage.getDirectory().then((r) => r.getDirectoryHandle('blobs'))`;
+
 export const scenarios = [
+  {
+    name: 'record-request-error-not-acknowledged',
+    kinds: [[CH, CH], [FF, FF]],
+    async run(ctx, kinds) {
+      // A request-level IndexedDB error (not a transaction abort): the transaction must abort and
+      // the save must never be acknowledged; the stored record must be unchanged.
+      const [A, B] = await devices(ctx, kinds);
+      const f = randomFile(`req-${ctx.id}.txt`, 500), g = randomFile(`keep-${ctx.id}.txt`, 500);
+      await A.add([f, g]); await B.waitFiles(files(f, g));
+      await A.waitFor(`document.querySelector('#saving').dataset.state === 'saved'`, 10000);
+      const before = await recordOf(A);
+      await A.eval('(window.__idbReqFail = true)');
+      await A.click(A.rowSel(f.name, 'delete'));
+      await A.waitFor(`!!document.querySelector('#banner-save')`, 20000, 'save-failed banner');
+      await sleep(2500);
+      assert.ok(await A.eval('window.__idbReqFailed') >= 1, 'the request-level error was exercised');
+      assert.deepEqual(await recordOf(A), before, 'the stored record is unchanged');
+      assert.ok(await A.eval(`!!document.querySelector('#banner-save') && document.querySelector('#saving').dataset.state === 'failed'`), 'still shown as not saved');
+      assert.ok((await B.rows()).some((r) => r.path === f.name), 'the unsaved deletion did not reach B');
+      assert.ok(!(await A.eval('window.leansync.log')).some((l) => /saving works again/.test(l)), 'never acknowledged');
+      await A.eval('(window.__idbReqFail = false)');
+      await A.click('#retry-save');
+      await B.waitFiles(files(g));
+      assert.notDeepEqual(await recordOf(A), before);
+    },
+  },
+  {
+    name: 'peer-edit-during-upload-becomes-conflict',
+    kinds: [[CH, CH], [FF, FF], [CH, FF]],
+    async run(ctx, kinds) {
+      // The user replaces x on A while B's replacement of x arrives during A's upload. A's add
+      // supersedes only the version A showed when the user acted, so B's edit must survive as a
+      // conflict, not be silently removed.
+      const [A, B] = await devices(ctx, kinds);
+      const x0 = randomFile(`x-${ctx.id}.txt`, 800);
+      await A.add([x0]); await B.waitFiles(files(x0));
+      const x1 = randomFile(x0.name, 900), x2 = randomFile(x0.name, 1000);
+      await A.eval('(window.__holdClose = true)');
+      await A.add([x1]);                                             // user action on A; the store is held
+      await A.waitFor('window.__held.length > 0', 10000, 'A is storing x1');
+      await B.add([x2]);                                             // B replaces x meanwhile
+      await A.waitRows((rows) => rows.length === 1 && rows[0].hashes.join() === sha(x2.bytes), 30000, 'A shows B\'s version');
+      assert.ok(await A.eval('window.__releaseCloses()') >= 1);
+      const conflict = (rows) => rows.length === 1 && rows[0].status === 'conflicted' && rows[0].versions.length === 2;
+      for (const D of [A, B]) {
+        const rows = await D.waitRows(conflict, 30000, 'x1 and x2 in conflict');
+        assert.deepEqual(new Set(rows[0].versions.map((v) => v.hex)), new Set([sha(x1.bytes), sha(x2.bytes)]));
+      }
+    },
+  },
+  {
+    name: 'damaged-or-missing-blob-recovers',
+    kinds: [[CH, CH], [FF, FF]],
+    async run(ctx, kinds) {
+      const [A, B] = await devices(ctx, kinds);
+      const f = randomFile(`dmg-${ctx.id}.bin`, 3000), g = randomFile(`gone-${ctx.id}.bin`, 3000);
+      await A.add([f, g]); await B.waitFiles(files(f, g));
+      // 1. A damaged copy is replaced when the same content is added again.
+      await A.eval(`${blobsDir}.then((d) => d.getFileHandle(${JSON.stringify(f.sha)})).then(async (h) => { const w = await h.createWritable(); await w.write(new Uint8Array([1, 2, 3])); await w.close(); return true; })`);
+      await A.add([f]);
+      await A.waitFor(`${blobsDir}.then((d) => d.getFileHandle(${JSON.stringify(f.sha)})).then((h) => h.getFile()).then((x) => x.size === ${f.bytes.length})`, 20000, 'the stored copy replaced');
+      await expectSha(A, f.name, f);
+      assert.ok(!(await A.eval(`[...document.querySelectorAll('#messages .msg.error')].length`)), 'no error shown');
+      // 2. A vanished copy is reported lost when a download finds it missing, and fetched again.
+      await A.eval(`${blobsDir}.then((d) => d.removeEntry(${JSON.stringify(g.sha)})).then(() => true)`);
+      await A.click(A.rowSel(g.name, 'download'));
+      await A.waitFor(`[...document.querySelectorAll('#messages .msg.error')].some((m) => m.textContent.includes('missing'))`, 10000, 'missing-copy message');
+      await A.waitFor(`${blobsDir}.then((d) => d.getFileHandle(${JSON.stringify(g.sha)})).then(() => true, () => false)`, 30000, 'fetched again from B');
+      await A.waitFiles(files(f, g));
+      await expectSha(A, g.name, g);
+    },
+  },
   {
     name: 'add-replace-delete-download',
     kinds: [[CH, CH], [FF, FF], [ESR, FF], [CH, FF]],
@@ -336,9 +409,9 @@ export const scenarios = [
       await A.add([f]); await A.waitFiles(files(f));
       await A.waitFor(`document.querySelector('#saving').dataset.state === 'saved'`, 10000);
       await A.close();
-      const copy = mkdtempSync(join(tmpdir(), 'lsync-copy-'));
+      const copy = tempDir('lsync-copy-');
       cpSync(A.profile, copy, { recursive: true, filter: (src) => !/Singleton(Lock|Socket|Cookie)$/.test(src) });   // a second profile restored from the same storage
-      ctx.cleanup.push(() => import('node:fs').then((fs) => fs.rmSync(copy, { recursive: true, force: true })));
+      ctx.cleanup.push(async () => removeDir(copy));
       await A.reopen();
       const A2 = await ctx.open(kinds[0], 'A2', { profile: copy });
       for (const D of [A, A2]) await D.waitFor(`[...document.querySelectorAll('#banners .banner')].some((b) => b.textContent.includes('own identity'))`, 30000, 'refused banner');
