@@ -184,8 +184,9 @@ is idempotent and only grows the state.
 **Local edit mid-session.** The edit is persisted; once acknowledged, the peer gets `digest`, and
 gets `state` unless it already announced that digest.
 
-**Cost (accepted for the demo).** One edit costs one whole-state send per connected peer: about
-1.6 MB per peer for 20k files. Bursts are folded by the single in-flight persist.
+**Cost (accepted for the demo).** One edit costs one whole-state send per connected peer. Each
+entry encodes to about 37 bytes plus its path, so 20k files with short paths come to about 1 MB
+per peer. Bursts are folded by the single in-flight persist.
 - A state sent to k peers in one step is encoded k times. Avoiding that would need the envelope
   to share bytes between effects, which is not free in Lean, so it is left as is.
 - Each received state is also encoded once, to check its size.
