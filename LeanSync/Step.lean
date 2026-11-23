@@ -271,19 +271,19 @@ def reportPass (n : Node) : Node × List Effect :=
   else ({ n1 with summary := sum }, effs ++ [.notify (.pendingSummary sum.1 sum.2)])
 
 def finish (n : Node) : Node × List Effect :=
-  let (n1, e1) := persistPass n
-  let (n2, e2) := reconcilePass n1
-  let (n3, e3) := planPass n2
-  let (n4, e4) := reportPass n3
-  (n4, e1 ++ e2 ++ e3 ++ e4)
+  let r1 := persistPass n
+  let r2 := reconcilePass r1.1
+  let r3 := planPass r2.1
+  let r4 := reportPass r3.1
+  (r4.1, r1.2 ++ r2.2 ++ r3.2 ++ r4.2)
 
 /-! ## Start-up and the step function -/
 
 def startNode (self : ReplicaId) (s : State) (blobs : List Hash) : Node × List Effect :=
   let bl := sortDedup blobs
   let n : Node := { self, current := s, blobs := bl, missing := computeMissing s bl, dirty := true }
-  let (n', e) := finish n
-  (n', .notify .indexChanged :: e)
+  let r := finish n
+  (r.1, .notify .indexChanged :: r.2)
 
 /-- The protocol: one event in, the new machine and the effects out, in the order the host must
 carry them out. Pure, total, deterministic. -/
@@ -293,20 +293,19 @@ def step (m : Machine) (ev : Event) : Machine × List Effect :=
     match ev with
     | .init self stored blobs =>
       match decodeState stored with
-      | .ok s => let (n, e) := startNode self s blobs; (.running n, e)
+      | .ok s => let r := startNode self s blobs; (.running r.1, r.2)
       | .error err => (.uninit, [.notify (.startupFailed err)])
-    | .initFresh self blobs => let (n, e) := startNode self State.empty blobs; (.running n, e)
+    | .initFresh self blobs => let r := startNode self State.empty blobs; (.running r.1, r.2)
     | _ => (.uninit, [.notify .notInitialized])
   | .running n =>
-    let (n1, e1) := handle n ev
-    let (n2, e2) := finish n1
-    (.running n2, e1 ++ e2)
+    let r1 := handle n ev
+    let r2 := finish r1.1
+    (.running r2.1, r1.2 ++ r2.2)
 
 /-- Run a sequence of events; returns the final machine and the effects of each step. -/
 def run (m : Machine) (evs : List Event) : Machine × List (List Effect) :=
   let r := evs.foldl (fun (acc : Machine × List (List Effect)) ev =>
-    let (m', effs) := step acc.1 ev
-    (m', effs :: acc.2)) (m, [])
+    ((step acc.1 ev).1, (step acc.1 ev).2 :: acc.2)) (m, [])
   (r.1, r.2.reverse)
 
 end LeanSync

@@ -751,4 +751,355 @@ theorem planGo_spec (missing : List Hash) (hm : StrictlySorted missing) :
           exact .inr hnoroom
         · exact hall x hx
 
+theorem forall2_mem {α β} {R : α → β → Prop} : ∀ {l : List α} {l' : List β}, Forall2 R l l' →
+    ∀ y' ∈ l', ∃ y ∈ l, R y y'
+  | [], [], .nil, y', hy => by cases hy
+  | a :: as, b :: bs, .cons hab hr, y', hy => by
+    simp only [List.mem_cons] at hy
+    rcases hy with rfl | hy
+    · exact ⟨a, .head _, hab⟩
+    · obtain ⟨y, hy, hr'⟩ := forall2_mem hr y' hy; exact ⟨y, .tail _ hy, hr'⟩
+
+theorem forall2_length {α β} {R : α → β → Prop} : ∀ {l : List α} {l' : List β}, Forall2 R l l' →
+    l'.length = l.length
+  | [], [], .nil => rfl
+  | _ :: _, _ :: _, .cons _ hr => by simp [forall2_length hr]
+
+theorem planRel_peer {missing : List Hash} {s s' : Session} (h : PlanRel missing s s') : s'.peer = s.peer := by
+  obtain ⟨c, rfl, -, -⟩ := h; rfl
+
+theorem sessSorted_of_forall2 {missing : List Hash} : ∀ {l l' : List Session},
+    Forall2 (PlanRel missing) l l' → SessSorted l → SessSorted l'
+  | [], [], .nil, _ => List.Pairwise.nil
+  | a :: as, b :: bs, .cons hab hr, hs => by
+    refine List.pairwise_cons.2 ⟨?_, sessSorted_of_forall2 hr (List.pairwise_cons.1 hs).2⟩
+    intro y' hy'
+    obtain ⟨y, hy, hyy⟩ := forall2_mem hr y' hy'
+    rw [planRel_peer hab, planRel_peer hyy]
+    exact (List.pairwise_cons.1 hs).1 y hy
+
+theorem mem_busyOf {l : List Session} {h : Hash} (hh : h ∈ busyOf l) : ∃ x ∈ l, h ∈ x.inflight := by
+  unfold busyOf at hh
+  rw [mem_sortDedup, List.mem_flatMap] at hh
+  exact hh
+
+/-- The spec of the planning pass, instantiated. -/
+theorem planPass_spec {n : Node} (h : n.Inv) :
+    ∃ l', (planPass n).1 = { n with sessions := l' } ∧ Forall2 (PlanRel n.missing) n.sessions l' ∧
+      (∀ e ∈ (planPass n).2, FetchOk n.missing n.sessions e) ∧
+      ∀ hb ∈ n.missing, (∃ x ∈ l', hb ∈ x.inflight) ∨
+        ∀ s' ∈ l', s'.ready = true → hb ∈ s'.lacks ∨ maxInflightPerPeer ≤ s'.inflight.length := by
+  obtain ⟨l', es, heq, hrel, hes, hcov⟩ := planGo_spec n.missing h.missingSorted n.sessions (busyOf n.sessions)
+    [] [] (sorted_sortDedup _) (fun x hx => (h.sessOk x hx).lacksSorted)
+    (fun hb hh => by simpa using mem_busyOf hh)
+  refine ⟨l', by simp [planPass, heq], hrel, by simpa [planPass, heq] using hes, fun hb hh => ?_⟩
+  rcases hcov hb hh with ⟨x, hx, hxi⟩ | hall
+  · exact .inl ⟨x, by simpa using hx, hxi⟩
+  · exact .inr hall
+
+theorem planPass_inv {n : Node} (h : n.Inv) : (planPass n).1.Inv := by
+  obtain ⟨l', heq, hrel, -, -⟩ := planPass_spec h
+  rw [heq]
+  exact { h with
+    sessionsSorted := sessSorted_of_forall2 hrel h.sessionsSorted
+    sessionCap := by rw [forall2_length hrel]; exact h.sessionCap
+    sessOk := fun x' hx' => by
+      obtain ⟨x, hx, c, rfl, -, hc⟩ := forall2_mem hrel x' hx'
+      have ho := h.sessOk x hx
+      exact { ho with
+        inflightCap := by
+          rcases hc with rfl | ⟨-, hc⟩
+          · simpa using ho.inflightCap
+          · simpa using hc } }
+
+theorem finish_inv {n : Node} (h : n.Inv) : (finish n).1.Inv := by
+  unfold finish
+  exact reportPass_inv (planPass_inv (reconcilePass_inv (persistPass_inv h)))
+
+theorem startNode_inv (self : ReplicaId) {s : State} (hs : s.WireOk) (blobs : List Hash) :
+    (startNode self s blobs).1.Inv := by
+  unfold startNode
+  apply finish_inv
+  exact {
+    currentOk := hs
+    publishedOk := fun _ hP => by simp at hP
+    publishedLe := fun _ hP => by simp at hP
+    inflightOk := fun _ _ hx => by simp at hx
+    inflightLe := fun _ _ hx => by simp at hx
+    tagFresh := fun _ _ hx => by simp at hx
+    blobsSorted := sorted_sortDedup _
+    missingSorted := sorted_computeMissing _ (sorted_sortDedup _)
+    missingSpec := fun z => by rw [mem_computeMissing _ (sorted_sortDedup _)]; rfl
+    sessionsSorted := List.Pairwise.nil
+    sessionCap := by simp [maxSessions]
+    sessOk := fun _ hx => by simp at hx }
+
+theorem step_inv' (m : Machine) (ev : Event) (h : m.Inv) : (step m ev).1.Inv := by
+  cases m with
+  | uninit =>
+    cases ev with
+    | init self stored blobs =>
+      simp only [step]
+      split
+      · next s hdec => exact startNode_inv self (wireOk_of_decodeState' hdec) blobs
+      · trivial
+    | initFresh self blobs => exact startNode_inv self wireOk_empty blobs
+    | _ => trivial
+  | running n => exact finish_inv (handle_inv h ev)
+
+/-! ## What each part of a step changes -/
+
+/-- The fields the end-of-step passes never change. -/
+structure Core (n n' : Node) : Prop where
+  self : n'.self = n.self
+  current : n'.current = n.current
+  published : n'.published = n.published
+  rollback : n'.rollback = n.rollback
+  blobs : n'.blobs = n.blobs
+  missing : n'.missing = n.missing
+
+theorem Core.trans {a b c : Node} (h1 : Core a b) (h2 : Core b c) : Core a c :=
+  ⟨h2.1.trans h1.1, h2.2.trans h1.2, h2.3.trans h1.3, h2.4.trans h1.4, h2.5.trans h1.5, h2.6.trans h1.6⟩
+
+theorem persistPass_core (n : Node) : Core n (persistPass n).1 := by
+  unfold persistPass; split <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+theorem reconcilePass_core (n : Node) : Core n (reconcilePass n).1 := by
+  unfold reconcilePass; split <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+theorem planPass_core (n : Node) : Core n (planPass n).1 := ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+theorem reportPass_core (n : Node) : Core n (reportPass n).1 := by
+  unfold reportPass; simp only; split <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+theorem finish_core (n : Node) : Core n (finish n).1 :=
+  (persistPass_core n).trans ((reconcilePass_core _).trans ((planPass_core _).trans (reportPass_core _)))
+
+theorem onMessage_grows (n : Node) (s : Session) (msg : Message) :
+    (onMessage n s msg).1.self = n.self ∧ State.Le n.current (onMessage n s msg).1.current := by
+  unfold onMessage
+  split
+  · split
+    · split
+      · exact ⟨rfl, State.le_refl' _⟩
+      · split <;> exact ⟨rfl, State.le_refl' _⟩
+    · exact ⟨rfl, State.le_refl' _⟩
+  · cases msg with
+    | state d st =>
+      simp only
+      split
+      · split
+        · split <;> exact ⟨rfl, State.le_merge _ _⟩
+        · split <;> exact ⟨rfl, State.le_merge _ _⟩
+      · split <;> exact ⟨rfl, State.le_refl' _⟩
+    | want hs => simp only; split <;> exact ⟨rfl, State.le_refl' _⟩
+    | _ => exact ⟨rfl, State.le_refl' _⟩
+
+theorem handle_grows (n : Node) (ev : Event) :
+    (handle n ev).1.self = n.self ∧ State.Le n.current (handle n ev).1.current := by
+  cases ev with
+  | received p b =>
+    simp only [handle]
+    split
+    · exact ⟨rfl, State.le_refl' _⟩
+    · split
+      · exact ⟨rfl, State.le_refl' _⟩
+      · exact onMessage_grows _ _ _
+  | localOp op =>
+    simp only [handle]
+    split
+    · exact ⟨rfl, State.le_refl' _⟩
+    · split
+      · obtain ⟨h1, h2, -⟩ := gotBlobs_frame (n.withCurrent (applyOp n.current n.self op)) (opHashes op)
+        exact ⟨h1, by rw [h2]; exact State.le_applyOp _ _ _⟩
+      · exact ⟨rfl, State.le_refl' _⟩
+  | blobStored hb src =>
+    obtain ⟨h1, h2, -⟩ := gotBlobs_frame n [hb]
+    exact ⟨h1, by simp only [handle]; rw [h2]; exact State.le_refl' _⟩
+  | connected p => simp only [handle]; split; exact ⟨rfl, State.le_refl' _⟩; split <;> exact ⟨rfl, State.le_refl' _⟩
+  | disconnected p => simp only [handle]; split <;> exact ⟨rfl, State.le_refl' _⟩
+  | persisted t d => simp only [handle]; split; split <;> exact ⟨rfl, State.le_refl' _⟩; exact ⟨rfl, State.le_refl' _⟩
+  | persistFailed t => simp only [handle]; split; split <;> exact ⟨rfl, State.le_refl' _⟩; exact ⟨rfl, State.le_refl' _⟩
+  | blobFailed p hb =>
+    simp only [handle]; split; split <;> exact ⟨rfl, State.le_refl' _⟩; exact ⟨rfl, State.le_refl' _⟩
+  | blobLost hb => simp only [handle]; split <;> exact ⟨rfl, State.le_refl' _⟩
+  | init => exact ⟨rfl, State.le_refl' _⟩
+  | initFresh => exact ⟨rfl, State.le_refl' _⟩
+  | query q => exact ⟨rfl, State.le_refl' _⟩
+
+theorem step_current_grows' (n : Node) (ev : Event) :
+    ∃ n', (step (.running n) ev).1 = .running n' ∧ n'.self = n.self ∧ State.Le n.current n'.current := by
+  refine ⟨_, rfl, ?_, ?_⟩
+  · rw [(finish_core _).self]; exact (handle_grows n ev).1
+  · rw [(finish_core _).current]; exact (handle_grows n ev).2
+
+/-- A ready session's message reaches `onMessage` with that session. -/
+theorem handle_received {n : Node} (h : n.Inv) {x : Session} (hx : x ∈ n.sessions) {b : ByteArray}
+    {msg : Message} (hdec : decodeMessage b = .ok msg) :
+    handle n (.received x.peer b) = onMessage n x msg := by
+  simp only [handle, findSession_of_mem h.sessionsSorted hx, hdec]
+
+theorem onMessage_state {n : Node} {x : Session} (hr : x.ready = true) (d : Digest) (s : State)
+    (hfit : (n.current.merge s).WireOk) :
+    (onMessage n x (.state d s)).1.current = n.current.merge s ∧
+    (n.current.context.get n.self < s.context.get n.self → (onMessage n x (.state d s)).1.rollback = true) := by
+  have hw : checkWire (n.current.merge s) = true := (checkWire_iff _).2 hfit
+  unfold onMessage
+  simp only [hr, Bool.not_true, Bool.false_eq_true, ite_false, hw, ite_true]
+  split
+  · refine ⟨by split <;> rfl, fun hlt => ?_⟩
+    have : decide (n.current.context.get n.self < s.context.get n.self) = true := decide_eq_true hlt
+    simp only [this, ite_true]
+  · refine ⟨by split <;> rfl, fun hlt => ?_⟩
+    have : decide (n.current.context.get n.self < s.context.get n.self) = true := decide_eq_true hlt
+    simp only [Node.withCurrent, this, ite_true]
+
+theorem step_received_state' (n : Node) (p : PeerId) (b : ByteArray) (d : Digest) (s : State)
+    (h : n.Inv) (hs : ∃ x ∈ n.sessions, x.peer = p ∧ x.ready = true)
+    (hdec : decodeMessage b = .ok (.state d s)) (hfit : (n.current.merge s).WireOk) :
+    ∃ n', (step (.running n) (.received p b)).1 = .running n' ∧ n'.current = n.current.merge s := by
+  obtain ⟨x, hx, rfl, hr⟩ := hs
+  refine ⟨_, rfl, ?_⟩
+  try simp only [step]
+  rw [(finish_core _).current, handle_received h hx hdec]
+  exact (onMessage_state hr d s hfit).1
+
+theorem step_detects_rollback' (n : Node) (p : PeerId) (b : ByteArray) (d : Digest) (s : State)
+    (h : n.Inv) (hs : ∃ x ∈ n.sessions, x.peer = p ∧ x.ready = true)
+    (hdec : decodeMessage b = .ok (.state d s))
+    (hgt : n.current.context.get n.self < s.context.get n.self) :
+    ∃ n', (step (.running n) (.received p b)).1 = .running n' ∧ n'.rollback = true := by
+  obtain ⟨x, hx, rfl, hr⟩ := hs
+  refine ⟨_, rfl, ?_⟩
+  try simp only [step]
+  rw [(finish_core _).rollback, handle_received h hx hdec]
+  unfold onMessage
+  simp only [hr, Bool.not_true, Bool.false_eq_true, ite_false, hgt, decide_true, ite_true]
+  split
+  · split <;> rfl
+  · rfl
+
+theorem step_putMany' (n : Node) (items : List PutItem) (hrb : n.rollback = false)
+    (hfit : (n.current.putMany n.self items).WireOk) :
+    ∃ n', (step (.running n) (.localOp (.putMany items))).1 = .running n' ∧
+      n'.current = n.current.putMany n.self items := by
+  refine ⟨_, rfl, ?_⟩
+  try simp only [step]
+  rw [(finish_core _).current]
+  have hw : checkWire (applyOp n.current n.self (.putMany items)) = true := (checkWire_iff _).2 hfit
+  simp only [handle, hrb, Bool.false_eq_true, ite_false, hw, ite_true]
+  rw [(gotBlobs_frame _ _).2.1]
+  rfl
+
+/-! ## Settled sessions and planned blobs -/
+
+/-- The session fields that only reconciliation and message handling touch. -/
+def SyncFields (s : Session) : Option ReplicaId × Option Digest × Option Digest × Option Digest :=
+  (s.peerReplica, s.peerDigest, s.announced, s.lastSent)
+
+theorem reconcileSession_settles (self : ReplicaId) (P : Published) (s : Session)
+    (hr : s.peerReplica.isSome = true) :
+    let s' := (reconcileSession self false P s).1
+    s'.peerReplica = s.peerReplica ∧ s'.announced = some P.digest ∧
+      (s'.peerDigest = some P.digest ∨ s'.lastSent = some P.digest) := by
+  have hp : let s1 := (helloPart self P s).1
+      s1.peerReplica = s.peerReplica ∧ s1.peerDigest = s.peerDigest ∧ s1.lastSent = s.lastSent := by
+    unfold helloPart; split <;> simp
+  obtain ⟨h1, h2, h3⟩ := hp
+  have hready : (helloPart self P s).1.ready = true := by simp [Session.ready, h1, hr]
+  unfold reconcileSession
+  simp only [hready, ite_true, Bool.not_false, Bool.true_and]
+  split
+  · next hc => exact ⟨h1, rfl, .inr rfl⟩
+  · next hc =>
+    simp only [Bool.and_eq_true, bne_iff_ne, ne_eq, not_and, Decidable.not_not] at hc
+    split
+    · refine ⟨h1, rfl, ?_⟩
+      by_cases hd : (helloPart self P s).1.peerDigest = some P.digest
+      · exact .inl hd
+      · exact .inr (hc hd)
+    · next ha =>
+      simp only [bne_iff_ne, ne_eq, Decidable.not_not] at ha
+      refine ⟨h1, ha, ?_⟩
+      by_cases hd : (helloPart self P s).1.peerDigest = some P.digest
+      · exact .inl hd
+      · exact .inr (hc hd)
+
+theorem step_settles' (n : Node) (ev : Event) (h : n.Inv) (n' : Node)
+    (hstep : (step (.running n) ev).1 = .running n') (P : Published)
+    (hP : n'.published = some P) (hrb : n'.rollback = false) :
+    ∀ x ∈ n'.sessions, x.peerReplica.isSome = true → x.announced = some P.digest ∧
+      (x.peerDigest = some P.digest ∨ x.lastSent = some P.digest) := by
+  simp only [step, Machine.running.injEq] at hstep
+  subst hstep
+  let n1 := (handle n ev).1
+  let r1 := persistPass n1
+  have hcore1 := persistPass_core n1
+  have hinv2 : (reconcilePass r1.1).1.Inv := reconcilePass_inv (persistPass_inv (handle_inv h ev))
+  have hfin := finish_core n1
+  have hpub : r1.1.published = some P := by
+    rw [hcore1.published]; rw [← hfin.published]; exact hP
+  have hrb1 : r1.1.rollback = false := by
+    rw [hcore1.rollback]; rw [← hfin.rollback]; exact hrb
+  -- sessions after reconciliation
+  have hrec : (reconcilePass r1.1).1.sessions =
+      r1.1.sessions.map (fun s => (reconcileSession r1.1.self false P s).1) := by
+    unfold reconcilePass; rw [hpub]; simp [hrb1]
+  obtain ⟨l', heq, hrel, -, -⟩ := planPass_spec hinv2
+  intro x hx hready
+  -- `x` comes from `l'` through the report pass, which only sets `reported`
+  have hx' : ∃ y ∈ l', SyncFields y = SyncFields x := by
+    change x ∈ (reportPass (planPass (reconcilePass r1.1).1).1).1.sessions at hx
+    unfold reportPass at hx
+    rw [heq] at hx
+    simp only at hx
+    split at hx <;> (simp only [List.mem_map] at hx; obtain ⟨y, hy, rfl⟩ := hx; exact ⟨y, hy, rfl⟩)
+  obtain ⟨y, hy, hyx⟩ := hx'
+  obtain ⟨z, hz, c, rfl, -, -⟩ := forall2_mem hrel y hy
+  rw [hrec] at hz
+  simp only [List.mem_map] at hz
+  obtain ⟨w, -, rfl⟩ := hz
+  simp only [SyncFields, Prod.mk.injEq] at hyx
+  obtain ⟨e1, e2, e3, e4⟩ := hyx
+  have hw : w.peerReplica.isSome = true := by
+    have := (reconcileSession_fields r1.1.self false P w).2.1
+    rw [← this]; rw [e1]; exact hready
+  obtain ⟨-, ha, hd⟩ := reconcileSession_settles r1.1.self P w hw
+  rw [← e3, ← e2, ← e4]
+  exact ⟨ha, hd⟩
+
+theorem step_plans_blobs' (n : Node) (ev : Event) (h : n.Inv) (n' : Node)
+    (hstep : (step (.running n) ev).1 = .running n') (hb : Hash) (hm : n'.Missing hb) :
+    (∃ x ∈ n'.sessions, hb ∈ x.inflight) ∨
+    (∀ x ∈ n'.sessions, x.peerReplica.isSome = true → hb ∈ x.lacks ∨ x.inflight.length = maxInflightPerPeer) := by
+  have hinv' : n'.Inv := by
+    have := step_inv' (.running n) ev h; rw [hstep] at this; exact this
+  have hmiss : hb ∈ n'.missing := (hinv'.missingSpec hb).2 hm
+  simp only [step, Machine.running.injEq] at hstep
+  subst hstep
+  let n2 := (reconcilePass (persistPass (handle n ev).1).1).1
+  have hinv2 : n2.Inv := reconcilePass_inv (persistPass_inv (handle_inv h ev))
+  obtain ⟨l', heq, hrel, -, hcov⟩ := planPass_spec hinv2
+  have hm2 : hb ∈ n2.missing := by
+    have hc := (planPass_core n2).trans (reportPass_core (planPass n2).1)
+    rw [← hc.missing]; exact hmiss
+  -- the report pass keeps inflight, lacks and peerReplica
+  have hsess : (reportPass (planPass n2).1).1.sessions =
+      l'.map (fun s => { s with reported := sessionStatus (planPass n2).1 s }) := by
+    unfold reportPass; rw [heq]; simp only; split <;> rfl
+  change (∃ x ∈ (reportPass (planPass n2).1).1.sessions, hb ∈ x.inflight) ∨
+    ∀ x ∈ (reportPass (planPass n2).1).1.sessions, x.peerReplica.isSome = true →
+      hb ∈ x.lacks ∨ x.inflight.length = maxInflightPerPeer
+  have hcap : ∀ x ∈ (reportPass (planPass n2).1).1.sessions, x.inflight.length ≤ maxInflightPerPeer :=
+    fun x hx => (hinv'.sessOk x hx).inflightCap
+  rw [hsess] at hcap ⊢
+  rcases hcov hb hm2 with ⟨x, hx, hxi⟩ | hall
+  · exact .inl ⟨_, List.mem_map_of_mem hx, hxi⟩
+  · refine .inr (fun x hx hr => ?_)
+    simp only [List.mem_map] at hx
+    obtain ⟨y, hy, rfl⟩ := hx
+    rcases hall y hy (by simpa [Session.ready] using hr) with h1 | h2
+    · exact .inl h1
+    · exact .inr (Nat.le_antisymm (hcap _ (List.mem_map_of_mem hy)) h2)
+
 end LeanSync
