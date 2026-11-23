@@ -195,4 +195,12 @@ theorem process_output_decodes (m : Machine) (hm : m.Inv) (input : ByteArray) :
     refine ⟨_, decodeEffects_encodeEffects [.notify (.badEvent e)] (by simp [EffOk]), fun ev' hev' => ?_⟩
     rw [hev] at hev'; cases hev'
 
+/-! ## 6. Storage failures -/
+
+/-- New: the step that handles a `persistFailed` event never emits a `persist`; the retry waits
+for the next event. So failure events alone cannot drive the host into a write loop. -/
+theorem persistFailed_no_retry_in_step (m : Machine) (hm : m.Inv) (t : Nat) :
+    ∀ t' s, Effect.persist t' s ∉ (step m (.persistFailed t)).2 :=
+  persistFailed_no_persist m hm t
+
 end LeanSync

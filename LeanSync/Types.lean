@@ -150,6 +150,9 @@ inductive Notice where
   | rollbackDetected
   | opRejected (why : String)             -- invalid local op (bad hash size, too long path, too large)
   | badEvent (e : DecodeError)            -- the event envelope did not decode
+  /-- The host could not store the state (`persistFailed`): recent changes are not durable, and
+  nothing new is sent to peers until a later persist succeeds. Lean retries on the next event. -/
+  | saveFailed
   /-- `init` with a stored state that does not decode. Lean stays uninitialised; the host may
   retry, or (after user confirmation) start with `initFresh` and a fresh replica id. -/
   | startupFailed (e : DecodeError)
@@ -233,6 +236,9 @@ structure Node where
   nextTag : Nat := 0
   /-- `current` changed since the last `persist` was issued. -/
   dirty : Bool := false
+  /-- The host just reported a failed persist: do not issue the retry in the same step, but on
+  the next event (so failures alone cannot drive a write loop). -/
+  holdPersist : Bool := false
   /-- Blob hashes present in local storage, strictly sorted. -/
   blobs : List Hash := []
   /-- Hashes referenced by `current` and not in `blobs`, strictly sorted (a cache). -/

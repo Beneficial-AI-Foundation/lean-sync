@@ -459,9 +459,11 @@ theorem handle_inv {n : Node} (h : n.Inv) (ev : Event) : (handle n ev).1.Inv := 
     split
     · exact h
     · split
-      · next hw =>
-        exact inv_gotBlobs (Inv.withCurrent h (checkWire_true hw) (State.le_applyOp _ _ _)) _
-      · exact h
+      · exact inv_gotBlobs h _
+      · split
+        · next hw =>
+          exact inv_gotBlobs (Inv.withCurrent h (checkWire_true hw) (State.le_applyOp _ _ _)) _
+        · exact h
   | persisted t d =>
     simp only [handle]
     split
@@ -486,8 +488,8 @@ theorem handle_inv {n : Node} (h : n.Inv) (ev : Event) : (handle n ev).1.Inv := 
           inflightOk := fun _ _ hx => by simp at hx
           inflightLe := fun _ _ hx => by simp at hx
           tagFresh := fun _ _ hx => by simp at hx }
-      · exact h
-    · exact h
+      · exact { h with }
+    · exact { h with }
   | blobStored hb src => exact inv_gotBlobs h [hb]
   | blobsStored hs => exact inv_gotBlobs h hs
   | blobFailed p hb =>
@@ -517,6 +519,8 @@ theorem handle_inv {n : Node} (h : n.Inv) (ev : Event) : (handle n ev).1.Inv := 
 
 theorem persistPass_inv {n : Node} (h : n.Inv) : (persistPass n).1.Inv := by
   unfold persistPass
+  split
+  · exact { h with }
   split
   · exact { h with
       inflightOk := fun t s hx => by simp only [Option.some.injEq, Prod.mk.injEq] at hx; rw [← hx.2]; exact h.currentOk
@@ -860,7 +864,7 @@ theorem Core.trans {a b c : Node} (h1 : Core a b) (h2 : Core b c) : Core a c :=
   ⟨h2.1.trans h1.1, h2.2.trans h1.2, h2.3.trans h1.3, h2.4.trans h1.4, h2.5.trans h1.5, h2.6.trans h1.6⟩
 
 theorem persistPass_core (n : Node) : Core n (persistPass n).1 := by
-  unfold persistPass; split <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+  unfold persistPass; (repeat' split) <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 theorem reconcilePass_core (n : Node) : Core n (reconcilePass n).1 := by
   unfold reconcilePass; split <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
@@ -908,9 +912,12 @@ theorem handle_grows (n : Node) (ev : Event) :
     split
     · exact ⟨rfl, State.le_refl' _⟩
     · split
-      · obtain ⟨h1, h2, -⟩ := gotBlobs_frame (n.withCurrent (applyOp n.current n.self op)) (opHashes op)
-        exact ⟨h1, by rw [h2]; exact State.le_applyOp _ _ _⟩
-      · exact ⟨rfl, State.le_refl' _⟩
+      · obtain ⟨h1, h2, -⟩ := gotBlobs_frame n (opHashes op)
+        exact ⟨h1, by rw [h2]; exact State.le_refl' _⟩
+      · split
+        · obtain ⟨h1, h2, -⟩ := gotBlobs_frame (n.withCurrent (applyOp n.current n.self op)) (opHashes op)
+          exact ⟨h1, by rw [h2]; exact State.le_applyOp _ _ _⟩
+        · exact ⟨rfl, State.le_refl' _⟩
   | blobStored hb src =>
     obtain ⟨h1, h2, -⟩ := gotBlobs_frame n [hb]
     exact ⟨h1, by simp only [handle]; rw [h2]; exact State.le_refl' _⟩
@@ -988,9 +995,10 @@ theorem step_putMany' (n : Node) (items : List PutItem) (hrb : n.rollback = fals
   try simp only [step]
   rw [(finish_core _).current]
   have hw : checkWire (applyOp n.current n.self (.putMany items)) = true := (checkWire_iff _).2 hfit
-  simp only [handle, hrb, Bool.false_eq_true, ite_false, hw, ite_true]
-  rw [(gotBlobs_frame _ _).2.1]
-  rfl
+  simp only [handle, hrb, Bool.false_eq_true, ite_false]
+  split
+  · next hb => rw [(gotBlobs_frame _ _).2.1]; exact (State.eq_of_beq hb).symm
+  · rw [(gotBlobs_frame _ _).2.1]; rfl
 
 /-! ## Settled sessions and planned blobs -/
 
@@ -1212,12 +1220,14 @@ theorem handle_effs (n : Node) (ev : Event) : ∀ e ∈ (handle n ev).2, HandleE
     split
     · simp [HandleEff]
     · split
-      · intro e he
-        simp only [List.mem_cons] at he
-        rcases he with rfl | he
-        · trivial
-        · exact gotBlobs_effs_handle _ _ e he
-      · simp [HandleEff]
+      · exact gotBlobs_effs_handle _ _
+      · split
+        · intro e he
+          simp only [List.mem_cons] at he
+          rcases he with rfl | he
+          · trivial
+          · exact gotBlobs_effs_handle _ _ e he
+        · simp [HandleEff]
   | blobStored hb src =>
     simp only [handle]
     split
@@ -1239,7 +1249,7 @@ theorem handle_effs (n : Node) (ev : Event) : ∀ e ∈ (handle n ev).2, HandleE
   | connected p => simp only [handle]; split; simp; split <;> simp [HandleEff]
   | disconnected p => simp only [handle]; split <;> simp [HandleEff]
   | persisted t d => simp only [handle]; split; split <;> simp; simp
-  | persistFailed t => simp only [handle]; split; split <;> simp; simp
+  | persistFailed t => simp only [handle]; split; split <;> simp [HandleEff]; simp
   | blobFailed p hb => simp only [handle]; split; split <;> simp [HandleEff]; simp
   | blobLost hb => simp only [handle]; split <;> simp [HandleEff]
   | init => simp [handle, HandleEff]
@@ -1291,9 +1301,12 @@ theorem handle_persistence (n : Node) (ev : Event) :
     split
     · exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
     · split
-      · obtain ⟨-, -, h3, h4, h5, -, -⟩ := gotBlobs_frame (n.withCurrent (applyOp n.current n.self op)) (opHashes op)
+      · obtain ⟨-, -, h3, h4, h5, -, -⟩ := gotBlobs_frame n (opHashes op)
         exact ⟨h5, .inl ⟨h4, h3⟩⟩
-      · exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+      · split
+        · obtain ⟨-, -, h3, h4, h5, -, -⟩ := gotBlobs_frame (n.withCurrent (applyOp n.current n.self op)) (opHashes op)
+          exact ⟨h5, .inl ⟨h4, h3⟩⟩
+        · exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
   | blobStored hb src =>
     obtain ⟨-, -, h3, h4, h5, -, -⟩ := gotBlobs_frame n [hb]
     exact ⟨h5, .inl ⟨h4, h3⟩⟩
@@ -1445,53 +1458,64 @@ theorem finish_frame (n : Node) :
     (late_frame_reconcile _).1, (late_frame_reconcile _).2]
   exact ⟨rfl, rfl⟩
 
+/-- The two outcomes of the persist pass. -/
+theorem persistPass_spec (n : Node) :
+    ((persistPass n).2 = [.persist n.nextTag n.current] ∧ n.inflight = none ∧
+      (persistPass n).1.inflight = some (n.nextTag, n.current) ∧ (persistPass n).1.nextTag = n.nextTag + 1) ∨
+    ((persistPass n).2 = [] ∧ (persistPass n).1.inflight = n.inflight ∧ (persistPass n).1.nextTag = n.nextTag) := by
+  unfold persistPass
+  split
+  · exact .inr ⟨rfl, rfl, rfl⟩
+  · split
+    · next hc =>
+      simp only [Bool.and_eq_true, Option.isNone_iff_eq_none] at hc
+      exact .inl ⟨rfl, hc.1, rfl, rfl⟩
+    · exact .inr ⟨rfl, rfl, rfl⟩
+
 theorem finish_persist {n : Node} (h : n.Inv) {t : Nat} {s : State} (he : .persist t s ∈ (finish n).2) :
     n.inflight = none ∧ t = n.nextTag ∧ s = n.current ∧ (finish n).1.inflight = some (t, s) ∧
       (finish n).1.nextTag = t + 1 := by
+  obtain ⟨hf1, hf2⟩ := finish_frame n
   rcases finish_mem h he with he | ⟨m, -, hl⟩
-  · unfold persistPass at he
-    split at he
-    · next hc =>
+  · rcases persistPass_spec n with ⟨he', hi, hi', ht'⟩ | ⟨he', -, -⟩
+    · rw [he'] at he
       simp only [List.mem_singleton, Effect.persist.injEq] at he
       obtain ⟨rfl, rfl⟩ := he
-      simp only [Bool.and_eq_true, Option.isNone_iff_eq_none] at hc
-      obtain ⟨hf1, hf2⟩ := finish_frame n
-      unfold persistPass at hf1 hf2
-      simp only [hc.1, hc.2, Option.isNone_none, Bool.and_self, ite_true] at hf1 hf2
-      exact ⟨hc.1, rfl, rfl, hf1, hf2⟩
-    · simp at he
+      exact ⟨hi, rfl, rfl, hf1.trans hi', hf2.trans ht'⟩
+    · rw [he'] at he; cases he
   · exact absurd rfl (lateEff_not_persist hl t s)
 
 theorem finish_keeps {n : Node} (h : n.Inv) {x : Nat × State} (hi : n.inflight = some x) :
     (finish n).1.inflight = some x ∧ (finish n).1.nextTag = n.nextTag ∧
       ∀ t s, .persist t s ∉ (finish n).2 := by
-  refine ⟨?_, ?_, fun t s he => ?_⟩
-  · rw [(finish_frame n).1]; unfold persistPass; simp [hi]
-  · rw [(finish_frame n).2]; unfold persistPass; simp [hi]
-  · have := (finish_persist h he).1; rw [hi] at this; cases this
+  obtain ⟨hf1, hf2⟩ := finish_frame n
+  rcases persistPass_spec n with ⟨-, hn, -⟩ | ⟨-, hi', ht'⟩
+  · rw [hi] at hn; cases hn
+  · refine ⟨by rw [hf1, hi', hi], by rw [hf2, ht'], fun t s he => ?_⟩
+    have := (finish_persist h he).1; rw [hi] at this; cases this
 
 theorem finish_inflight_cases {n : Node} (_h : n.Inv) {t : Nat} {s : State}
     (hi : (finish n).1.inflight = some (t, s)) : .persist t s ∈ (finish n).2 ∨ n.inflight = some (t, s) := by
   rw [(finish_frame n).1] at hi
-  unfold persistPass at hi
-  split at hi
-  · next hc =>
-    left
+  rcases persistPass_spec n with ⟨he, -, hi', -⟩ | ⟨-, hi', -⟩
+  · left
+    rw [hi'] at hi
     simp only [Option.some.injEq, Prod.mk.injEq] at hi
     obtain ⟨rfl, rfl⟩ := hi
     unfold finish
     simp only [List.mem_append]
     left; left; left
-    unfold persistPass; simp [hc]
-  · exact .inr hi
+    rw [he]; exact .head _
+  · rw [hi'] at hi; exact .inr hi
 
 theorem finish_nextTag_le (n : Node) : n.nextTag ≤ (finish n).1.nextTag := by
-  rw [(finish_frame n).2]; unfold persistPass; split <;> simp
+  rw [(finish_frame n).2]
+  rcases persistPass_spec n with ⟨-, -, -, ht⟩ | ⟨-, -, ht⟩ <;> rw [ht] <;> omega
 
 theorem finish_state {n : Node} (h : n.Inv) {p : PeerId} {d : Digest} {s : State}
     (he : .send p (.state d s) ∈ (finish n).2) : ∃ P, n.published = some P ∧ d = P.digest ∧ s = P.state := by
   rcases finish_mem h he with he | ⟨m, hc, hl⟩
-  · unfold persistPass at he; split at he <;> simp at he
+  · rcases persistPass_spec n with ⟨he', -⟩ | ⟨he', -⟩ <;> rw [he'] at he <;> simp at he
   · obtain ⟨P, hP, rfl, rfl⟩ := lateEff_state hl
     exact ⟨P, by rw [← (persistPass_core n).published, ← hc.published]; exact hP, rfl, rfl⟩
 
@@ -1973,19 +1997,18 @@ theorem finish_exec {n : Node} (hn : n.Inv) {v : HostView} (hpeers : ∀ x ∈ n
       v1.pendingPersist = r1.1.inflight.map (·.1) := by
     show ∃ v1, v.execAll (persistPass n).2 = some v1 ∧ v1.peers = v.peers ∧ v1.blobs = v.blobs ∧
       v1.pendingPersist = (persistPass n).1.inflight.map (·.1)
-    unfold persistPass
-    split
-    · next hc =>
-      simp only [Bool.and_eq_true, Option.isNone_iff_eq_none] at hc
-      have hsz := (checkWire_iff _).2 hn.currentOk
-      refine ⟨{ v with pendingPersist := some n.nextTag }, ?_, rfl, rfl, rfl⟩
-      simp [HostView.execAll, HostView.exec, hpend, hc.1, hsz]
-    · exact ⟨v, rfl, rfl, rfl, hpend⟩
+    rcases persistPass_spec n with ⟨he, hi, hi', -⟩ | ⟨he, hi', -⟩
+    · have hsz := (checkWire_iff _).2 hn.currentOk
+      refine ⟨{ v with pendingPersist := some n.nextTag }, ?_, rfl, rfl, by rw [hi']; rfl⟩
+      rw [he]
+      simp [HostView.execAll, HostView.exec, hpend, hi, hsz]
+    · exact ⟨v, by rw [he]; rfl, rfl, rfl, by rw [hi', hpend]⟩
   obtain ⟨v1, hv1, hp1, hb1, hpend1⟩ := hstep1
   -- sessions keep their peers through the later passes
   have hpeers1 : ∀ x ∈ r1.1.sessions, x.peer ∈ v1.peers := by
     rw [hp1]; intro x hx
-    have : r1.1.sessions = n.sessions := by show (persistPass n).1.sessions = n.sessions; unfold persistPass; split <;> rfl
+    have : r1.1.sessions = n.sessions := by
+      show (persistPass n).1.sessions = n.sessions; unfold persistPass; (repeat' split) <;> rfl
     rw [this] at hx; exact hpeers x hx
   have hpeers2 : ∀ x ∈ (reconcilePass r1.1).1.sessions, x.peer ∈ v1.peers := by
     unfold reconcilePass
@@ -2267,21 +2290,31 @@ theorem handle_exec {v : HostView} {n : Node} (hn : n.Inv) (hr : PreRel v n) (ev
     split
     · exact ⟨_, hnotify _ _, hr1⟩
     · split
-      · next hw =>
-        have hi : (n.withCurrent (applyOp n.current n.self op)).Inv :=
-          Inv.withCurrent hn (checkWire_true hw) (State.le_applyOp _ _ _)
-        obtain ⟨g1, g2, g3⟩ := gotBlobs_exec hi (opHashes op) (v.onEvent (.localOp op)).peers hr1.1
+      · obtain ⟨g1, g2, g3⟩ := gotBlobs_exec hn (opHashes op) (v.onEvent (.localOp op)).peers hr1.1
         refine ⟨_, ?_, g1, fun z hz => ?_, ?_⟩
-        · show (v.onEvent (.localOp op)).execAll (.notify .indexChanged :: _) = _
-          simp only [HostView.execAll, HostView.exec]
-          exact execAll_benign _ _ (fun e he => by
+        · exact execAll_benign _ _ (fun e he => by
             obtain ⟨q, h, rfl, hq, hh⟩ := g3 e he
             exact exec_send hq (hashBatchOk_single hh))
         · rcases g2 z hz with h | h
           · exact hr1.2.1 z h
           · exact hops z h
         · rw [(gotBlobs_frame _ _).2.2.2.1]; exact hr1.2.2
-      · exact ⟨_, hnotify _ _, hr1⟩
+      · split
+        · next hw =>
+          have hi : (n.withCurrent (applyOp n.current n.self op)).Inv :=
+            Inv.withCurrent hn (checkWire_true hw) (State.le_applyOp _ _ _)
+          obtain ⟨g1, g2, g3⟩ := gotBlobs_exec hi (opHashes op) (v.onEvent (.localOp op)).peers hr1.1
+          refine ⟨_, ?_, g1, fun z hz => ?_, ?_⟩
+          · show (v.onEvent (.localOp op)).execAll (.notify .indexChanged :: _) = _
+            simp only [HostView.execAll, HostView.exec]
+            exact execAll_benign _ _ (fun e he => by
+              obtain ⟨q, h, rfl, hq, hh⟩ := g3 e he
+              exact exec_send hq (hashBatchOk_single hh))
+          · rcases g2 z hz with h | h
+            · exact hr1.2.1 z h
+            · exact hops z h
+          · rw [(gotBlobs_frame _ _).2.2.2.1]; exact hr1.2.2
+        · exact ⟨_, hnotify _ _, hr1⟩
   | persisted t d =>
     have hrel := answer_rel hr t (.persisted t d) (.inl ⟨d, rfl⟩)
     simp only [handle]
@@ -2500,7 +2533,7 @@ theorem finish_rollback_no_state {n : Node} (h : n.rollback = true) (p : PeerId)
   unfold finish at he
   simp only [List.mem_append] at he
   rcases he with ((he | he) | he) | he
-  · unfold persistPass at he; split at he <;> simp at he
+  · rcases persistPass_spec n with ⟨he', -⟩ | ⟨he', -⟩ <;> rw [he'] at he <;> simp at he
   · unfold reconcilePass at he
     split at he
     · cases he
@@ -2610,5 +2643,31 @@ theorem hostRel_canon (m : Machine) : HostRel (canonView m) m := by
 theorem step_effects_ok (m : Machine) (hm : m.Inv) (ev : Event) : ∀ e ∈ (step m ev).2, EffOk e := by
   obtain ⟨v2, h1, -⟩ := step_exec hm (hostRel_canon m) ev
   exact execAll_effOk h1
+
+/-! ## A failed persist is never answered with a new write -/
+
+theorem handle_persistFailed_hold (n : Node) (t : Nat) : (handle n (.persistFailed t)).1.holdPersist = true := by
+  simp only [handle]
+  split
+  · split <;> rfl
+  · rfl
+
+theorem persistPass_hold {n : Node} (h : n.holdPersist = true) : (persistPass n).2 = [] := by
+  simp [persistPass, h]
+
+/-- The step that handles `persistFailed` emits no `persist` (the retry waits for the next event). -/
+theorem persistFailed_no_persist (m : Machine) (hm : m.Inv) (t : Nat) :
+    ∀ t' s, .persist t' s ∉ (step m (.persistFailed t)).2 := by
+  intro t' s he
+  cases m with
+  | uninit => simp [step] at he
+  | running n =>
+    rw [step_running] at he
+    simp only [List.mem_append] at he
+    rcases he with he | he
+    · exact handle_no_persist _ _ _ _ he
+    · rcases finish_mem (handle_inv hm _) he with he | ⟨m', -, hl⟩
+      · rw [persistPass_hold (handle_persistFailed_hold n t)] at he; cases he
+      · exact lateEff_not_persist hl t' s rfl
 
 end LeanSync

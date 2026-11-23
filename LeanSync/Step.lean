@@ -185,7 +185,10 @@ def handle (n : Node) : Event → Node × List Effect
       (n, [.notify (.opRejected "rollback detected: restart with a fresh replica id")])
     else
       let s' := applyOp n.current n.self op
-      if checkWire s' then
+      -- an operation that changes nothing (empty batch, deleting an absent path) schedules no
+      -- write and no notice; its blobs are still recorded
+      if State.beq s' n.current then gotBlobs n (opHashes op)
+      else if checkWire s' then
         let r := gotBlobs (n.withCurrent s') (opHashes op)
         (r.1, .notify .indexChanged :: r.2)
       else (n, [.notify (.opRejected "operation exceeds the wire limits (hash size, path length or state size)")])
@@ -194,9 +197,13 @@ def handle (n : Node) : Event → Node × List Effect
     | some (t', s) => if t' = t then ({ n with published := some ⟨s, d⟩, inflight := none }, []) else (n, [])
     | none => (n, [])
   | .persistFailed t =>
+    -- never answer a failure with a new write in the same step: the retry waits for the next
+    -- event, so a host whose storage keeps failing cannot be driven into a write loop
     match n.inflight with
-    | some (t', _) => if t' = t then ({ n with inflight := none, dirty := true }, []) else (n, [])
-    | none => (n, [])
+    | some (t', _) =>
+      if t' = t then ({ n with inflight := none, dirty := true, holdPersist := true }, [.notify .saveFailed])
+      else ({ n with holdPersist := true }, [])
+    | none => ({ n with holdPersist := true }, [])
   | .blobStored h _ =>
     let r := gotBlobs n [h]
     (r.1, if (sdiff [h] n.blobs).isEmpty then [] else .notify .blobsChanged :: r.2)
@@ -221,7 +228,8 @@ def handle (n : Node) : Event → Node × List Effect
 /-! ## The end-of-step pass -/
 
 def persistPass (n : Node) : Node × List Effect :=
-  if n.inflight.isNone && n.dirty then
+  if n.holdPersist then ({ n with holdPersist := false }, [])
+  else if n.inflight.isNone && n.dirty then
     ({ n with inflight := some (n.nextTag, n.current), nextTag := n.nextTag + 1, dirty := false },
       [.persist n.nextTag n.current])
   else (n, [])

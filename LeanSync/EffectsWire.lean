@@ -275,7 +275,8 @@ theorem readOptRep_complete : Complete readOptRep encOptRep (fun _ => True) := b
 /-- Notices: 0 indexChanged · 1 blobsChanged · 2 peerStatus peer status:u8 optReplica ·
 3 peerClosed peer reason:u8 byPeer:bool · 4 peerLeft peer · 5 peerError peer err ·
 6 rollbackDetected · 7 opRejected str · 8 badEvent err · 9 startupFailed err ·
-10 notInitialized · 11 alreadyInitialized · 12 pendingSummary fetching queued waiting (nats).
+10 notInitialized · 11 alreadyInitialized · 12 pendingSummary fetching queued waiting (nats) ·
+13 saveFailed.
 `err` = code:u8 value:nat (0 truncated, 1 trailing, 2 tooLarge, 3 badVersion v, 4 badKind k,
 5 badTag t, 6 nonCanonical, 7 badUtf8); `optReplica` = 00 | 01 replica. -/
 def encNotice : Notice → List UInt8
@@ -292,6 +293,7 @@ def encNotice : Notice → List UInt8
   | .notInitialized => [10]
   | .alreadyInitialized => [11]
   | .pendingSummary f q w => 12 :: (encVar f ++ encVar q ++ encVar w)
+  | .saveFailed => [13]
 
 def wNotice (acc : ByteArray) : Notice → ByteArray
   | .indexChanged => acc.push 0
@@ -311,6 +313,7 @@ def wNotice (acc : ByteArray) : Notice → ByteArray
   | .notInitialized => acc.push 10
   | .alreadyInitialized => acc.push 11
   | .pendingSummary f q w => wVar (wVar (wVar (acc.push 12) f) q) w
+  | .saveFailed => acc.push 13
 
 theorem wNotice_toList (acc : ByteArray) (n : Notice) :
     (wNotice acc n).data.toList = acc.data.toList ++ encNotice n := by
@@ -337,6 +340,7 @@ def readNotice : Parser Notice := fun b pos =>
     else if t = 10 then .ok (.notInitialized, p1)
     else if t = 11 then .ok (.alreadyInitialized, p1)
     else if t = 12 then mapP (fun z => .pendingSummary z.1 z.2.1 z.2.2) (seqP readNat (seqP readNat readNat)) b p1
+    else if t = 13 then .ok (.saveFailed, p1)
     else .error (.badTag t.toNat)
 
 /-- Read a tag byte `t` known to be at `pos`. -/
@@ -400,6 +404,9 @@ theorem readNotice_complete : Complete readNotice encNotice (fun _ => True) := b
     obtain ⟨e0, -, -⟩ := tag_at (l := []) hpos (by simpa [encNotice] using h)
     simp [readNotice, e0, encNotice]
   | alreadyInitialized =>
+    obtain ⟨e0, -, -⟩ := tag_at (l := []) hpos (by simpa [encNotice] using h)
+    simp [readNotice, e0, encNotice]
+  | saveFailed =>
     obtain ⟨e0, -, -⟩ := tag_at (l := []) hpos (by simpa [encNotice] using h)
     simp [readNotice, e0, encNotice]
   | pendingSummary f q w =>

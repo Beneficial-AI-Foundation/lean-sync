@@ -8,10 +8,12 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 python3 - "$@" <<'PY'
 import os, re, sys
+charlit = re.compile(r"'(\\(x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]+\}|.)|[^\\'\n])'")
 words = re.compile(r'(?<![A-Za-z0-9_.\'])(sorry|axiom|native_decide|implemented_by|unsafe|partial)(?![A-Za-z0-9_\'])')
 
 def strip(src):
-    """Blank out comments (nested /- -/, --) and string/char literals, keeping line structure."""
+    """Blank out comments (nested /- -/, --), character literals and string literals, keeping line
+    structure. Character literals are handled before strings, so '"' does not open a string."""
     out, i, n, depth = [], 0, len(src), 0
     while i < n:
         c = src[i]
@@ -22,6 +24,10 @@ def strip(src):
         elif src.startswith('/-', i): depth = 1; out.append('  '); i += 2
         elif src.startswith('--', i):
             while i < n and src[i] != '\n': out.append(' '); i += 1
+        elif c == "'" and (i == 0 or not (src[i-1].isalnum() or src[i-1] in "_'!?." or ord(src[i-1]) > 127)) \
+                and charlit.match(src, i):
+            # a character literal such as '"', '\'' or 'a' (a prime after an identifier is not one)
+            m = charlit.match(src, i); out.append(' ' * (m.end() - i)); i = m.end()
         elif c == '"':
             out.append(' '); i += 1
             while i < n and src[i] != '"':

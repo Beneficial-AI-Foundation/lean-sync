@@ -23,6 +23,7 @@ open LeanSync
 #print axioms process_output_decodes
 #print axioms decodeEffects_encodeEffects
 #print axioms step_effects_ok
+#print axioms persistFailed_no_retry_in_step
 #print axioms step_received_state
 #print axioms step_putMany
 #print axioms step_current_grows
