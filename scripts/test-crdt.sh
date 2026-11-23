@@ -21,10 +21,10 @@ fail=0
 lake build || exit 1
 lake build crdt-tests || exit 1
 
-if grep -rnE '\bsorry\b|^\s*axiom\b|native_decide|implemented_by|^\s*unsafe\b' LeanCrdt LeanCrdt.lean; then
-  echo "FAIL: forbidden construct found in LeanCrdt/"; fail=1
+if grep -rnE '\bsorry\b|^\s*axiom\b|native_decide|implemented_by|^\s*unsafe\b|^\s*partial\b' LeanCrdt LeanCrdt.lean LeanSync LeanSync.lean; then
+  echo "FAIL: forbidden construct found in LeanCrdt/ or LeanSync/"; fail=1
 else
-  echo "ok: no sorry/axiom/native_decide/implemented_by/unsafe in LeanCrdt/"
+  echo "ok: no sorry/axiom/native_decide/implemented_by/unsafe/partial in LeanCrdt/ or LeanSync/"
 fi
 
 echo "== full tests, default stack"

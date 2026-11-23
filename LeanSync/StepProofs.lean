@@ -396,7 +396,7 @@ theorem onMessage_inv {n : Node} (h : n.Inv) {s : Session} (hs : s ∈ n.session
           toldNoOk := fun z hz => by
             rcases mem_addToldNo _ _ z hz with hz | hz
             · exact ho.toldNoOk z hz
-            · simp only [List.mem_filter, decide_eq_true_eq] at hz
+            · rw [mem_sdiff hm.1 h.blobsSorted] at hz
               exact ⟨hm.2.2.2 z hz.1, hz.2⟩ }
     | noBlob hs' =>
       apply Inv.setSession h
@@ -407,7 +407,7 @@ theorem onMessage_inv {n : Node} (h : n.Inv) {s : Session} (hs : s ∈ n.session
         toldNoOk := ho.toldNoOk }
     | «have» hs' =>
       apply Inv.setSession h
-      exact { ho with lacksSorted := ho.lacksSorted.filter _ }
+      exact { ho with lacksSorted := sorted_sdiff ho.lacksSorted hm.1 }
     | bye r => exact Inv.dropSession h _
 
 theorem sessOk_mono {b b' : List Hash} {s : Session} (h : SessOk b s) (hb : ∀ z ∈ b', z ∈ b) :
@@ -2116,11 +2116,16 @@ theorem onMessage_exec {v : HostView} {n : Node} (hn : n.Inv) (hr : PreRel v n) 
       · exact closeWith_exec (hrb _) hp _ _ (hnot _ _)
     | want hs' =>
       simp only
-      have hserve : ∀ e ∈ (hs'.filter (fun h => h ∈ n.blobs)).map (fun h => Effect.serveBlob s.peer h),
+      have hsort : StrictlySorted hs' := hm.1
+      have hlack := sorted_sdiff hsort hn.blobsSorted
+      have hserve : ∀ e ∈ (sdiff hs' (sdiff hs' n.blobs)).map (fun h => Effect.serveBlob s.peer h),
           v.exec e = some v := by
         intro e he
-        simp only [List.mem_map, List.mem_filter, decide_eq_true_eq] at he
-        obtain ⟨h, ⟨-, hb⟩, rfl⟩ := he
+        simp only [List.mem_map] at he
+        obtain ⟨h, hh, rfl⟩ := he
+        rw [mem_sdiff hsort hlack, mem_sdiff hsort hn.blobsSorted] at hh
+        have hb : h ∈ n.blobs := by
+          apply Classical.byContradiction; intro hnb; exact hh.2 ⟨hh.1, hnb⟩
         simp [HostView.exec, hp, hr.2.1 h hb]
       split
       · exact ⟨v, execAll_benign v _ hserve, hr⟩
@@ -2130,15 +2135,11 @@ theorem onMessage_exec {v : HostView} {n : Node} (hn : n.Inv) (hr : PreRel v n) 
         rcases he with he | rfl
         · exact hserve e he
         · apply exec_send hp
-          obtain ⟨hsort, -, hmax, hsz⟩ := hm
-          refine ⟨hsort.filter _, ?_, Nat.le_trans (List.length_filter_le _ _) hmax,
-            fun h hh => hsz h (List.mem_filter.1 hh).1⟩
-          cases hl : hs'.filter (fun h => h ∉ n.blobs) with
-          | nil =>
-            simp at hne
-            obtain ⟨x, hx, hxn⟩ := hne
-            have : x ∈ hs'.filter (fun h => h ∉ n.blobs) := List.mem_filter.2 ⟨hx, by simpa using hxn⟩
-            rw [hl] at this; cases this
+          obtain ⟨-, -, hmax, hsz⟩ := hm
+          refine ⟨hlack, ?_, Nat.le_trans (length_sdiff_le hsort hn.blobsSorted) hmax,
+            fun h hh => hsz h (mem_of_mem_sdiff hh)⟩
+          cases hl : sdiff hs' n.blobs with
+          | nil => simp [hl] at hne
           | cons _ _ => simp
     | noBlob hs' => exact ⟨v, by rfl, hset _ rfl⟩
     | «have» hs' => exact ⟨v, by rfl, hset _ rfl⟩

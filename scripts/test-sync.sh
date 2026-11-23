@@ -21,12 +21,8 @@ fail=0
 lake build || exit 1
 lake build sync-tests || exit 1
 
-# Forbidden constructs in the library. WARN only while the proofs are in progress.
-if grep -rnE '\bsorry\b|^\s*axiom\b|native_decide|implemented_by|^\s*unsafe\b|^\s*partial\b' LeanSync LeanSync.lean; then
-  echo "WARN: forbidden construct found in LeanSync/ (see above)"
-else
-  echo "ok: no sorry/axiom/native_decide/implemented_by/unsafe/partial in LeanSync/"
-fi
+# Forbidden constructs in the libraries, and the axioms of the headline theorems.
+scripts/check-proofs.sh || fail=1
 
 echo "== full tests, default stack"
 "$BIN" all || fail=1

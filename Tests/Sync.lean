@@ -650,9 +650,7 @@ def simRun (seed nd steps : Nat) (stepFn : Machine → Event → Machine × List
     for _ in [0:steps] do randomStep
     quiesce seed ackFirst
   let ((), w) ← act.run (newWorld nd seed stepFn useProcess)
-  let vs := if (← IO.getEnv "SYNC_TESTS_IGNORE_HELLO_ORDER").isSome
-    then w.violations.filter (fun v => !(v.splitOn "before its own hello").length > 1) else w.violations
-  return (vs, w.stats)
+  return (w.violations, w.stats)
 
 def simTests (c : Ctx) (seed count : Nat) (nd steps : Nat := 4) (steps' : Nat := 400)
     (ackFirst := false) : IO Unit := do
@@ -709,12 +707,10 @@ def mutSendAfterClose (m : Machine) (ev : Event) : Machine × List Effect :=
   | .disconnected p => (m', effs ++ [.send p (.digest (digestOf ByteArray.empty))])
   | _ => (m', effs)
 
-/-- Violations of the known "message before own hello" bug (see the report) are excluded from the
-mutation check, and persists are acknowledged before the final reconnection, so that the check
-measures each mutant against a clean baseline. -/
+/-- One strict simulator run (all checks, strict quiescence) with a given step function. -/
 def mutRun (s : Nat) (f : Machine → Event → Machine × List Effect) : IO (Array String) := do
-  let (vs, _) ← simRun s 4 300 f false (ackFirst := true)
-  return vs.filter (fun v => !((v.splitOn "before its own hello").length > 1))
+  let (vs, _) ← simRun s 4 300 f false
+  return vs
 
 def mutationTests (c : Ctx) (budget : Nat := 30) : IO Unit := do
   let muts : List (String × (Machine → Event → Machine × List Effect)) :=
@@ -1271,6 +1267,55 @@ def deep : Nat → Nat
 
 end SyncTests
 
+
+namespace SyncTests
+
+def bh32 (n : Nat) : Hash :=
+  ⟨⟨((List.range 28).map (fun _ => (0:UInt8)) ++ [(n / 16777216 % 256).toUInt8, (n / 65536 % 256).toUInt8,
+    (n / 256 % 256).toUInt8, (n % 256).toUInt8]).toArray⟩⟩
+
+def bdg (n : Nat) : Digest :=
+  ⟨⟨((List.range 31).map (fun _ => (0:UInt8)) ++ [n.toUInt8]).toArray⟩, by rw [← ByteArray.size_data]; simp⟩
+
+/-- Per-event cost of `step` on a node whose index has `n` entries (compiled; indicative). -/
+def stepBench (n : Nat) : IO Unit := do
+  let items := (List.range n).map (fun i => ({ path := s!"dir{i % 100}/file{i}", hash := bh32 i, supersedes := [] } : PutItem))
+  let a2 := (step (step (step .uninit (.initFresh ⟨1,1⟩ [])).1 (.persisted 0 (bdg 1))).1 (.localOp (.putMany items))).1
+  let st := match a2 with | .running x => x.current | _ => State.empty
+  let b3 := (step (step (step (step .uninit (.initFresh ⟨2,2⟩ [])).1 (.persisted 0 (bdg 2))).1 (.connected ⟨7⟩)).1
+    (.received ⟨7⟩ (encodeMessage (.hello 1 ⟨1,1⟩ (bdg 3))))).1
+  let t0 ← IO.monoNanosNow
+  let b4 := (step b3 (.received ⟨7⟩ (encodeMessage (.state (bdg 3) st)))).1
+  let b5 := (step b4 (.persisted 1 (bdg 3))).1
+  let blen := match b5 with | .running x => x.missing.length | _ => 0
+  let t1 ← IO.monoNanosNow
+  IO.println s!"stepbench n={n}: merge + persist of the {n}-entry state: {(t1 - t0) / 1000000} ms (missing {blen})"
+  let mut m := b5
+  let t2 ← IO.monoNanosNow
+  for i in [0:1000] do
+    m := (step m (.blobStored (bh32 i) (some ⟨7⟩))).1
+  let k := match m with | .running x => x.blobs.length | _ => 0
+  let t3 ← IO.monoNanosNow
+  IO.println s!"stepbench: blobStored {(t3 - t2) / 1000 / 1000} us/event ({k} blobs)"
+  let t4 ← IO.monoNanosNow
+  for _ in [0:1000] do
+    m := (step m (.query .status)).1
+  let k2 := match m with | .running x => x.nextTag | _ => 0
+  let t5 ← IO.monoNanosNow
+  IO.println s!"stepbench: an event that changes nothing (finish pass only) {(t5 - t4) / 1000 / 1000} us/event ({k2})"
+  let a5 := (step (step (step a2 (.persisted 1 (bdg 4))).1 (.connected ⟨5⟩)).1
+    (.received ⟨5⟩ (encodeMessage (.hello 1 ⟨2,2⟩ (bdg 3))))).1
+  let want := encodeMessage (.want ((List.range 32).map (fun i => bh32 (i * (n / 32)))))
+  let mut ma := a5
+  let t6 ← IO.monoNanosNow
+  for _ in [0:100] do
+    ma := (step ma (.received ⟨5⟩ want)).1
+  let k3 := match ma with | .running x => x.sessions.length | _ => 0
+  let t7 ← IO.monoNanosNow
+  IO.println s!"stepbench: want(32) {(t7 - t6) / 1000 / 100} us/event ({k3})"
+
+end SyncTests
+
 open SyncTests in
 def main (args : List String) : IO UInt32 := do
   let failures ← IO.mkRef 0
@@ -1312,6 +1357,7 @@ def main (args : List String) : IO UInt32 := do
         for e in n.current.entries do IO.println s!"   {e.path} ({e.dot.replica.lo},{e.dot.counter}) {e.hash.bytes.toList.drop 30}"
       | .uninit => IO.println s!"dev {d} uninit"
     IO.println s!"conns {w.conns.map (fun c => (c.id, c.a, c.b, c.qab.size, c.qba.size))}"
+  | "stepbench" :: rest => stepBench ((rest[0]? >>= String.toNat?).getD 20000); return 0
   | "scale" :: rest => scaleTest { c with label := "scale" } ((rest[0]? >>= String.toNat?).getD 20000)
   | "control" :: rest => controlTest ((rest[0]? >>= String.toNat?).getD 20000)
   | "deep" :: rest =>

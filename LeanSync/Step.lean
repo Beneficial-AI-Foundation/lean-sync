@@ -117,8 +117,9 @@ def onMessage (n : Node) (s : Session) (msg : Message) : Node × List Effect :=
         else (n2.withCurrent merged, eRb ++ [.notify .indexChanged])
       else closeWith n2 p .stateTooLarge eRb
     | .want hs =>
-      let present := hs.filter (fun h => h ∈ n.blobs)
-      let lack := hs.filter (fun h => h ∉ n.blobs)
+      -- `hs` and `blobs` are sorted: one pass each
+      let lack := sdiff hs n.blobs
+      let present := sdiff hs lack
       let serve := present.map (fun h => Effect.serveBlob p h)
       if lack.isEmpty then (n, serve)
       else (n.setSession { s with toldNo := addToldNo s.toldNo lack }, serve ++ [.send p (.noBlob lack)])
@@ -127,7 +128,7 @@ def onMessage (n : Node) (s : Session) (msg : Message) : Node × List Effect :=
       let keep := s.inflight.filter (fun h => h ∉ hs)
       (n.setSession { s with inflight := keep, lacks := back.foldl (fun acc h => insertH h acc) s.lacks },
         [.notify .blobsChanged])
-    | .have hs => (n.setSession { s with lacks := s.lacks.filter (fun h => h ∉ hs) }, [.notify .blobsChanged])
+    | .have hs => (n.setSession { s with lacks := sdiff s.lacks hs }, [.notify .blobsChanged])
     | .bye r => (n.dropSession p, [.close p r, .notify (.peerClosed p r true)])
 
 /-! ## Queries -/
@@ -188,7 +189,7 @@ def handle (n : Node) : Event → Node × List Effect
     | none => (n, [])
   | .blobStored h _ =>
     let r := gotBlobs n [h]
-    (r.1, if r.2.isEmpty && h ∈ n.blobs then [] else .notify .blobsChanged :: r.2)
+    (r.1, if (sdiff [h] n.blobs).isEmpty then [] else .notify .blobsChanged :: r.2)
   | .blobFailed p h =>
     match n.findSession? p with
     | some s =>
@@ -263,7 +264,9 @@ def reportPass (n : Node) : Node × List Effect :=
   let effs : List Effect := n.sessions.filterMap (fun s =>
     let st := sessionStatus n s
     if st == s.reported then none else some (.notify (.peerStatus s.peer st s.peerReplica)))
-  let fetching := n.missing.length - (sdiff n.missing (busyOf n.sessions)).length
+  -- requests in flight that are still missing: walks `missing` only as far as the (small) busy set
+  let busy := busyOf n.sessions
+  let fetching := (sdiff busy (sdiff busy n.missing)).length
   let sum := (fetching, n.missing.length - fetching)
   let n1 := { n with sessions := sessions }
   if sum == n.summary then (n1, effs)
