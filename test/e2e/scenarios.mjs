@@ -57,7 +57,7 @@ export const scenarios = [
       assert.ok((await B.rows()).some((r) => r.path === f.name), 'the unsaved deletion did not reach B');
       assert.ok(!(await A.eval('window.leansync.log')).some((l) => /saving works again/.test(l)), 'never acknowledged');
       await A.eval('(window.__idbReqFail = false)');
-      await A.click('#retry-save');
+      await A.eval(`(document.querySelector('#retry-save')?.click(), true)`);   // an automatic retry may already have succeeded
       await B.waitFiles(files(g));
       assert.notDeepEqual(await recordOf(A), before);
     },
@@ -298,7 +298,7 @@ export const scenarios = [
       // 3. Recovery.
       if (firefox) await A.eval(`(async () => { const root = await navigator.storage.getDirectory(); const names = []; for await (const n of root.keys()) if (n.startsWith('filler-')) names.push(n); for (const n of names) await root.removeEntry(n); return names.length; })()`);
       else { await A.eval('(window.__idbFail = false)'); await A.page.cdp('Storage.overrideQuotaForOrigin', { origin: ctx.server.url }); }
-      await A.click('#retry-save');
+      await A.eval(`(document.querySelector('#retry-save')?.click(), true)`);   // an automatic retry may already have succeeded
       await A.waitFor(`!document.querySelector('#banner-save') && document.querySelector('#saving').dataset.state === 'saved'`, 30000, 'banner gone after a successful save');
       await B.waitRows((rows) => !rows.some((r) => r.path === gone.name) && rows.some((r) => r.path === keep.name), 30000, 'B gets the deletion once it is saved');
       const failed = firefox ? null : await A.eval('window.__idbFailed');

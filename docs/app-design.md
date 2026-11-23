@@ -236,8 +236,8 @@ dimmed, and downloads under its last component (nothing below the UI restricts p
 
 ## 10. Tests and results
 
-Unit (`node --test test/unit/*.test.mjs`): 36 tests — codec vs Lean (5), links (14), core with the
-real engine (10), relay access (2), view (3)… plus the mutation audit of §4. Engine checks: §0.
+Unit (`node --test test/unit/*.test.mjs`): 34 tests — codec vs Lean (5), links (14), core with the
+real engine (10), relay access (2), view (3), plus the mutation audit of §4. Engine checks: §0.
 End-to-end (`node test/e2e/run.mjs`): 20 scenarios, 51 runs; browsers per run in the table below (Chromium 154.0.8037.92, Firefox 146.0, Firefox ESR
 140.16.0esr, all headless, each device its own browser process and profile).
 
