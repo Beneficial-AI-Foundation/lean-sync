@@ -58,14 +58,10 @@ peer we had answered `noBlob` for it. -/
 def gotBlob (n : Node) (h : Hash) : Node × List Effect :=
   if h ∈ n.blobs then (n, [])
   else
-    let step1 := fun (acc : List Session × List Effect) (s : Session) =>
-      let s1 := { s with inflight := eraseH h s.inflight }
-      if h ∈ s.toldNo then
-        ({ s1 with toldNo := eraseH h s.toldNo } :: acc.1, .send s.peer (.have [h]) :: acc.2)
-      else (s1 :: acc.1, acc.2)
-    let r := n.sessions.foldl step1 ([], [])
-    ({ n with blobs := insertH h n.blobs, missing := eraseH h n.missing, sessions := r.1.reverse },
-      r.2.reverse)
+    let sessions := n.sessions.map (fun s =>
+      { s with inflight := eraseH h s.inflight, toldNo := eraseH h s.toldNo })
+    ({ n with blobs := insertH h n.blobs, missing := eraseH h n.missing, sessions := sessions },
+      n.sessions.filterMap (fun s => if h ∈ s.toldNo then some (.send s.peer (.have [h])) else none))
 
 def gotBlobs (n : Node) (hs : List Hash) : Node × List Effect :=
   let r := hs.foldl (fun (acc : Node × List Effect) h =>
@@ -95,9 +91,9 @@ def reasonOfError : DecodeError → CloseReason
   | .badVersion _ => .incompatible
   | _ => .protocolError
 
-/-- Add hashes to `toldNo`, up to `maxToldNo` entries. -/
+/-- Add hashes to `toldNo` (an unordered list), up to `maxToldNo` entries. -/
 def addToldNo (told : List Hash) (hs : List Hash) : List Hash :=
-  hs.foldl (fun acc h => if acc.length < maxToldNo then insertH h acc else acc) told
+  hs.foldl (fun acc h => if h ∉ acc ∧ acc.length < maxToldNo then h :: acc else acc) told
 
 def onMessage (n : Node) (s : Session) (msg : Message) : Node × List Effect :=
   let p := s.peer
@@ -238,10 +234,8 @@ def reconcilePass (n : Node) : Node × List Effect :=
   match n.published with
   | none => (n, [])
   | some P =>
-    let r := n.sessions.foldl (fun (acc : List Session × List Effect) s =>
-      let x := reconcileSession n.self n.rollback P s
-      (x.1 :: acc.1, acc.2 ++ x.2)) ([], [])
-    ({ n with sessions := r.1.reverse }, r.2)
+    ({ n with sessions := n.sessions.map (fun s => (reconcileSession n.self n.rollback P s).1) },
+      n.sessions.flatMap (fun s => (reconcileSession n.self n.rollback P s).2))
 
 /-- Give each ready session with room the first missing hashes that are in flight nowhere and
 that it has not said it lacks. -/
@@ -263,16 +257,15 @@ def planPass (n : Node) : Node × List Effect :=
   ({ n with sessions := r.1 }, r.2)
 
 def reportPass (n : Node) : Node × List Effect :=
-  let r := n.sessions.foldl (fun (acc : List Session × List Effect) s =>
+  let sessions := n.sessions.map (fun s => { s with reported := sessionStatus n s })
+  let effs : List Effect := n.sessions.filterMap (fun s =>
     let st := sessionStatus n s
-    if st == s.reported then (s :: acc.1, acc.2)
-    else ({ s with reported := st } :: acc.1, acc.2 ++ [.notify (.peerStatus s.peer st s.peerReplica)]))
-    ([], [])
+    if st == s.reported then none else some (.notify (.peerStatus s.peer st s.peerReplica)))
   let fetching := n.missing.length - (sdiff n.missing (busyOf n.sessions)).length
   let sum := (fetching, n.missing.length - fetching)
-  let n1 := { n with sessions := r.1.reverse }
-  if sum == n.summary then (n1, r.2)
-  else ({ n1 with summary := sum }, r.2 ++ [.notify (.pendingSummary sum.1 sum.2)])
+  let n1 := { n with sessions := sessions }
+  if sum == n.summary then (n1, effs)
+  else ({ n1 with summary := sum }, effs ++ [.notify (.pendingSummary sum.1 sum.2)])
 
 def finish (n : Node) : Node × List Effect :=
   let (n1, e1) := persistPass n
