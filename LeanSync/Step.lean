@@ -215,12 +215,15 @@ def persistPass (n : Node) : Node × List Effect :=
   else (n, [])
 
 /-- What one session needs sent, given the published state. -/
-def reconcileSession (self : ReplicaId) (rollback : Bool) (P : Published) (s : Session) :
+def helloPart (self : ReplicaId) (P : Published) (s : Session) : Session × List Effect :=
+  if !s.helloSent then
+    ({ s with helloSent := true, announced := some P.digest }, [.send s.peer (.hello 1 self P.digest)])
+  else (s, [])
+
+def reconcileSession (self : ReplicaId) (rollback : Bool) (P : Published) (s0 : Session) :
     Session × List Effect :=
-  let (s, e) : Session × List Effect :=
-    if !s.helloSent then
-      ({ s with helloSent := true, announced := some P.digest }, [.send s.peer (.hello 1 self P.digest)])
-    else (s, [])
+  let s := (helloPart self P s0).1
+  let e := (helloPart self P s0).2
   if s.ready then
     if !rollback && s.peerDigest != some P.digest && s.lastSent != some P.digest then
       ({ s with lastSent := some P.digest, announced := some P.digest },

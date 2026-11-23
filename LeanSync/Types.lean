@@ -30,7 +30,13 @@ instance : DecidableEq Digest := fun a b =>
 /-- Host-assigned handle of one connection (one session). Fresh for every connection. -/
 structure PeerId where
   val : UInt32
-  deriving DecidableEq, Repr, Inhabited, Ord
+  deriving DecidableEq, Repr, Inhabited
+
+instance : Ord PeerId := ⟨compareOn PeerId.val⟩
+instance : Std.TransOrd PeerId := inferInstanceAs (Std.TransCmp (compareOn _))
+instance : Std.LawfulEqOrd PeerId where
+  eq_of_compare {a b} h := by
+    cases a; cases b; simp only [PeerId.mk.injEq]; exact Std.LawfulEqOrd.eq_of_compare h
 
 /-! ## Peer-to-peer messages (Lean-encoded, carried opaquely by the host) -/
 
