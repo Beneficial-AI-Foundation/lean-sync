@@ -1,9 +1,13 @@
 name = "lean-crdt"
 version = "0.1.0"
-defaultTargets = ["LeanCrdt"]
+defaultTargets = ["LeanCrdt", "LeanSync"]
 
 [[lean_lib]]
 name = "LeanCrdt"
+
+# Sync protocol and wire format on top of the CRDT (see docs/sync-design.md).
+[[lean_lib]]
+name = "LeanSync"
 
 # Spike: Lean -> WebAssembly feasibility demo (see docs/spike-lean-wasm.md).
 [[lean_lib]]
@@ -18,3 +22,8 @@ root = "WasmDemo"
 [[lean_exe]]
 name = "crdt-tests"
 root = "Tests.Main"
+
+# Native tests for the sync protocol and wire format (see Tests/Sync.lean and scripts/test-sync.sh).
+[[lean_exe]]
+name = "sync-tests"
+root = "Tests.Sync"

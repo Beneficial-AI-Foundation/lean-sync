@@ -18,13 +18,17 @@ STACK_KB=${STACK_KB:-256}
 BIN=.lake/build/bin/crdt-tests
 fail=0
 
-lake build || exit 1
+blog=$(lake build 2>&1) || { echo "$blog"; exit 1; }
+echo "$blog" | tail -1
+if grep -q "declaration uses .sorry." <<<"$blog"; then
+  echo "FAIL: lake build reports a declaration that uses sorry"; fail=1
+fi
 lake build crdt-tests || exit 1
 
-if grep -rnE '\bsorry\b|^\s*axiom\b|native_decide|implemented_by|^\s*unsafe\b' LeanCrdt LeanCrdt.lean; then
-  echo "FAIL: forbidden construct found in LeanCrdt/"; fail=1
+if scripts/check-forbidden.sh LeanCrdt LeanCrdt.lean LeanSync LeanSync.lean; then
+  echo "ok: no sorry/axiom/native_decide/implemented_by/unsafe/partial in LeanCrdt/ or LeanSync/ (outside comments)"
 else
-  echo "ok: no sorry/axiom/native_decide/implemented_by/unsafe in LeanCrdt/"
+  echo "FAIL: forbidden construct found in LeanCrdt/ or LeanSync/"; fail=1
 fi
 
 echo "== full tests, default stack"
