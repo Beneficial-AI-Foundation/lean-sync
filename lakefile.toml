@@ -4,3 +4,12 @@ defaultTargets = ["LeanCrdt"]
 
 [[lean_lib]]
 name = "LeanCrdt"
+
+# Spike: Lean -> WebAssembly feasibility demo (see docs/spike-lean-wasm.md).
+[[lean_lib]]
+name = "WasmDemo"
+
+# Native build of the same code, used as the reference the wasm output is checked against.
+[[lean_exe]]
+name = "wasm-demo-native"
+root = "WasmDemo"
