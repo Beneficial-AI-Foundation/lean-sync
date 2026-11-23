@@ -17,7 +17,7 @@ out=$(lake env lean scripts/Axioms.lean 2>&1)
 echo "$out"
 n=$(grep -c "depends on axioms" <<<"$out")
 bad=$(grep "depends on axioms" <<<"$out" | grep -v "depends on axioms: \[propext, Classical.choice, Quot.sound\]$" || true)
-if [ "$n" -lt 22 ] || [ -n "$bad" ] || grep -q "sorryAx\|error" <<<"$out"; then
+if [ "$n" -lt 23 ] || [ -n "$bad" ] || grep -q "sorryAx\|error" <<<"$out"; then
   echo "FAIL: unexpected axioms or errors"; fail=1
 else
   echo "ok: $n headline theorems depend only on propext, Classical.choice, Quot.sound"

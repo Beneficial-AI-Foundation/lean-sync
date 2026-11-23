@@ -1,375 +1,525 @@
-# Sync protocol and wire format: design note (stage 1)
+# Sync protocol and wire format: design and status
 
-Branch `sync-protocol` · Lean 4.36.0 · `Init` only · new library `LeanSync` (`LeanSync/`), built by
-default next to `LeanCrdt`, which is unchanged.
+Branch `sync-protocol` · Lean 4.36.0 · `Init` only · library `LeanSync` (`LeanSync/`), built by
+default next to `LeanCrdt`. The CRDT's definitions and theorem statements are unchanged.
 
-| File | Contents | Status at stage 1 |
+**Status.** Everything is implemented and every theorem is proved: there is no `sorry`, `axiom`,
+`native_decide`, `unsafe`/`implemented_by` or `partial` in `LeanCrdt/` or `LeanSync/`. The
+headline theorems depend only on `propext`, `Classical.choice` and `Quot.sound`
+(`scripts/check-proofs.sh` re-checks both claims). The protocol is tested natively by
+`scripts/test-sync.sh` (§10). It has not been built for wasm; the C-shim change is in §1.
+
+| File | Contents | Runtime? |
 |---|---|---|
-| `LeanSync/Types.lean` | messages, events, effects, session, node, machine | real |
-| `LeanSync/Wire.lean` | limits, `WireOk` predicates, encoders/decoders | limits and predicates real; codec bodies are placeholders |
-| `LeanSync/Step.lean` | `step`, `run`, `process`, exported `processIO` | `step` is a placeholder |
-| `LeanSync/HostModel.lean` | what the host can carry out (`HostView`, `Executable`) | real |
-| `LeanSync/Laws.lean` | theorem statements (proof-only) | statements real, proofs are placeholders |
+| `LeanSync/Types.lean` | messages, events, effects, session, node, machine | yes |
+| `LeanSync/Bytes.lean` | byte-level parsers and writers (varints, fixed bytes, strings, lists) and their correctness | yes |
+| `LeanSync/Wire.lean` | limits, `WireOk`, state and message codecs, round trip and canonicity | yes |
+| `LeanSync/Sets.lean` | sorted hash sets: sort+dedup, one-pass difference | yes |
+| `LeanSync/Step.lean` | the step function | yes |
+| `LeanSync/Envelope.lean` | event/effect envelopes, `process`, exported `processIO` | yes |
+| `LeanSync/HostModel.lean` | what a host can carry out (`HostView`, `Executable`) | used by tests and a theorem |
+| `LeanSync/StepProofs.lean`, `LeanSync/Laws.lean` | proofs; `Laws.lean` states the stage-1 theorems | proofs only |
+| `Tests/Sync.lean`, `scripts/test-sync.sh` | unit, codec and fuzz, simulator, mutation check, scale, stack | tests |
+| `scripts/check-proofs.sh`, `scripts/Axioms.lean` | forbidden-construct grep and `#print axioms` | check |
 
-Every placeholder is a `sorry` tagged `STAGE-1 PLACEHOLDER` (`grep -rn STAGE-1 LeanSync`).
-Placeholders exist only in `LeanSync/`. `scripts/test-crdt.sh` greps only `LeanCrdt/`, so it still passes.
-The Lean code below is copied from those files, which compile; where the two differ, the files are right.
+## 1. Shape and the wasm boundary
 
-## 1. Shape
-
-`step : Machine → Event → Machine × List Effect` is pure, total and deterministic. A `Machine`
-is either `uninit` or `running (n : Node)`. The wasm boundary is one function:
+`step : Machine → Event → Machine × List Effect` is pure, total and deterministic. A `Machine` is
+`uninit` or `running (n : Node)`. One exported function carries everything:
 
 ```lean
-def process (m : Machine) (input : ByteArray) : Machine × ByteArray   -- event in, effects out
+def process (m : Machine) (input : ByteArray) : Machine × ByteArray   -- encoded event in, encoded effects out
 initialize machineRef : IO.Ref Machine ← IO.mkRef .uninit
-@[export lean_sync_process] def processIO (input : ByteArray) : IO ByteArray   -- get, process, set
+@[export lean_sync_process] def processIO (input : ByteArray) : IO ByteArray  -- get, process, set
 ```
 
-The machine lives in an `IO.Ref` between calls. `IO.Ref` comes from `Init`, and the code does no
-other IO. The C shim calls `lean_sync_process` and unwraps the `IO` result. This is a one-time change
-from the spike's pure `ByteArray → ByteArray` shim; after it, the C shim and the JS host stay fixed.
-An input that does not decode yields `[notify (badEvent e)]` and leaves the machine unchanged.
-The output is always a well-formed effect list.
+The machine lives in an `IO.Ref` between calls. `IO.Ref` is part of `Init`, and the code does no
+other IO. A malformed input yields the effect list `[notify (badEvent e)]` and leaves the machine
+unchanged, so the output is always a well-formed effect list.
 
-## 2. Types (`LeanSync/Types.lean`, abridged: doc comments dropped)
+**C-shim change, for the host task.** Do not apply it here, since `wasm/` is not touched.
+Checked against the C that Lean 4.36 generates (`.lake/build/ir/LeanSync/Envelope.c`):
+- **Declarations.** Declare `lean_object *initialize_lean_x2dcrdt_LeanSync_Envelope(uint8_t builtin);`
+  and `lean_object *lean_sync_process(lean_object *input);`. The second takes **one** argument (no
+  world token) and returns an **IO result**.
+- **`lw_init`.** Call `initialize_lean_x2dcrdt_LeanSync_Envelope(1)` instead of the demo's
+  initializer.
+  - Its import closure is `Init`, `LeanCrdt.{Types,SortedList,VersionVector,State}` and
+    `LeanSync.{Types,Bytes,Wire,Sets,Step,Envelope}`. It imports no `Std`, and none of the
+    proof modules.
+  - It also creates `machineRef`, unconditionally.
+- **`lw_process`.** In place of `g_result = lean_wasm_demo_process(in)`:
+  ```c
+  lean_object *res = lean_sync_process(in);            /* consumes `in` */
+  if (!lean_io_result_is_ok(res)) { lean_io_result_show_error(res); lean_dec(res); return 0; }
+  g_result = lean_io_result_get_value(res); lean_inc(g_result); lean_dec(res);
+  ```
+  It cannot fail in practice, because `processIO` only reads and writes the ref.
+- **JS host.** Unchanged: bytes in, bytes out, one call at a time.
+  - After a trap, re-instantiate the module and start again with `init`, as the spike requires.
+  - Edits that were never acknowledged as persisted are lost. They were never sent either, so
+    reusing their dots is safe.
+
+## 2. Types (`LeanSync/Types.lean`, abridged)
 
 ```lean
-structure Digest where bytes : ByteArray; size_eq : bytes.size = 32   -- host SHA-256
-structure PeerId where val : UInt32      -- host handle of ONE connection; never reused in a run
+structure Digest where bytes : ByteArray; size_eq : bytes.size = 32   -- host SHA-256 of a stored record
+structure PeerId where val : UInt32                                     -- one connection; never reused in a run
 
 inductive Message where
   | hello (maxVersion : UInt8) (replica : ReplicaId) (digest : Digest)
-  | digest (d : Digest)                  -- my published state now has digest d
-  | state (d : Digest) (s : State)       -- my whole published state, with its digest
-  | want (hs : List Hash)                -- serve these blobs (only via Effect.fetch)
-  | noBlob (hs : List Hash)              -- I lack these
-  | have (hs : List Hash)                -- I now have these, which I said I lacked
+  | digest (d : Digest) | state (d : Digest) (s : State)
+  | want (hs : List Hash) | noBlob (hs : List Hash) | have (hs : List Hash)   -- sorted batches, 1..1024
   | bye (reason : CloseReason)
 
 inductive Event where
-  | init (self : ReplicaId) (stored : Option ByteArray) (blobs : List Hash)
+  | init (self : ReplicaId) (stored : ByteArray) (blobs : List Hash)    -- restore from the stored record
+  | initFresh (self : ReplicaId) (blobs : List Hash)                    -- empty index, fresh replica id
   | connected (p : PeerId) | disconnected (p : PeerId)
-  | received (p : PeerId) (bytes : ByteArray)       -- one complete Lean message
-  | localOp (op : LocalOp)                          -- putMany | deleteMany | resolve
+  | received (p : PeerId) (bytes : ByteArray)                           -- one complete Lean message
+  | localOp (op : LocalOp)                                              -- putMany | deleteMany | resolve
   | persisted (tag : Nat) (digest : Digest) | persistFailed (tag : Nat)
-  | blobStored (h : Hash) (src : Option PeerId) | blobFailed (p : PeerId) (h : Hash)
-  | blobLost (h : Hash)
-  | query (q : Query)                               -- snapshot | pending | status
+  | blobStored (h : Hash) (src : Option PeerId) | blobFailed (p : PeerId) (h : Hash) | blobLost (h : Hash)
+  | query (q : Query)                                                   -- snapshot | pending | status
 
 inductive Effect where
-  | send (p : PeerId) (msg : Message)
-  | close (p : PeerId) (reason : CloseReason)
-  | persist (tag : Nat) (s : State)                 -- store atomically, hash, answer persisted
-  | fetch (p : PeerId) (hs : List Hash)             -- send `want hs`, accept those streams
+  | send (p : PeerId) (msg : Message) | close (p : PeerId) (reason : CloseReason)
+  | persist (tag : Nat) (s : State)          -- store atomically, hash the stored bytes, answer persisted/persistFailed
+  | fetch (p : PeerId) (hs : List Hash)      -- send `want hs` (bytes in the envelope), accept those streams
   | serveBlob (p : PeerId) (h : Hash)
   | notify (n : Notice) | reply (r : Reply)
-
-structure Session where
-  peer : PeerId
-  helloSent : Bool;  peerReplica : Option ReplicaId     -- `some _` = hello received = ready
-  peerDigest : Option Digest   -- last digest the peer announced
-  announced : Option Digest    -- last digest we announced
-  lastSent : Option Digest     -- digest of the last state we sent in this session
-  inflight lacks toldNo : List Hash;  reported : PeerStatus
-
-structure Published where state : State; digest : Digest
-structure Node where
-  self : ReplicaId
-  current : State                     -- may hold unpersisted local dots
-  published : Option Published        -- last state the host confirmed persisted
-  inflight : Option (Nat × State)     -- the one persist in flight
-  nextTag : Nat;  dirty : Bool        -- current changed since the last persist was issued
-  blobs : List Hash                   -- present locally, strictly sorted
-  sessions : List Session             -- strictly sorted by peer
-  rollback : Bool                     -- host-rule violation detected
 ```
 
-`Notice` covers these cases:
-- `indexChanged` and `blobsChanged`: the UI should re-query;
-- `peerStatus p (handshaking|syncing|inSync) replica`, `peerClosed`, `peerError`;
-- `rollbackDetected`, `opRejected`, `badEvent`, `corruptStore`, `notInitialized`, `alreadyInitialized`.
+The `Node` holds:
+- `self` and `current`, the latest state, which may carry dots not yet persisted;
+- `published`, the last acknowledged state together with its digest, and `inflight`, the one
+  persist in flight;
+- `nextTag` and `dirty`;
+- `blobs`, the sorted set of present blobs, and `missing`, a sorted cache of the hashes referenced
+  by `current` that are not present;
+- `sessions`, sorted by peer;
+- `rollback` and the last pending summary.
 
-`Reply` answers a `query`:
+A `Session` holds:
+- `helloSent`, and `peerReplica`, which is `some` once the peer's hello arrived ("ready");
+- `peerDigest`, `announced` and `lastSent`;
+- `inflight`, `lacks` and `toldNo` (blob bookkeeping, §5), and `reported`.
+
+Notices for the UI:
+- `indexChanged` and `blobsChanged`: re-query;
+- `peerStatus p (handshaking|syncing|inSync) replica`, `peerClosed`, `peerLeft`, `peerError`;
+- `pendingSummary fetching waiting`, which separates "being fetched" from "nobody reachable has
+  it" (§5);
+- `rollbackDetected`, `opRejected`, `badEvent`, `startupFailed`, `notInitialized`,
+  `alreadyInitialized`.
+
+Replies:
 - `snapshot`: each path with its versions, each marked present or not;
-- `pending`: each missing hash, with `requested p` or `waiting`;
-- `status`: persistence state and peer statuses.
+- `pending`: each missing hash, `requested p` or `waiting`;
+- `status`.
+
+Changes since stage 1:
+- `init` takes the stored bytes (no longer optional), and `initFresh` is new (user decision, §7);
+- `persistFailed` and the `fetch` effect were already introduced at the end of stage 1;
+- `startupFailed` replaces `corruptStore`, and `peerLeft` and `pendingSummary` are new.
 
 ## 3. Save-before-send, made structural
 
-**Only one state is ever put on the wire: `published`, the state of the last `persist` the host
-acknowledged.**
-- Every change to `current` (local op or merge) sets `dirty`.
-- When no persist is in flight and `dirty` is set, Lean emits `persist tag current`.
-- On `persisted tag d` with the matching tag, `published := ⟨that state, d⟩`. On a non-matching or
-  duplicate tag, nothing happens.
-- `hello`, `digest` and `state` messages carry only `published` and its digest.
-- At most one persist is in flight. Later changes coalesce into the next persist, so the host never
-  has two writes racing, and a later write can never be overtaken by an earlier one.
+The only state ever put on the wire is `published`: the state of the last persist the host
+acknowledged.
+- Any change to `current` sets `dirty`.
+- When no persist is in flight, the end-of-step pass emits `persist nextTag current`.
+- On `persisted tag d` with the in-flight tag, `published := ⟨that state, d⟩`. Other tags, stale
+  or duplicate, are ignored.
+- `persistFailed tag` clears the in-flight persist and sets `dirty`. The next event retries; the
+  host decides when to call again.
 
-This rule is stricter than the host rule: merged states, which carry other replicas' dots, are also
-persisted before they are forwarded. The cost is a few ms of latency, and the benefit is that a
-reload never has to re-download the index. If the user keeps editing, the peer gets the last
-acknowledged state, so sync is never starved.
+**At most one persist is ever in flight.** Later changes are folded into the next persist. The
+host therefore never has two writes racing, and an earlier write can never overtake a later one.
 
-**The digest comes back with `persisted`.** The host hashes exactly the bytes it stored. So there
-is no separate digest effect/event round trip, and no state that is "changed but digest not yet
-known". Every digest Lean holds is the digest of a durable state, and `published` is one atomic
-`(state, digest)` pair. This bundles two of decision 2's examples into one effect/event pair; I
-think it is strictly simpler. The alternative is a separate `computeDigest`/`digest` pair tagged
-with a state epoch, which drops stale answers.
+**The digest comes with `persisted`** (accepted by the user). The host hashes exactly the bytes it
+stored, so every digest Lean holds belongs to a durable state, and nothing waits on a separate
+digest round trip.
 
-Statement, for **every** event sequence, with no hypothesis (`Laws.lean`, §3):
-`sent_state_acked`: if `send p (.state d s)` is among the effects of step `i`, then `persist t s` was
-emitted at some step `j` and `evs[k] = persisted t _` for some `j < k ≤ i`.
-`save_before_send` is the host-rule form: for every effect that puts a message `m` on the wire
-(`Effect.sentMessage?`) and every replica `r`, the dots of `r` that `m` reveals are bounded by some
-acknowledged state. `persist_tag_unique` and `persist_one_in_flight` make "acknowledged" unambiguous.
-What remains an assumption: the host sends `persisted` only after the write is durable.
+**Merged states are persisted before they are forwarded** (accepted). This is stricter than the
+host rule.
 
-**Rollback detection (new, cheap).** A legitimate peer can never know more of our own dots than
-`current`. So if a received state has `s.context.get self > current.context.get self`, our storage
-was rolled back or our id is shared. In that case Lean sets `rollback`, emits
-`notify rollbackDetected`, and **rejects further local ops**. Continuing under the same id is
-unsafe, because another peer may know even higher counters. The host must restart with a fresh
-replica id. A hello carrying our own replica id closes the session with `sameReplicaId`.
+Proved for **every** event sequence from the uninitialised machine, with no hypothesis (§9):
+- `sent_state_acked`: every `send p (.state d s)` at step `i` carries a state `s` for which
+  `persist t s` was emitted at some step `j < k`, and `evs[k] = persisted t _` with `k ≤ i`.
+- `save_before_send`: the host-rule form, over every effect that puts a message on the wire.
+- `persist_tag_unique` and `persist_one_in_flight`.
+- Remaining assumption: the host answers `persisted` only after the write is durable.
 
 ## 4. Session flow
 
-A session is per connection: `connected p` creates it, and `disconnected p` or our `close p`
-removes it. After **every** event, `step` runs one reconciliation pass over all sessions, in
-`PeerId` order. For a session `x`, with published state `P` (if any), the pass does this:
-
-1. If `P` exists and the hello has not been sent, send `hello 1 self P.digest`.
-2. If `x` is ready (its hello was received):
-   - if `x.peerDigest ≠ P.digest` and `x.lastSent ≠ P.digest`, send `state P.digest P.state`;
-   - else if `x.announced ≠ P.digest`, send `digest P.digest`.
-3. Plan blob requests (§5).
-4. Then, once per step and not per session, issue a persist if one is needed, and emit UI notices
-   for changed statuses.
+After every event, `step` runs the same end-of-step pass:
+1. **persist**, if one is needed;
+2. **reconcile** each session:
+   - send `hello 1 self digest` once `published` exists;
+   - then, on a ready session: if the peer announced a different digest and we have not yet sent
+     this state in this session, send `state digest published`; otherwise, if we have not
+     announced this digest, send `digest d`;
+3. **plan** blob requests (§5);
+4. **report** status changes and the pending summary.
 
 On receipt of a message:
-- `hello`: record the peer's replica id and digest; the session becomes ready.
-- `digest d`: set `peerDigest := d`.
-- `state d s`: set `current := merge current s` and `peerDigest := d`, and run the rollback check.
-- `want`: emit `serveBlob` for present blobs. Answer the rest with `noBlob`, remembered in `toldNo`.
+- `hello`: record the peer's replica and digest. Our own id closes the session with
+  `sameReplicaId`, and `maxVersion = 0` closes it with `incompatible`.
+- `digest d`: record `d`.
+- `state d s`: `current := merge current s`, record `d`, and run the rollback check. If the merge
+  would exceed the size limit, close with `stateTooLarge` and keep `current`.
+- `want`: serve the present blobs; answer the rest with `noBlob` and remember them in `toldNo`.
 - `noBlob`: move the hashes from `inflight` to `lacks`.
 - `have`: remove the hashes from `lacks`.
-- `bye`: remove the session.
-- Any message before `hello`, a second `hello`, an undecodable message, or a bad version:
-  `send bye`, `close`, `notify`.
+- `bye`: drop the session.
+- Anything before `hello`, a second `hello`, an undecodable message, or a wrong version:
+  `send bye`, `close`, notify.
 
-A typical session, where A and B differ:
+**Disconnect at any point.** The session, with its requests, is dropped in that step and its
+requests are re-planned to other peers. A reconnect is a new `PeerId` and a fresh session.
+Messages for an unknown peer are ignored. Duplicate or stale states are harmless, because merge
+is idempotent and only grows the state.
 
-```
-A → B  hello(dA)           B → A  hello(dB)          (both, as soon as each has a published state)
-A → B  state(dA, sA)       B → A  state(dB, sB)      (each sees a different digest and has not sent this state)
-A: merge, persist, ack → published = sA⊔sB → A → B  digest(d')   (B does the same; d' equal on both sides)
-both: peerDigest = own digest → nothing more to send; blob requests start as soon as states merge
-```
+**Local edit mid-session.** The edit is persisted; once acknowledged, the peer gets `digest`, and
+gets `state` unless it already announced that digest.
 
-If the digests are equal at hello, nothing is sent. The protocol is symmetric, so both sides send
-their state on a mismatch, even the side that is behind. That is inherent in decision 1: a digest
-says nothing about direction. Comparing version vectors does not help either, because deletes issue
-no dot.
+**Cost (accepted for the demo).** One edit costs one whole-state send per connected peer: about
+1.6 MB per peer for 20k files. Bursts are folded by the single in-flight persist.
+- A state sent to k peers in one step is encoded k times. Avoiding that would need the envelope
+  to share bytes between effects, which is not free in Lean, so it is left as is.
+- Each received state is also encoded once, to check its size.
 
-**Local edit mid-session.** `current` changes, then persist, then ack, then `published` changes.
-Every ready session then gets `digest`, and also `state` unless the peer already announced that
-digest. One edit therefore costs one whole-state send per peer. Bursts of edits coalesce through
-the single in-flight persist.
+**Rollback mode** (user decision). A received state with `s.context.get self >
+current.context.get self` proves that our storage was rolled back or our id is shared. Lean then
+sets `rollback`, notifies `rollbackDetected`, and from then on:
+- **refuses every local edit** (`opRejected`; proved: `rollback_rejects_local`);
+- **never sends its state** (proved: `rollback_no_state`).
 
-**Disconnect at any point.** The session is dropped with its blob requests, which are re-planned to
-other peers in the same step. Nothing about the session is persisted. A partially received message
-is never delivered, because the host delivers only complete messages. A reconnect is a fresh session
-and starts again with `hello`. Late events for an unknown `PeerId` are ignored. Duplicate or stale
-states are harmless, since merge is idempotent and inflationary.
+It still:
+- accepts and merges incoming states;
+- persists;
+- sends `hello`/`digest`;
+- fetches and serves blobs, and answers `noBlob`/`have`.
 
-**Why it converges (paper argument; the local half is proved).**
-- `step_settles` holds after every step: each ready session has been told our published digest, and
-  either the peer announced the same digest or we sent it our published state in this session.
-- Take two connected nodes A, B at quiescence: every persist is acknowledged, so `published = current`,
-  and every message is delivered.
-- B's announced digest is B's current one. So either `dA = dB`, or A sent `sA` and B merged it, so
-  `sA ≤ sB`. Symmetrically, `sB ≤ sA`. Hence `sA = sB`, by `encodeState_inj` and SHA-256 collision
-  resistance for the digest case, and by `Le` antisymmetry otherwise.
-- Transitivity over the topology follows. The simulator checks the whole claim (§8).
+Why this is the most conservative option that cannot make things worse for other devices:
+- The only thing that can spread damage is a `state` message, whose possibly colliding dots other
+  devices would merge, and those are stopped.
+- Digests and hellos reveal no dots.
+- Blob bytes are checked against their SHA-256 by the receiving host, so serving cannot spread
+  wrong content.
+- Merging incoming states changes only this device, and only adds what peers already hold. It
+  keeps the user's view current, and keeps the persisted state complete for the restart under a
+  fresh id.
 
-## 5. Blobs: presence, pending, and who to ask
+Honest limit: dots issued before detection may already have reached peers. Detection only stops
+further damage. The host must restart with a fresh replica id.
 
-- `blobs` holds the hashes present locally. It is rebuilt at `init` from the host's listing. It is
-  updated by `blobStored`, by local puts (the host stores a blob before reporting the op), and by
+**Why it converges.** The local half is proved; the global half is a paper argument, checked by
+simulation.
+- **Proved,** `step_settles`: after every step, for every ready session of a node not in rollback
+  mode, we announced our published digest, and either the peer announced the same digest or we
+  sent it our published state in this session.
+- **Paper argument for two connected nodes A, B at quiescence.**
+  - At quiescence every persist is acknowledged (`published = current`), every message is
+    delivered (the channel is reliable and ordered), and neither node is in rollback mode.
+  - B's last announced digest is B's current one. So either `dA = dB` (equal states, by
+    `encodeState_inj` and SHA-256 collision resistance), or A sent `sA` in this session and B
+    merged it, so `sA ≤ sB`.
+  - Symmetrically `sB ≤ sA`, hence `sA = sB`.
+  - Transitivity over a connected topology follows.
+- The simulator checks the whole claim, end to end (§10).
+
+## 5. Blobs: presence, pending, who to ask
+
+- **Present blobs.** `blobs` is rebuilt at `init` from the host's listing, and updated by
+  `blobStored`, by local puts (the host stores the blob before reporting the op), and by
   `blobLost`.
-- The **missing** set is the hashes referenced by `current` and absent from `blobs`. This includes
-  every sibling of a conflict, because every device stores every file. A file is complete iff all
-  its versions are present.
-- **Planning**, after every event: for each missing hash, in hash order, that is not in flight
-  anywhere, pick the ready session that does not list it in `lacks` and has the fewest requests in
-  flight, with ties going to the smaller `PeerId`. Each session is capped at `maxInflightPerPeer`.
-  The requests to one peer become a single `fetch p hs`.
-  - Lean does not know which peer has which blob. It asks, and a peer without the blob answers
-    `noBlob`. That costs one round trip, and avoids advertising whole blob sets.
-- **Transitive case** (A has the blob, B is fetching it from A, and C asks B): B answers `noBlob`
-  and records the hash in `toldNo`. When B stores the blob, it sends `have` to C, and C asks again.
-  `step_no_owed_have` proves B owes no `have` after any step. `toldNo` is capped at `maxToldNo`;
-  past the cap, C retries only on its next session with B.
-- `blobFailed p h` marks `h` as lacked from `p` for the rest of that session, so that a peer serving
-  corrupt data cannot cause a retry loop.
-- **A hash no connected peer has** stays `waiting`. That is not an error: there is no clock, so
-  there is no timeout. It is asked for again when a new session becomes ready or a `have` arrives.
+- **Missing blobs.** `missing` is the set of hashes referenced by `current` that are not present,
+  every sibling version included. A file is complete when all its versions are present.
+- **Planning,** after every event. Each ready session **to which we have sent our hello**, in
+  `PeerId` order, with fewer than 32 requests in flight, receives one `fetch` for the first
+  missing hashes that are neither in flight anywhere nor listed as lacking at that peer.
+  - The simulator found that requesting before our own hello makes the peer reject the session.
+    This was a real bug, now fixed; `step_plans_blobs` changed with it (§9).
+  - Proved, `step_plans_blobs`: after every step, each missing hash is in flight somewhere, or
+    every greeted ready session either lacks it or is full.
+- **Chains** (A has a blob, B is fetching it, C asks B). B answers `noBlob` and records the hash
+  in `toldNo`. When B stores the blob it sends `have` to C, and C asks again.
+  - Proved, `step_no_owed_have`: no `have` is owed after any step.
+  - `toldNo` is capped at 4096 per session; past that, C retries on its next session with B.
+- `blobFailed p h` marks `h` as lacked at `p` for that session, so a peer serving corrupt data
+  cannot cause a retry loop.
+- **"Pending, being fetched" versus "waiting, nobody reachable has it"** (user decision: no
+  clock, wait indefinitely).
+  - `pendingSummary fetching waiting` is emitted whenever the pair changes, and the `pending`
+    query lists each hash with `requested p` or `waiting`.
+  - A waiting hash is asked for again when a new session is greeted or a `have` arrives.
   - If the device that wrote it later superseded it, the next index sync removes the reference.
-  - If that device is gone forever, the file stays pending until the user deletes or overwrites it.
-  - The UI should show "waiting for a device that has this file".
-- Serving: the serving host streams the blob. If it cannot read the blob, it aborts the stream,
-  which the requester's host reports as `blobFailed`, and it reports `blobLost` to its own Lean.
+  - If that device is gone for good, the file stays pending until the user deletes or overwrites
+    it.
 
 ## 6. Wire format, version 1
 
-Integers are canonical unsigned LEB128 (no overlong forms, at most 10 bytes, value < 2^64).
-`ReplicaId` is 16 bytes big-endian `(hi, lo)`. Hashes and digests are exactly 32 bytes. A string is
-a varint byte length followed by valid UTF-8. Every top-level value starts with
-`[version = 1][kind]`, where kind is 1 = state, 2 = message, 3 = event, 4 = effect list.
+The format is defined in `Wire.lean` and `Envelope.lean`.
+- **Integers** are canonical unsigned LEB128: no overlong forms, at most 10 bytes, value below
+  2^64.
+- **Replica ids** are two such varints, `hi` then `lo`. Stage 1 planned 16 fixed bytes; the
+  varints let the encoding reuse one proved primitive.
+- **Hashes and digests** are exactly 32 bytes in states and messages.
+- **Strings** are a varint length followed by validated UTF-8.
+- **Every top-level value** starts with `[version = 1][kind]`, where kind is 1 = state,
+  2 = message, 3 = event, 4 = effect list.
 
 ```
-state    := 01 01 ctx:varint r { replica:16 counter:varint≥1 }^r        (replica strictly increasing)
-                  n:varint     { path:str idx:varint<r counter:varint hash:32 }^n
-            -- entry dot = (ctx[idx].replica, counter), 1 ≤ counter ≤ ctx[idx].counter: coverage is
-            --   structural, and the check is O(1) through an Array of the context
-            -- entries strictly increasing by (path, dot, hash); this is exactly the CRDT's canonical form
-message  := 01 02 tag:u8 body
-            0 hello  maxVersion:u8 replica:16 digest:32     3 want/4 noBlob/5 have  k:varint∈[1,1024] {hash:32}^k (strictly increasing)
-            1 digest digest:32                              6 bye reason:u8
-            2 state  digest:32 <state without its 2-byte header>
+state   := 01 01 r {hi lo counter≥1}^r  n {path:str idx<r counter∈[1,ctx[idx]] hash:32}^n
+           (replica ids strictly increasing; entries strictly increasing by (path, dot, hash))
+message := 01 02 tag ...  0 hello maxVersion:u8 hi lo digest:32 | 1 digest digest:32
+                          2 state digest:32 <state without its 2-byte header>
+                          3 want | 4 noBlob | 5 have   k∈[1,1024] {hash:32}^k (strictly increasing)
+                          6 bye reason:u8
+event   := 01 03 tag ...  (layout in the header of LeanSync/Envelope.lean)
+effects := 01 04 k {effect}^k   send carries the encoded message; persist the encoded state record;
+                                fetch carries the hashes and the encoded `want` to send verbatim
 ```
 
-- **The digest preimage is the persisted record**, the `state` encoding including its header. The
-  host stores the replica id beside it, in the same IndexedDB record.
-- **Version scheme.** The first byte of every value is the format version, and a decoder rejects any
-  other value with `badVersion`. `hello` stays decodable in v1 forever and advertises `maxVersion`;
-  peers use the minimum. v1 nodes close with `incompatible`.
-- **Limits** (`Wire.lean`): state ≤ 64 MiB (about 500k entries); message ≤ state + 64 B; envelope ≤
-  128 MiB; path ≤ 4096 bytes; batch ≤ 1024 hashes; ≤ 32 sessions; ≤ 32 blob requests in flight per
-  peer. Local ops that would break a limit are rejected with `opRejected`, and so are hashes that
-  are not 32 bytes. A merge whose result would exceed the state limit closes that session with
-  `stateTooLarge`.
-- **Decoders** are total and make one tail-recursive pass, so they run in linear time. Each item is
-  compared with the previous one only, which proves strict sortedness by transitivity, as
-  `strictPaths` does. The output list is built reversed, then reversed once. Nothing is
-  preallocated from a claimed count: each item consumes at least one byte, so a lying count fails
-  as `truncated`. Before parsing, the decoder checks that the input is at most the limit.
-- Event and effect envelopes use the same primitives. In the effect list:
-  - `send` carries the encoded message as a length-prefixed blob, which the host forwards verbatim;
-  - `fetch p hs` carries `hs` and the encoded `want` message;
-  - `persist` carries the encoded state record.
+- **Digest preimage.** The persisted record and the digest preimage are both `encodeState`, header
+  included.
+- **Canonicity.** Two equal states always encode to the same bytes, and the decoder accepts
+  nothing else: `encodeState_of_decodeState` says any accepted input is exactly the encoding of
+  what was decoded.
+- **Versioning.** `hello` stays decodable in v1 and advertises `maxVersion`.
+- **Limits.**
+  - State ≤ 64 MiB (about 500k entries); message ≤ state + 64 B; event ≤ 128 MiB.
+  - Path ≤ 4096 bytes; batch ≤ 1024 hashes; ≤ 32 sessions; ≤ 32 requests in flight per peer;
+    `toldNo` ≤ 4096.
+  - A local op that would break a limit is rejected with `opRejected`, including a hash that is
+    not 32 bytes.
+  - A merge that would exceed the state limit closes that session with `stateTooLarge`.
+- **Decoders** are total and make one tail-recursive pass over their input.
+  - Order is checked only between neighbours.
+  - A dot's coverage is checked in O(1), through an `Array` of the context.
+  - Nothing is preallocated from a claimed count.
+  - The size is checked before parsing.
 
-## 7. Startup, and what the host persists
+## 7. Start-up, reset, and what the host persists
 
-**The host persists exactly two kinds of data.**
-1. One record `{replicaId, stateBytes}`, written atomically for each `persist` effect, replacing the
-   previous record. Only after the write is durable does the host send
-   `persisted tag (SHA-256 stateBytes)`; if the write fails, it sends `persistFailed tag`.
-2. Blobs, stored by hash after SHA-256 verification, before `blobStored` is sent. A local edit's
-   blob is stored before the `localOp` event.
+**Restore.** `init self storedBytes blobs`. If the bytes decode, the node starts from them and
+immediately emits `persist 0 state`; the host may skip the identical write but must answer with the
+digest. Until that acknowledgement, no hello is sent.
 
-Nothing else is persisted: no sessions, tags, pending sets or blob lists.
+**Start-up error** (user decision: never reset silently). If the stored bytes do not decode, Lean
+emits `startupFailed e` and stays uninitialised. The host may retry `init`, for example after
+re-reading storage.
 
-**At startup** the host loads the record and lists the hashes of its stored blobs. If the record is
-missing, or the host cannot guarantee it is the latest one it ever wrote (backup restore, two tabs
-without a Web Lock, a `rollbackDetected` on the previous run), it uses a fresh replica id.
-It then sends `init self stored blobs`. Lean decodes and validates `stored`:
-- on failure it emits `notify (corruptStore e)` and stays `uninit`;
-- otherwise it sets `current := stored` (or `empty`) and immediately emits `persist 0 current`. The
-  host may skip the write if the bytes are identical, but it must answer with the digest.
+**Reset** is a separate, explicit, host-initiated event: `initFresh newId blobs`, which starts an
+empty index. The UI puts it behind a user confirmation, because it loses changes that were never
+synced; blobs on disk are kept. The same event is used for a first start on empty storage.
 
-Until that acknowledgement arrives, `published = none` and no hello is sent. Connections and local
-ops may arrive in the meantime. Any non-`init` event before `init` yields `notInitialized`, and a
-second `init` yields `alreadyInitialized`. A host that traps must re-instantiate the module and
-start again with `init`. Edits that were never acknowledged are lost, and so is nothing else. Those
-edits were never sent, so reusing their dots is safe. The UI should call an edit "saved" only once
-the `persisted` that covers it has arrived.
+**Other cases.**
+- Any event before an initialisation yields `notInitialized`.
+- A second `init` yields `alreadyInitialized`.
 
-## 8. Proved versus tested
+## 8. Host obligations (for the JS implementer)
 
-**To be proved** (statements in `LeanSync/Laws.lean`, all placeholders now):
-- **Wire:**
-  - `decodeState_encodeState`: round trip, under `WireOk`;
-  - `encodeState_of_decodeState`: canonicity. Whatever decodes is exactly the encoding of the
-    result, which rules out every non-canonical spelling, including trailing bytes;
-  - `wireOk_of_decodeState`, `encodeState_inj`;
-  - the same four for messages, and `decodeMessage_tooLarge`.
-- **Protocol:**
-  - `sent_state_acked`, `save_before_send`, `persist_tag_unique`, `persist_one_in_flight`;
-  - `effects_executable`: every effect of every step of every event sequence can be carried out by
-    `HostView`. That means: sends, fetches and closes only to open connections; no persist while
-    one is unanswered; serving only blobs reported present; every message within limits;
-  - `step_inv`, the node invariant;
-  - `step_current_grows`: the state only grows and the id never changes;
-  - `step_received_state` and `step_putMany`: exact semantics;
-  - `step_settles`, `step_plans_blobs`, `step_no_owed_have`, `step_detects_rollback`.
-- **Stretch:** round trip for the event and effect envelopes. I commit only to testing these.
+**What to persist, and when.**
+1. **The record.** Store `{replicaId, stateBytes}` in **one** atomic IndexedDB transaction for each
+   `persist tag stateBytes`, replacing the previous record.
+   - Only after the transaction commits, send `persisted tag SHA-256(stateBytes)`.
+   - If it fails, send `persistFailed tag`; back-off is the host's job.
+   - Lean never has two persists outstanding. Do not reorder writes.
+2. **Blobs.** Store a blob durably, after verifying its SHA-256, *before* sending `blobStored`.
+   For a local edit, store the blob *before* sending the `localOp` that refers to it.
+3. **Nothing else** is persisted: no sessions, tags, pending sets or blob lists.
 
-**To be tested** (natively; `crdt-tests sync ...` or a sibling `sync-tests` exe, wired into
-`scripts/test-crdt.sh` including the small-stack run):
-- unit flows for each message and event, including out-of-order, duplicate and stale cases;
-- codec round trips, and a fuzz of mutated valid encodings: bit flips, truncation, insertion,
-  deletion, duplicated spans, lying counts. Each mutant must either fail to decode or re-encode to
-  exactly the input, and must never crash;
-- a seeded, deterministic simulator:
-  - N devices, each with a model host: a storage record, a blob store, delayed persists and
-    failures, and blob streams that are delayed, dropped or corrupted;
-  - per-connection FIFO queues; random local ops, connects and disconnects, drops at any point,
-    crash and restart from the persisted record, and injected corrupt or duplicate messages;
-  - after every step it checks `HostView` executability and a boolean version of `Node.Inv`. It
-    also keeps a global **dot registry**: every dot ever revealed on the wire, with its
-    `(path, hash)`. Seeing the same dot with different content is a host-rule violation;
-  - at the end it connects a spanning set and drains, then requires equal states everywhere, all
-    blobs present, `published = current`, and settled sessions. The seed is printed on failure;
-- mutation checks: deliberately broken steps must be caught. Examples: send `current` instead of
-  `published`, ignore `lastSent`, forget `have`, accept a mismatched persist tag;
-- scale: 20k paths, full initial sync of 3 devices, timed. Stack: the scale sync and the decoders
-  must pass under `LEAN_STACK_SIZE_KB=256`.
+**Start-up.**
+- Hold a Web Lock, so that one tab owns the storage.
+- Load the record and list the stored blob hashes.
+  - If there is no record: `initFresh newId hashes`.
+  - If the record is trustworthy: `init id bytes hashes`.
+  - If you cannot vouch that the record is the latest one written (backup restore, lost
+    storage, previous `rollbackDetected`): `init newId bytes hashes`, with a fresh id.
+- On `startupFailed`: show the error, and offer a reset, which is `initFresh newId hashes` after
+  the user confirms.
 
-**Not proved:** convergence and blob liveness across nodes and the network (simulated only), linear
-decoding time, and stack depth (tested).
+**What each effect requires** (Lean guarantees the preconditions; `effects_executable`):
+- `send p bytes`: queue `bytes` on connection `p`, in order. If `p` is already closed, drop it
+  silently: Lean will receive `disconnected p`.
+- `close p reason`: close `p` after the bytes already queued for it.
+- `persist tag bytes`: as in 1 above.
+- `fetch p hashes bytes`: send `bytes` to `p`, then accept blob streams from `p` for exactly those
+  hashes.
+  - Verify each blob's SHA-256 and its size against the host's own limit, store it, and report
+    `blobStored h (some p)`.
+  - Report `blobFailed p h` on a mismatch, an abort, or the size limit.
+  - If the connection drops mid-stream, discard the partial blob and report nothing more for it.
+- `serveBlob p h`: stream blob `h` to `p`. If it cannot be read, send an abort frame for `h` and
+  report `blobLost h`.
+- `notify` and `reply`: for the UI.
 
-## 9. Risks, tensions and open questions for the user
+**What each event promises.**
+- `connected p` and `disconnected p`: once each per connection, and `p` is never reused.
+- `received p bytes`: one complete Lean message, in order, of at most `maxMessageBytes`. The
+  host reassembles its own fragments, and closes a connection that exceeds the limit.
+- `persisted` and `persistFailed`: only for a `persist` the host was given.
+- `blobStored`: the blob is durably stored and verified.
+- `blobLost`: a blob previously reported present is gone.
 
-1. **Digest bundled into `persisted`** (§3), so there is no separate digest effect. Please confirm.
-2. **Every state is persisted before it is sent, merged states included.** This is stricter than the
-   host rule. The extra writes are bounded by the single in-flight persist.
-3. **Whole-state cost** (decision 1). Both sides send on a mismatch, and every local edit during a
-   session costs one full state per connected peer. With 20k files that is about 2 MB per edit per
-   peer. A state sent to k peers appears k times in one effect list, and is re-encoded each time.
-   - Option: a `sendPublished p` effect, where the host builds the message from the record it
-     stored. That keeps save-before-send structural on the host side too.
-   - I propose plain `send` for v1, and to measure first.
-4. **Blob GC is out of scope**, so superseded blobs accumulate. A safe rule for later: a host may
-   delete a blob only if the *published* state does not reference it. A peer that still references
-   it then gets `noBlob`, and drops the reference at its next index sync with a device that
-   superseded it. Decide when, and whether, GC is wanted.
-5. **Hashes with no source**, and files pending forever (§5). There is no timeout without a clock;
-   the user resolves it by deleting or overwriting the file. Should Lean accept `tick` events to
-   report "stuck for a long time"?
-6. **Rollback response**: reject local ops until a restart with a fresh id. Syncing continues, so our
-   possibly colliding dots keep spreading. The alternative is to quarantine: stop sending our state.
-   Which do you prefer?
-7. **Corrupt stored state** at startup: Lean refuses to start. The host's only recovery is a fresh id
-   and an empty state. Paths edited only on this device and never synced are then lost, although
-   their blobs remain on disk and could be offered as "recovered files". This is a product
-   decision.
-8. **Limits**: a 64 MiB index caps the index at about 500k entries. A merge exceeding the limit closes
-   the session rather than producing an unsendable state.
-9. **Unsolicited blob streams.** The host accepts streams only for `fetch`ed hashes and enforces its
-   own maximum blob size. Lean never learns blob sizes, because the index has no size field, so the
-   UI cannot show the size of a pending file. Should a size go into the index? That would be a
-   CRDT change, so I have not made it.
-10. **Boundary signature** changes to `ByteArray → IO ByteArray` (§1), a one-time shim edit. The
-    alternative is to keep the state as an opaque handle in the C shim.
-11. **Cost.** Each event does O(n) bookkeeping: missing-set computation, sorted-list membership, and
-    the O((n+m)·r) merge. A full initial sync of 20k blobs therefore costs about 20k × O(20k) hash
-    comparisons, spread over the transfer time. That is acceptable but quadratic in total.
-    Batching `blobStored` events or adding an indexed set is the fix if measurements demand it.
-12. **Proof risk.** The codec proofs are the largest item. Core 4.36 has the needed `ByteArray`
-    lemmas (`size_append`, `getElem_append_*`, `extract_*`), and `String` is `ByteArray` plus
-    validity with decidable `IsValidUTF8`, so string round trips are direct. The trace theorems
-    need an invariant that relates `Node.inflight` to the trace; I expect them to be routine but
-    long. If a statement turns out false, I will stop and report rather than weaken it.
+**Framing.** On a data channel the host multiplexes fragments of Lean messages and blob-stream
+frames. That framing belongs to the host and is invisible to Lean.
+
+## 9. Theorems
+
+All of these are proved in `LeanSync/Laws.lean`, with lemmas in `StepProofs.lean` and `Wire.lean`.
+
+| Group | Theorem | Statement |
+|---|---|---|
+| Wire | `decodeState_encodeState` | `s.WireOk → decodeState (encodeState s) = .ok s` |
+| Wire | `encodeState_of_decodeState` | canonicity: whatever decodes is exactly the encoding of the result |
+| Wire | `wireOk_of_decodeState` | decoded states are `WireOk`, and carry the CRDT invariants by construction |
+| Wire | `encodeState_inj` | equal encodings ⇒ equal states |
+| Wire | four message counterparts | `decodeMessage_encodeMessage`, `encodeMessage_of_decodeMessage`, `wireOk_of_decodeMessage`, `decodeMessage_tooLarge` |
+| Trace | `sent_state_acked`, `save_before_send` | §3 |
+| Trace | `persist_tag_unique`, `persist_one_in_flight` | §3 |
+| Host | `effects_executable` | every effect of every step of every event sequence is executable by `HostView`, which models the host from the events and effects so far |
+| Step | `step_inv` | the node invariant holds after every step: sortedness, caps, `missing` = refs(current) \ blobs, published/in-flight ≤ current, owed-`have` bookkeeping, `WireOk` states |
+| Step | `step_current_grows` | the state only grows and the replica id never changes |
+| Step | `step_received_state`, `step_putMany` | exact merge and `putMany` semantics |
+| Step | `step_settles`, `step_plans_blobs`, `step_no_owed_have` | §4 and §5 |
+| Step | `step_detects_rollback`, `rollback_no_state`, `rollback_rejects_local` | rollback mode (§4) |
+
+**Statements changed since stage 1**, each marked in `Laws.lean`:
+1. **`step_putMany`** gains `n.rollback = false`. Local edits are refused after a rollback. The
+   stage-1 statement was already false under the stage-1 design, which refused them too; I missed
+   that at stage 1.
+2. **`step_settles`** gains `n'.rollback = false`. In rollback mode no state is sent (your
+   decision), so sessions cannot settle.
+3. **`step_plans_blobs`** restricts the "no peer can take it" disjunct to sessions with
+   `helloSent`. This follows the hello-first bug fix (§5): a ready session we have not greeted yet
+   cannot be asked.
+
+**Definitions refined.**
+- `Node.Inv` gained fields (the `missing` cache, per-session facts), which makes `step_inv`
+  stronger.
+- `State.WireOk` keeps its stage-1 shape, with the path size written as `toByteArray.size`, which
+  equals `utf8ByteSize`. The count bounds that the varint encoding needs are *derived* from the
+  size bound (`fieldsOk_of_wireOk`), not added as assumptions.
+- `rollback_no_state` and `rollback_rejects_local` are new.
+
+**Re-run the no-placeholder claim:** `scripts/check-proofs.sh`. It greps the libraries for
+`sorry`, `axiom`, `native_decide`, `implemented_by`, `unsafe` and `partial`, and runs
+`#print axioms` on 23 headline theorems. Each must list exactly
+`[propext, Classical.choice, Quot.sound]`.
+
+**What is proved, argued, and only simulated:**
+- **Proved:** everything in the table above.
+- **Argued on paper, checked by simulation, not proved:**
+  - global convergence of several nodes (§4);
+  - blob liveness: once connected enough and quiescent, every referenced blob that some
+    connected device holds reaches every device. This follows from `step_plans_blobs`, the
+    `have` mechanism and transitivity.
+- **Tested only:**
+  - the event and effect envelope round trips;
+  - linear decoding time;
+  - stack depth.
+
+## 10. Tests (`scripts/test-sync.sh`; `sync-tests <subcommand>`)
+
+All of these passed in the final run, both with the default stack and with
+`LEAN_STACK_SIZE_KB=256`.
+
+**`unit`** (47 checks) covers every flow of §4 to §7:
+- the persist-before-send ordering;
+- stale and duplicate acknowledgements;
+- protocol errors: before hello, bad version, own id;
+- the session cap;
+- re-planning on disconnect, and the `noBlob` → `have` chain;
+- `blobFailed`;
+- rollback mode;
+- `startupFailed`, then `initFresh`;
+- the pending summary and the queries.
+
+**`codec`**:
+- **Round trips:** 200 random `WireOk` states, and 300 each of random messages, events and effect
+  lists, compared at byte level.
+- **Truncation:** every proper prefix of six encodings (6,937 prefixes) must be rejected. The six
+  are a state with 28 entries and 3 replicas, a state message, a 20-hash `want`, a `hello`, an
+  `init` event and an effect list.
+- **Mutation fuzz:** 24,000 mutants of states, messages and events, made by bit flips, overwrites,
+  inserts, deletes, duplicated spans and huge varint counts. Each must fail to decode or re-encode
+  to exactly the mutated bytes; there were no crashes.
+  - States: 7,331 rejected, 669 accepted.
+  - Messages: 7,244 rejected, 756 accepted.
+  - Events: 6,729 rejected, 1,271 accepted.
+- **Random bytes:** 18,000 random inputs, all rejected.
+
+**`sim 1 200`**: 200 seeds × 4 devices × 400 random steps, then quiescence.
+- **Faults injected over the 200 seeds:**
+  - 2,111 connection drops at arbitrary points and 783 crash/restarts from the persisted record;
+  - 553 persist failures and delayed acknowledgements;
+  - 97 blob-transfer failures and 414 blob losses (only when another copy exists);
+  - 370 garbage, 192 truncated and 186 duplicated messages.
+- **Volume:** 81,894 events, of which 20,580 went through `process` and the byte envelopes, and
+  15,451 state sends.
+- **Checked after every event:**
+  - save-before-send, through a global **dot registry**: no dot is ever seen on the wire with two
+    different contents;
+  - every sent state equals a state its host acknowledged;
+  - every effect is executable in `HostView`;
+  - the node invariants;
+  - hello-first order on every connection.
+- **At quiescence:** all connections are rebuilt as a full mesh, a chain, or sequential pairs
+  (by seed). The run then requires equal states, `published = current`, no persist in flight, and
+  every referenced blob present on every device.
+- **Result:** 0 failing seeds.
+- **Not injected:** bit corruption that still decodes. The transport has integrity, and the trust
+  model excludes it.
+
+**`mutation`** runs broken step functions through the strict simulator, 30 seeds each:
+
+| Mutant | Caught on |
+|---|---|
+| state sends carry `current` instead of `published` | 30/30 |
+| no `have` sent | 8/30 |
+| received states ignored | 30/30 |
+| a send after disconnect | 30/30 |
+
+The real step function is clean on 30/30 seeds. Earlier, the simulator caught the real
+want-before-hello bug on 83 of 200 seeds.
+
+**`scale 20000`**: 20,000 files on one device, then a full sync of two fresh devices: the index
+plus 40,000 blobs, 79,962 events.
+- `putMany` of the 20k files plus their persist: 0.7 s.
+- The whole sync: about 33 s native, of which about 19 s is inside `step`.
+- It passes under the 256 KB stack.
+
+**`stepbench n`** gives compiled per-event costs. At 20k entries:
+- merging the 20k-entry state and persisting it: about 27 ms;
+- `blobStored`: about 120 µs;
+- an event that changes nothing: about 85 µs;
+- a 32-hash `want`: about 110 µs.
+
+## 11. Costs and limits (accepted), with the fix I would make
+
+| Limit | Fix |
+|---|---|
+| One edit during a session costs a whole-state send per peer (§4) | a `sendPublished` effect that rebuilds the message from the stored record, or index deltas: both declined for the demo |
+| O(n) blob bookkeeping per event: sorted-list membership, the `missing` cache, the summary length; at 20k files about 0.1 ms per event native, so a full initial sync of 20k blobs costs about 19 s of `step` time over the transfer | balanced-tree or array-indexed sets; a cached missing count |
+| Index ≤ 64 MiB, about 500k entries; a merge past the limit closes the session | raise the limit (a version bump), or chunked state messages |
+| A state sent to k peers in one step is encoded k times | share the encoded bytes between effects |
+| Merge is O((n+m)·r) (CRDT note, risk 5) | as in the CRDT note |
+
+## 12. Future work and open points
+
+- **Blob GC** is not done (user decision), so storage grows with superseded versions. A safe rule
+  for later:
+  - a host may delete a blob only when the **published** state does not reference it, and only
+    after that state is acknowledged;
+  - a peer that still references it then gets `noBlob`, and drops the reference at its next index
+    sync with a device that superseded it.
+- **File sizes or other metadata** in the index are not in v1 (user decision). Adding them is a
+  CRDT `Entry` change *and* a wire-format version bump (`wireVersion` 2, negotiated through
+  `hello.maxVersion`).
+- **Deltas or `sendPublished`**: see §11.
+- **Not yet run under wasm.** The import closure is `Init` only, but startup time, size and stack
+  depth have not been measured there.

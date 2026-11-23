@@ -5,7 +5,7 @@ import LeanCrdt.State
 
 Executable module: imports only `Init` (through `LeanCrdt.State`).
 
-STAGE 1: these types are the design; they are real (no placeholders). See `docs/sync-design.md`.
+See `docs/sync-design.md` for the protocol, the wire format and the host obligations.
 
 Naming: a *node* is the protocol state of one device (one replica id); a *session* is one live
 connection to one peer, identified by a host-assigned `PeerId` that is never reused within one

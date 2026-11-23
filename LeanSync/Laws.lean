@@ -170,4 +170,11 @@ theorem rollback_no_state (n : Node) (ev : Event) (h : n.Inv) (hrb : n.rollback 
   · exact handle_no_state _ _ p d s he
   · exact rollback_mode_no_state h hrb ev he
 
+/-- New: once a rollback was detected, local operations are rejected: the state is unchanged. -/
+theorem rollback_rejects_local (n : Node) (op : LocalOp) (hrb : n.rollback = true) :
+    ∃ n', (step (.running n) (.localOp op)).1 = .running n' ∧ n'.current = n.current := by
+  refine ⟨_, rfl, ?_⟩
+  rw [(finish_core _).current]
+  simp only [handle, hrb, ite_true]
+
 end LeanSync
