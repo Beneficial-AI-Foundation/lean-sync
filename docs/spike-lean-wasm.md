@@ -94,6 +94,37 @@ What `build.sh` does and costs, from scratch:
 - Probes: `panic!` prints the message and returns the default value, as on native. Exceeding the stack
   throws a JS `RangeError` out of `lw_process`.
 
+## Known gaps in the spike harness (not fixed)
+
+A second review of `d2ab800` found these nine issues. All of them are in spike scaffolding (`wasm/index.html`,
+`wasm/serve.mjs`, `wasm/check-node.mjs`) that the real build will replace, so they were recorded rather than fixed.
+None of them affects the Lean/wasm build itself, but a harness pass is less strong evidence than it looks.
+
+1. **[P2][carry] Trapped instance is reused** (`wasm/index.html`). After a trap, such as `!deep N` exhausting the
+   stack, the Run button stays enabled and reuses the same, possibly corrupted, instance.
+2. **[P2][carry] Oracle uses the input the page reports** (`wasm/serve.mjs`), not the input assigned to the run.
+   If the page stopped honouring `?input=`, the probe runs would still pass on the default text.
+3. **[P2] `display` is the pre-render string** (`wasm/index.html`). The check sends the `report` string rather
+   than reading the output element, so a blank or wrong render would still pass.
+4. **[P2] A JSON `null` body kills the server** (`wasm/serve.mjs`). The catch handler reads `r.run` on `null`,
+   throws again, and the unhandled rejection ends the process.
+5. **[P2] Malformed percent-escapes kill the server** (`wasm/serve.mjs`). URL parsing and decoding happen
+   outside the `try`, so the server dies instead of returning 400.
+6. **[P2] Request chunks are decoded independently** (`wasm/serve.mjs`). A multibyte character split across
+   chunks becomes replacement characters and fails a correct run.
+7. **[P2] Platform check takes the first `numBits=` match** (`wasm/index.html`), which can be inside quoted
+   input text rather than the platform line. It should be anchored to line start, as the Node check does.
+8. **[P2][carry] Heap growth is logged, never asserted** (`wasm/check-node.mjs`). Growth over the 2000 repeated
+   calls is printed, but a leak would still end in "all passed".
+9. **[P3] Oracle temp files are never removed** (`wasm/serve.mjs`). The temp directory and input file are left behind.
+
+### Requirements carried forward to the real host and tests
+- **Re-instantiate after any trap** (from 1). The host must discard the module and create a new instance; it must
+  never call into an instance that has trapped.
+- **Verify each run used its assigned input** (from 2). The oracle's input must come from the test, not from
+  what the system under test reports.
+- **Fail on heap growth** (from 8). Repeated-call tests must fail when growth exceeds a steady-state bound.
+
 ## What was hard or fragile and will bite later
 
 - **Upstream's Emscripten path is unmaintained.** The CI job is commented out and the code has bit-rotted
