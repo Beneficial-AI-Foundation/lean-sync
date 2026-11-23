@@ -59,7 +59,7 @@ const M = [
   { id: 'missing-blob-not-reported', row: 'blobLost when found gone', file: 'app/js/core.mjs',
     from: "        if (e?.name === 'NotFoundError') {", to: '        if (false) {', check: e2e('damaged-or-missing-blob-recovers') },
   { id: 'damaged-copy-kept', row: 'blob verified and durable', file: 'app/js/storage.mjs',
-    from: '    if (await hasBlob(hx)) await blobsDir.removeEntry(hx);\n    await fh.move(blobsDir, hx);', to: '    if (await hasBlob(hx)) await removeIncoming(name); else await fh.move(blobsDir, hx);', check: e2e('damaged-or-missing-blob-recovers') },
+    from: 'if (await hasBlob(hx) && await existingIsIntact(hx)) {', to: 'if (await hasBlob(hx)) {', check: e2e('damaged-or-missing-blob-recovers') },
   { id: 'peer-ids-reused', row: 'PeerIds never reused', file: 'app/js/links.mjs',
     from: 'c.peer = nextPeer++;', to: 'c.peer = byPeer.size + 1;', check: unit('links') },
   { id: 'close-before-queued-bytes', row: 'close after queued bytes', file: 'app/js/links.mjs',
