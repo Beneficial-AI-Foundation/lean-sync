@@ -1,0 +1,6 @@
+name = "lean-crdt"
+version = "0.1.0"
+defaultTargets = ["LeanCrdt"]
+
+[[lean_lib]]
+name = "LeanCrdt"
