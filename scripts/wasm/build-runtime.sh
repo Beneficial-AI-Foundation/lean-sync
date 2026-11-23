@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# Build the Lean C++ runtime (src/runtime) with Emscripten into build/<arch>/libleanrt.a.
-# usage: build-runtime.sh wasm32|wasm64
+# Build the Lean C++ runtime (src/runtime) with Emscripten into build/libleanrt.a.
 source "$(dirname "$0")/common.sh"
-ARCH="$1"
-OUT="$BUILD/$ARCH/rt"
+OUT="$BUILD/rt"
 mkdir -p "$OUT" "$BUILD/gen/include/lean"
 
 # Headers normally produced by CMake's configure_file.
@@ -33,14 +31,14 @@ SRCS=(debug thread mpz utf8 object apply exception interrupt memory stackinfo co
       process object_ref mpn mutex libuv openssl cadical
       uv/net_addr uv/event_loop uv/timer uv/tcp uv/udp uv/dns uv/system uv/signal)
 
-CFLAGS="$(common_cflags "$ARCH") -std=c++20 -Wno-deprecated-declarations"
+CFLAGS="$(common_cflags) -std=c++20 -Wno-deprecated-declarations"
 export CFLAGS OUT LEAN_SRC
 printf '%s\n' "${SRCS[@]}" | xargs -P "$JOBS" -I{} bash -c '
   f={}; o="$OUT/${f//\//_}.o"
   if [ ! -f "$o" ] || [ "$LEAN_SRC/runtime/$f.cpp" -nt "$o" ]; then
     em++ $CFLAGS -c "$LEAN_SRC/runtime/$f.cpp" -o "$o" || exit 255
   fi'
-emcc $(common_cflags "$ARCH") -c "$ROOT/wasm/uv_stubs.c" -o "$OUT/uv_stubs.o"
-rm -f "$BUILD/$ARCH/libleanrt.a"
-emar rcs "$BUILD/$ARCH/libleanrt.a" "$OUT"/*.o
-echo "runtime($ARCH): $BUILD/$ARCH/libleanrt.a"
+emcc $(common_cflags) -c "$ROOT/wasm/uv_stubs.c" -o "$OUT/uv_stubs.o"
+rm -f "$BUILD/libleanrt.a"
+emar rcs "$BUILD/libleanrt.a" "$OUT"/*.o
+echo "runtime: $BUILD/libleanrt.a"

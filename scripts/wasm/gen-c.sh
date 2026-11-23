@@ -4,11 +4,10 @@
 #   - our own modules come from Lake (`lake build`, C lands in .lake/build/ir)
 #   - Init/Std modules are re-elaborated from the matching lean4 sources with `lean -c`
 #     (the release ships oleans and static libs for them, but not their C).
-# Output: build/c-raw/<Module/Path>.c (as emitted) and build/c/ (after fix-nat-literals.py,
-# which is what gets compiled), plus build/c-raw/modules.txt.
+# Output: build/c/<Module/Path>.c and build/c/modules.txt
 source "$(dirname "$0")/common.sh"
 ROOT_MODULE="${1:-WasmDemo}"
-OUT="$BUILD/c-raw"
+OUT="$BUILD/c"
 mkdir -p "$OUT"
 
 cd "$ROOT"
@@ -31,4 +30,3 @@ grep -vE '^(Init|Std|Lean)(\.|$)' "$OUT/modules.txt" | while read -r m; do
   cp "$ROOT/.lake/build/ir/$rel.c" "$OUT/$rel.c"
 done
 echo "gen-c: $(wc -l < "$OUT/modules.txt") modules -> $OUT"
-python3 -I "$ROOT/scripts/wasm/fix-nat-literals.py" "$OUT" "$BUILD/c"

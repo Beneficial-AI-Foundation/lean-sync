@@ -2,6 +2,9 @@
 // Emscripten (upstream links a patched libuv for that). In the browser there is no
 // filesystem worth talking to, so these fail with UV_ENOSYS: the corresponding Lean
 // IO actions (stat/lstat, link, unlink, temp files/dirs) return an IO error.
+// Upstream: open PR leanprover/lean4#13298 guards the temp-file calls (uv_os_tmpdir,
+// uv_fs_mkstemp/mkdtemp, uv_fs_req_cleanup) under LEAN_EMSCRIPTEN; as of 2026-11-23 it
+// does not cover uv_fs_stat/lstat/link/unlink, so these stubs stay until upstream does.
 #include <uv.h>
 
 int uv_fs_stat(uv_loop_t *l, uv_fs_t *r, const char *p, uv_fs_cb cb) { (void)l; (void)r; (void)p; (void)cb; return UV_ENOSYS; }

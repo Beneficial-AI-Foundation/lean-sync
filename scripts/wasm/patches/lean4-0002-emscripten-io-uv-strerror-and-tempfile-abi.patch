@@ -1,3 +1,12 @@
+Two independent fixes to src/runtime/io.cpp for Emscripten:
+1. `uv_strerror` is called unconditionally although libuv is not linked on Emscripten.
+   Upstream: open PR leanprover/lean4#13298 guards this (and the libuv calls in
+   createTempFile/createTempDir). Drop this hunk once #13298 is in the pinned Lean.
+2. lean_io_create_tempfile/tempdir still take the IO world argument that the 4.36
+   compiler no longer passes; on wasm, wasm-ld turns the mismatch into a trapping stub.
+   Upstream: issue leanprover/lean4#16089 (closed 2026-11-02, fixed on master after
+   4.36.0). Drop these hunks once the pinned Lean includes that fix.
+
 diff --git a/src/runtime/io.cpp b/src/runtime/io.cpp
 index 0ef8192..62e5fb1 100644
 --- a/src/runtime/io.cpp

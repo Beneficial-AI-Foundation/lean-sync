@@ -15,7 +15,6 @@
 <h1>Lean → WebAssembly spike</h1>
 <p>Loads <code>lean_demo.wasm</code> built from Lean 4 and calls the exported
 <code>WasmDemo.process : ByteArray → ByteArray</code>.
-Architecture: <select id="arch"><option>wasm32</option><option>wasm64</option></select>
 <span id="status">loading…</span></p>
 <textarea id="input">héllo wörld — ∀ε>0 🙂</textarea>
 <button id="run" disabled>Run</button>
@@ -25,21 +24,19 @@ import { loadLean } from './host.mjs';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
-const arch = params.get('arch') ?? 'wasm32';
-$('arch').value = arch;
-$('arch').onchange = (e) => { params.set('arch', e.target.value); location.search = params; };
+if (params.has('input')) $('input').value = params.get('input');   // used by headless checks
 
 let lean;
 try {
   const t0 = performance.now();
-  const { default: createLeanDemo } = await import(`./${arch}/lean_demo.mjs`);
+  const { default: createLeanDemo } = await import('./lean_demo.mjs');
   lean = await loadLean(createLeanDemo);
   const total = performance.now() - t0;
-  $('status').textContent = `ready (${arch}): fetch+compile+instantiate ${lean.timings.instantiateMs.toFixed(1)} ms, ` +
+  $('status').textContent = `ready: fetch+compile+instantiate ${lean.timings.instantiateMs.toFixed(1)} ms, ` +
     `Lean init ${lean.timings.leanInitMs.toFixed(1)} ms, total ${total.toFixed(1)} ms`;
   $('run').disabled = false;
-  const { input, out } = run();
-  report({ ok: true, status: $('status').textContent, input, out });
+  const { input, out, display } = run();
+  report({ ok: true, status: $('status').textContent, input, out, display });
 } catch (e) {
   $('status').innerHTML = `<span class="err">failed: ${e}</span>`;
   console.error(e);
@@ -47,12 +44,12 @@ try {
 }
 
 // With ?report=1, POST the result to the dev server (wasm/serve.mjs) for headless checks.
-function report({ ok, status, input, out, error }) {
+function report({ ok, status, input, out, display, error }) {
   if (!params.has('report')) return;
   const b64 = (u8) => btoa(Array.from(u8, (c) => String.fromCharCode(c)).join(''));
   const text = out ? new TextDecoder('latin1').decode(out) : '';
   fetch('/report', { method: 'POST', body: JSON.stringify({
-    ok, arch, status, error, run: params.get('run'), userAgent: navigator.userAgent,
+    ok, status, error, display, run: params.get('run'), userAgent: navigator.userAgent,
     platform: (text.match(/numBits=[^\n]*/) ?? [''])[0],
     inputB64: input ? b64(input) : '', outputB64: out ? b64(out) : '',
   }) });
@@ -69,8 +66,8 @@ function run() {
   const report = new TextDecoder().decode(isReport ? out.subarray(0, out.length - input.length) : out);
   $('out').textContent = `${report}\n[${out.length} bytes out, ${ms.toFixed(2)} ms]`;
   // Machine-readable marker for headless checks.
-  document.title = `done:${arch}:${out.length}`;
-  return { input, out };
+  document.title = `done:${out.length}`;
+  return { input, out, display: report };
 }
 $('run').onclick = run;
 </script>

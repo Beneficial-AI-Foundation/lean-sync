@@ -42,7 +42,8 @@ def bigNum (b : ByteArray) : Nat :=
   (b.extract 0 256).foldl (fun acc x => acc * (x.toNat + 1)) 1 * 2 ^ 200 + factorial 40
 
 /-- Literals between 2^31 and 2^63 are scalars on a 64-bit host but heap objects on
-wasm32; this exercises how the 64-bit compiler's C treats them. -/
+wasm32, where the 64-bit compiler's C mishandles them (see docs/spike-lean-wasm.md).
+Kept as a regression probe: it crashes a wasm32 build that lacks the literal fix. -/
 def midLiterals (n : Nat) : Nat := Id.run do
   let k := 5000000000          -- > 2^32
   let j := 3000000000          -- between 2^31 and 2^32

@@ -1,5 +1,5 @@
 // Minimal JS host for the Lean wasm module: bytes in, bytes out.
-// Works unchanged for wasm32 (pointers are Numbers) and wasm64 (pointers are BigInts).
+// On wasm64 pointers arrive as BigInts; toNum() converts them for HEAPU8 indexing.
 
 const toNum = (p) => (typeof p === 'bigint' ? Number(p) : p);
 

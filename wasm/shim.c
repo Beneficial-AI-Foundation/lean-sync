@@ -6,8 +6,8 @@
 //   lw_process()           -> runs the Lean function on the input; returns result length
 //   lw_result()            -> pointer to the result bytes (valid until lw_release())
 //   lw_release()           -> frees the result
-// Lengths are uint32_t so the JS side sees plain Numbers on both wasm32 and wasm64;
-// pointers are i32 on wasm32 and i64 (BigInt) on wasm64.
+// Lengths are uint32_t so the JS side sees plain Numbers; pointers are i64 on wasm64,
+// i.e. BigInts in JS.
 #include <lean/lean.h>
 #include <emscripten/emscripten.h>
 

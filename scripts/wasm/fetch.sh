@@ -10,6 +10,8 @@ fi
 got=$(git -C "$VENDOR/lean4" rev-parse HEAD)
 [ "$got" = "$LEAN_GITHASH" ] || { echo "lean4 checkout is $got, expected $LEAN_GITHASH" >&2; exit 1; }
 # Local fixes to upstream's (untested, commented-out-in-CI) Emscripten code paths.
+# Each patch file starts with its upstream status (lean4#16089, PR #13298) and when it
+# can be dropped. Lean is pinned at 4.36.0 for the demo.
 for p in "$ROOT"/scripts/wasm/patches/lean4-*.patch; do
   if git -C "$VENDOR/lean4" apply --check "$p" 2>/dev/null; then
     git -C "$VENDOR/lean4" apply "$p"; echo "applied $(basename "$p")"
@@ -17,8 +19,8 @@ for p in "$ROOT"/scripts/wasm/patches/lean4-*.patch; do
 done
 
 if [ ! -d "$LIBUV_SRC" ]; then
-  # Only the headers are used: with LEAN_EMSCRIPTEN the runtime calls no libuv function,
-  # but several runtime headers still #include <uv.h> unconditionally.
+  # Only the headers are used (several runtime headers #include <uv.h> unconditionally);
+  # the few libuv functions io.cpp still calls are stubbed in wasm/uv_stubs.c.
   git clone --depth 1 --branch "$LIBUV_TAG" https://github.com/libuv/libuv "$LIBUV_SRC"
 fi
 

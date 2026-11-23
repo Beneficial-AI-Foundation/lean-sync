@@ -17,21 +17,16 @@ LEAN="$LEAN_TC/bin/lean"
 
 JOBS="${JOBS:-$(nproc)}"
 
-# Per-architecture flags. ARCH is wasm32 or wasm64.
-arch_flags() {
-  case "$1" in
-    wasm32) echo "" ;;
-    wasm64) echo "-m64" ;;   # = Emscripten MEMORY64 (the -s spelling is deprecated)
-    *) echo "unknown arch $1" >&2; exit 1 ;;
-  esac
-}
-
 # Flags shared by every C/C++ compilation unit (runtime and Lean-emitted C).
 #  - LEAN_EMSCRIPTEN: upstream's switch that stubs out libuv/openssl/threads-specific code
 #  - no LEAN_MULTI_THREAD, no LEAN_USE_GMP (Lean's own mpn bignums), no LEAN_MMAP,
 #    no mimalloc (Emscripten's dlmalloc is used)
 #  - -fwasm-exceptions: the runtime uses C++ exceptions (lean::throwable) internally
+#  - -m64: wasm64 / Memory64, the only target (same as Emscripten's deprecated -sMEMORY64).
+#    64-bit pointers make the C emitted by the native 64-bit Lean compiler correct as is;
+#    see docs/spike-lean-wasm.md for why wasm32 was not pursued.
+WASM_ARCH_FLAGS="-m64"
 common_cflags() {
-  echo "-O2 -DNDEBUG -DLEAN_EMSCRIPTEN -fwasm-exceptions $(arch_flags "$1") \
+  echo "-O2 -DNDEBUG -DLEAN_EMSCRIPTEN -fwasm-exceptions $WASM_ARCH_FLAGS \
     -I$BUILD/gen/include -I$LEAN_SRC/include -I$LEAN_SRC -I$LIBUV_SRC/include"
 }

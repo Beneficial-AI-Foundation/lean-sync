@@ -1,6 +1,6 @@
 // Automated check: run the wasm build under Node on several inputs and compare byte-for-byte
 // with the native build of the same Lean code (.lake/build/bin/wasm-demo-native).
-// usage: node wasm/check-node.mjs wasm32|wasm64 [--bench]
+// usage: node wasm/check-node.mjs
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,29 +9,17 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { loadLean } from './host.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const arch = process.argv[2] ?? 'wasm32';
 const native = join(root, '.lake/build/bin/wasm-demo-native');
-// What the platform line must say for the requested arch (guards against a mislabelled artifact).
-const EXPECTED_PLATFORM = {
-  wasm32: 'numBits=32 usizeMax=4294967295 ',
-  wasm64: 'numBits=64 usizeMax=18446744073709551615 ',
-};
-if (!EXPECTED_PLATFORM[arch]) { console.log(`unknown arch ${arch}`); process.exit(2); }
+// The build is wasm64-only; the platform line guards against a wrong (e.g. 32-bit) artifact.
+const EXPECTED_PLATFORM = 'numBits=64 usizeMax=18446744073709551615 ';
 
 const t0 = performance.now();
-const { default: createLeanDemo } = await import(pathToFileURL(join(root, 'build', arch, 'lean_demo.mjs')));
+const { default: createLeanDemo } = await import(pathToFileURL(join(root, 'build', 'lean_demo.mjs')));
 const tImport = performance.now();
 const lean = await loadLean(createLeanDemo);
 const tReady = performance.now();
 
 const enc = new TextEncoder();
-function dropPlatformLine(bytes) {
-  const s = new TextDecoder('latin1').decode(bytes);
-  const i = s.indexOf('\nnumBits=');
-  if (i < 0) return bytes;
-  const j = s.indexOf('\n', i + 1);
-  return Uint8Array.from([...bytes.subarray(0, i), ...bytes.subarray(j)]);
-}
 const big = new Uint8Array(1 << 20).map((_, i) => (i * 7919) % 251);
 const inputs = [
   ['empty', new Uint8Array()],
@@ -50,13 +38,11 @@ for (const [name, input] of inputs) {
   const f = join(tmp, name);
   writeFileSync(f, input);
   const want = new Uint8Array(execFileSync(native, [f], { maxBuffer: 1 << 26 }));
-  // The `numBits=… usizeMax=…` line legitimately differs on wasm32: first check it matches the
-  // requested arch, then compare everything else with native.
+  // Check the module is 64-bit, then require byte-for-byte equality with native.
   const platform = new TextDecoder('latin1').decode(got).split('\n').find((l) => l.startsWith('numBits=')) ?? '';
-  const platformOk = platform.startsWith(EXPECTED_PLATFORM[arch]);
-  if (!platformOk) console.log(`  platform line ${JSON.stringify(platform)} does not match ${arch}`);
-  const a = dropPlatformLine(got), b = dropPlatformLine(want);
-  const ok = platformOk && a.length === b.length && a.every((x, i) => x === b[i]);
+  const platformOk = platform.startsWith(EXPECTED_PLATFORM);
+  if (!platformOk) console.log(`  platform line ${JSON.stringify(platform)} is not 64-bit`);
+  const ok = platformOk && got.length === want.length && got.every((x, i) => x === want[i]);
   if (!ok) failures++;
   console.log(`${ok ? 'PASS' : 'FAIL'} ${name.padEnd(7)} in=${input.length} out=${got.length} ${ms.toFixed(1)}ms`);
   if (!ok) {
