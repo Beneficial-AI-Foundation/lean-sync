@@ -1,7 +1,8 @@
 # Browser app (single machine): design note
 
-Branch `browser-app` · Lean 4.36.0 · Emscripten 6.0.5 (Debian) · wasm64 only. Stage 1: the engine
-is built and checked; this note is the plan for stage 2 and is **not built yet**. Specs:
+Branch `browser-app` · Lean 4.36.0 · Emscripten 6.0.5 (Debian) · wasm64 only. **Built and tested**
+(stage 2); §0 is the engine work of stage 1, §1–§12 describe the app as built, §13 lists what the
+browser forced and what is not done. How to run: `README.md`. Specs:
 `docs/sync-design.md` (protocol, §8 host obligations), `docs/crdt-design.md` (host rule),
 `docs/spike-lean-wasm.md` (build, constraints).
 
@@ -32,221 +33,252 @@ through the JS encoder, wasm and the JS decoder and checks the exact record byte
 (`test/browser-smoke.mjs`) does the same in Chromium 154, Firefox 146 and Firefox ESR 140, each run
 checked against a path the server assigned to it. A steady-state loop (3,000 cycles, each a
 256 KiB message) grew the wasm heap by 0 bytes (bound 1 MiB). Not yet probed under wasm: the frame
-budget with states much larger than 20k entries; replies (`snapshot`, `pending`) are covered by the
-smoke test but not by the replay (the simulator issues no queries).
+budget with states much larger than 20k entries. Replies, which the simulator never produces, are
+covered by the golden vectors (§2). **The leak check can fail:** against a test-only build whose
+shim leaks every input (`scripts/wasm/build-leak-variant.sh`), the same loop grows the heap from
+63.5 MB to 870 MB and the check fails; `check-engine.sh` requires that failure.
 
 **Trap probe.** An allocation of 4 GiB (`_ls_input(0xffffffff)`) makes Lean print `INTERNAL PANIC:
 out of memory` and Emscripten throw `ExitStatus`; afterwards the instance still *accepts* calls, so
 the wrapper (`app/js/engine.mjs`) marks an instance dead on any exception and refuses further calls.
-Under Node, Emscripten's exit also sets the process exit status; tests will pass a `quit` override.
+In the browser e2e test the trap is triggered for real inside the module (§8).
 
-## 1. Module layout
+## 1. Module layout (as built)
 
 ```
-app/                         the shipped static site (copied with the wasm into build/site/)
+app/                         the shipped static site (scripts/build-site.sh copies it with the engine into build/site/)
   index.html, app.css
-  js/main.mjs                boot: lock, storage, engine, core, transport, UI
-  js/engine.mjs              wasm instance wrapper: sync bytes→bytes, dead after any trap   [exists]
-  js/codec.mjs               event encoder, effects/notice/reply decoder                    [exists]
-  js/core.mjs                event queue, pump, effect executor, epochs, start-up, trap recovery
-  js/storage.mjs             IndexedDB record + OPFS blob store, inventory, fault hooks (test mode)
-  js/links.mjs               link ↔ PeerId, host framing, message fragmentation, reconnect policy
-  js/blobs.mjs               blob streams: sender scheduler, receiver with credits, verification
-  js/view.mjs                snapshot + pending → file rows (pure; unit-tested)
-  js/ui.mjs                  DOM: file list, banners, dialogs, drag-and-drop
-  js/transport/relay.mjs     dev transport: WebSocket relay client (implements the interface, §6)
-dev/serve.mjs                dev/test only: static server + WebSocket relay + admin API, 127.0.0.1
-test/                        Node unit tests, engine checks [exist], e2e driver and scenarios
+  js/main.mjs                boot: Web Lock, storage, engine, core, links, transport, UI; window.leansync diagnostics (read-only)
+  js/engine.mjs              wasm instance wrapper: synchronous bytes→bytes, dead after any exception
+  js/codec.mjs               event encoder; effects/notice/reply decoder; the tables the tests check against Lean
+  js/core.mjs                event queue and pump, effect execution, epochs, start-up, trap recovery, user operations
+  js/storage.mjs             IndexedDB record, OPFS blobs (incoming/ → verify → move to blobs/), 256 MiB file limit
+  js/links.mjs               host framing, PeerIds, HELLO / own-id refusal, fragmentation, blob streams with credit
+  js/view.mjs                snapshot + pending → rows (pure)
+  js/ui.mjs                  DOM rendering, dialogs, drag-and-drop
+  js/hash.mjs                WebCrypto SHA-256
+  js/transport/relay.mjs     the transport of this version: client of the dev relay (interface in its header)
+  lean/lean_sync.{mjs,wasm}  (in build/site only) the engine
+dev/serve.mjs                dev/test only: static server + WebSocket relay + admin API; 127.0.0.1 only
+test/unit/                   node --test: codec vs Lean vectors, links, core (real engine), view
+test/e2e/                    driver (CDP / WebDriver BiDi on Node built-ins), lib, scenarios, runner, feature probe
+test/wasm-*.mjs, test/browser-smoke.*   engine checks (§0)
+scripts/build-site.sh, scripts/test-app.sh, scripts/wasm/*   build and checks
 ```
-No framework, bundler or npm package; the relay's WebSocket server and the CDP/BiDi clients are
-hand-written on Node's built-ins. The spike demo (`WasmDemo.lean`, its two lakefile targets,
-`wasm/index.html`, `serve.mjs`, `check-node.mjs`, `host.mjs`, `shim.c`, `check-browsers.sh`) is
-removed in stage 2 unless you want it kept.
+The spike demo was removed. The shipped app contains no test-only code path: all fault injection
+(traps, IndexedDB failure in Chromium, download capture) is done by the test driver from outside,
+through init scripts (`test/e2e/lib.mjs`), so the app under test is byte-identical to what ships.
+`window.leansync` exposes read-only diagnostics (phase, epoch, engine instances, traps, heap size,
+log), which the tests read.
 
 ## 2. Codec: hand-written, differentially tested against Lean
 
-The format is small (15 event forms, 8 effect forms, 14 notices, 3 replies), version-tagged, and
-its Lean side is proved; a generator (Lean metaprogram emitting JS) would be more code than the
-codec and itself unverified. So `codec.mjs` is hand-written, and kept in step by tests that use
-**bytes produced by the current Lean build on every run**: (a) the trace replay above (every real
-envelope must decode); (b) a new `sync-tests vectors` subcommand writes the codec tests' random
-events and effect lists (all constructors, `sendAgain` included) as JSON plus Lean's bytes — JS must
-encode each event to identical bytes and decode each envelope to the JSON; (c) JS must reject every
-proper prefix of each envelope. A format change in Lean breaks (b) at once. The decoder resolves
-`sendAgain p` to the last state message written in full *in the same envelope* (Lean's `effsGo`
-starts each envelope with no state), sharing the same `Uint8Array`.
+`codec.mjs` is hand-written (the format is small and version-tagged; a generator would be more,
+unverified, code). It is kept in step by tests that regenerate their inputs from the current Lean
+build on every run (`scripts/test-app.sh`):
+- `sync-tests vectors` writes 636 cases: one sample of **every** event, local op, query, effect,
+  notice (all 14), reply (all 3), pending status, peer status, close reason and decode error, with
+  edge values (u64-max replica halves, 2^40 tags, peer 2^32−1, empty lists, Unicode and quotes in
+  paths, `sendAgain`), plus 600 random ones. JS must encode each event to identical bytes and
+  decode each envelope to the same values; every proper prefix must be rejected, and a trailing
+  byte too. The Lean renderers are exhaustive matches, so a new constructor breaks their build.
+- `scripts/wasm/Ctors.lean` prints the constructor lists of the ten boundary types from the Lean
+  environment; the JS test fails unless the codec's tables cover exactly those constructors, and
+  unless the vectors exercise every one of them.
+- The 83,729 real envelopes of the trace replay (§0) all decode.
 
-## 3. Event loop
+## 3. Event loop (as built)
 
-One `Core` owns the engine, a FIFO of events, and an `epoch` number. Everything that is an event —
-UI operations, transport messages and link changes, storage and hash completions, back-off timers,
-UI queries — calls `core.enqueue(ev)`. A single pump drains the FIFO: **dequeue one event, encode,
-call `engine.process` (synchronous), decode, then execute every effect in order, synchronously**.
-Executing an effect never awaits: it queues bytes on a link, closes a link, or *starts* an async
-job (IndexedDB write, OPFS write, file read) whose completion later enqueues an event tagged with
-the epoch that started it. Because `process` is synchronous, JS is single-threaded and the pump is
-the only caller (the wrapper also throws on re-entry), events reach Lean strictly one at a time,
-and all effects of event *i* are dispatched before event *i+1* is processed — per-link order is the
-effect order. The engine runs on the main thread: a 20k-file `putMany` + persist took 54 ms under wasm,
-a 20k-entry merge ~10 ms natively (not yet isolated under wasm); moving it to a Worker later
-changes only `engine.mjs`.
+One `Core` (`core.mjs`) owns the engine, a FIFO and an epoch. Every event — UI operation, link
+change, message, storage completion, blob completion, timer — goes through `emit(ev, epoch)`. The
+pump dequeues one event, calls `engine.process` (synchronous; the wrapper also rejects re-entry),
+decodes, and executes every effect in order without awaiting: sends are queued on links, `persist`
+and blob work start async jobs whose completion is a later `emit`. So events reach Lean one at a
+time and all effects of an event are dispatched before the next one. Start-up events (`init`, then
+inventory chunks) are processed directly, in order, before peers are accepted.
 
-Epochs: a restart (trap recovery, rollback restart, reset) increments the epoch. Completions of
-an older epoch are dropped, except that a blob that became durable is re-reported as
-`blobsStored [h]`; `persisted`/`persistFailed` of an older epoch are never delivered (the new
-instance's tags restart at 0, so a stale tag would be misattributed).
+Two rules found necessary while building:
+- **No host-generated events while saves fail.** Every event makes Lean retry the write, and the
+  UI's refresh queries are events; the first version therefore spun at 16 failed writes per second.
+  While `saveFailed` holds, UI queries are deferred to the back-off nudge (1, 2, 4 … 60 s, growing
+  only with the nudges). Real events (peer messages, blob completions) still cause retries — 138
+  failed writes in the Firefox quota test, during a burst of 150 incoming files — which is the
+  protocol's design (any event retries), bounded by the event rate.
+- **A restart cancels pending refreshes** (found by a unit test: a stale debounced query of the old
+  epoch was dropped and the new machine's file list was never requested).
+
+Epochs: a restart increments the epoch; completions of an older epoch are dropped, except that a
+blob that became durable is re-reported as `blobsStored [h]`. Stale `persisted`/`persistFailed`
+never reach the new machine (its tags restart at 0).
 
 ## 4. Host obligations
 
-| Obligation (sync-design §8, user decision 7) | Mechanism | Test |
+| Obligation (sync-design §8, decision 7) | Mechanism | Test |
 |---|---|---|
-| Persist the record atomically, then answer `persisted tag SHA-256(bytes)` | one IDB `readwrite` transaction, `durability:'strict'`, puts `{replica, state}`; digest of exactly the bytes put; event enqueued on `complete` | core unit test with a fake store whose commits are held (no `persisted` before commit); e2e kill-during-persist |
-| Never acknowledge a failed write | `error`/`abort`/exception → `persistFailed tag` | fault hook + real quota (Chromium CDP `Storage.overrideQuotaForOrigin`, Firefox `dom.quotaManager…fixedLimit` pref) |
-| Retry after back-off; surface `saveFailed` | timer 1, 2, 4 … 60 s enqueues `query status`; "Retry now" button; banner until a later `persisted` | e2e storage failure: banner shown, peers receive nothing new, recovery after quota lifted |
-| One persist in flight, no reordering | guaranteed by Lean; host asserts and logs if violated | core unit test |
-| Blobs verified and durable before `blobStored`; local blob before `localOp` | stream → `incoming/<rand>`, close, hash, `move()` to `blobs/<hex>`; only then enqueue; local add = same path, then `putMany` | unit (fake OPFS); e2e add then kill before op: orphan blob, no entry |
-| Nothing else persisted | IDB holds only the record, a `rotateId` flag and the device label (host-level, §5) | review |
-| One owner of the storage | Web Lock `leansync-owner`, `ifAvailable`; a second tab shows "Open in another tab" and starts nothing | e2e second tab in the same profile |
-| Start-up: record → `init id bytes`, none → `initFresh newId`, cannot vouch → `init newId bytes` | `rotateId` flag set on `rollbackDetected` (and by reset); cleared in the same transaction that writes a record under the new id | e2e reload; rollback scenario (restore an older IDB copy) |
-| Inventory before any peer | first ≤10k hashes in `init`, rest as `blobsStored` chunks; transport started only after the last chunk is processed | core unit test (no `connected` before last chunk); e2e reload with many blobs |
-| `startupFailed` → error, reset only on confirmation | error screen: Retry, or Reset (dialog states that unsynced changes are lost) → `initFresh newId`, blobs kept | e2e: corrupt the record bytes in IDB, reload |
-| `sendAgain` | decoder (§2) | codec vectors |
-| `send` to a closed link dropped silently | link lookup by PeerId; missing → drop | core unit test |
-| `close` after queued bytes | CLOSE frame queued behind data; `disconnected` enqueued when the link is gone | e2e protocol error (garbage injected by the relay admin API) |
-| `fetch`: send `want`, accept only those hashes, verify hash and size, report | per-link expected set; unexpected stream → abort; mismatch, abort or > size cap → `blobFailed p h`; link drop mid-stream → delete partial, report nothing | unit; e2e corrupting relay mode; e2e disconnect mid-transfer |
-| `serveBlob`: unreadable → abort frame + `blobLost` | read, hash (also catches bit rot: delete file), stream; failure → ABORT + `blobLost h` | e2e: delete/corrupt a blob file in OPFS, peer asks |
-| `connected`/`disconnected` once each; PeerIds never reused | page-lifetime counter, never reset (not even across engine restarts) | core unit test |
-| `received`: one complete message ≤ `maxMessageBytes` | reassembly of MSG fragments; overflow → close link | unit |
-| `persisted`/`persistFailed` only for persists given | epochs (§3) | core unit test with a trap mid-persist |
-| Rollback mode surfaced | banner; edits disabled in UI; `rotateId` written at once; "Restart with a new identity" re-instantiates with `init newId bytes` | e2e rollback scenario |
-| Discard and re-instantiate after a trap (carried 1) | §8 | e2e with a real trap; Node wrapper test |
+| Persist the record atomically, then `persisted tag SHA-256(bytes)` | `storage.saveRecord`: one `readwrite` transaction with `durability:'strict'` putting `{v,hi,lo,state}`; the promise resolves **only** from the transaction's `complete` event; digest of exactly those bytes | unit `core`: no `persisted` while the save is held; e2e `reload-and-kill-mid-session` |
+| Never acknowledge a failed write | `error`, `abort` or any exception (including Firefox's `InvalidStateError`, Chromium's OPFS `AbortError`) rejects → `persistFailed` | unit `core`; e2e `storage-failure` |
+| Retry after back-off; surface `saveFailed` until resolved | nudge timer; "Retry now"; banner and "not saved" header stay until a later save completes | e2e `storage-failure` (banner still there after 4 s and ≥2 failed retries; peer did not get the unsaved delete) |
+| One persist in flight | Lean; host logs a violation | unit `core` |
+| Blob verified and durable before `blobStored`; local blob before `localOp` | write to `incoming/`, close, hash the **stored** bytes, `move()` to `blobs/<hex>`, then emit; local add the same, then `putMany` | unit `links`; e2e `corrupted-blob…`, `reload-and-kill…` |
+| Nothing else persisted | IDB holds the record, `rotateId` and the device label | review |
+| One owner (Web Lock) | `navigator.locks.request('leansync-owner', {ifAvailable:true})`, held for the tab's life | e2e `second-tab-lock` |
+| Start-up: `init` / `initFresh` / `init newId` | `rotateId` set on `rollbackDetected` and before a user-confirmed new identity; cleared in the same transaction as the first record under the new id | unit `core`; e2e `rollback…`, `startup-failure…` |
+| Inventory before any peer | 10k hashes in `init`, rest in `blobsStored` chunks; `links.setAccepting(true)` only afterwards; links that greet earlier are closed (the remote retries) | unit `core` (25,000 blobs), unit `links` |
+| `startupFailed` → error; reset only after confirmation | start-up failure screen: Try again / Reset… (dialog says what is lost and kept) → `initFresh newId` | unit `core`; e2e `startup-failure-and-reset` |
+| `sendAgain` | decoder, within one envelope | codec vectors |
+| `send` to a closed peer dropped; `close` after queued bytes | per-link queue with a CLOSE marker | unit `links` |
+| `fetch`: accept only those hashes, verify, size limit, `blobFailed`; drop mid-stream discards | per-peer expected set; START over 256 MiB refused before any byte; mismatch/abort/over-credit → `blobFailed`; link loss → partial deleted, nothing reported | unit `links`; e2e `corrupted-blob…`, `disconnect-mid-transfer…` |
+| `serveBlob`: unreadable → abort + `blobLost` | read, verify hash (bit rot: delete), stream; else ABORT + `blobLost` | unit `links` |
+| `connected`/`disconnected` once; PeerIds never reused | page-lifetime counter; `connected` after the host HELLO | unit `links` |
+| `received`: one complete message ≤ limit | reassembly; over the limit closes the link | unit `links` |
+| Persist answers only for persists given | epochs | unit `core` |
+| Rollback mode surfaced; restart only on click + confirm | banner, edit controls disabled, dialog (keeps / loses), then `init newId bytes` | e2e `rollback-detected-then-new-identity` |
+| Re-instantiate after a trap; no loop | §8 | e2e `trap-mid-sync…`, `trap-at-startup…`; unit `core` |
+| Refuse a peer with our own replica id | host HELLO carries the replica id; equal → link closed before Lean sees it (Lean's own `sameReplicaId` check stays behind it) | unit `links`; e2e `same-replica-id-refused` |
 
 ## 5. Storage schema and crash consistency
 
-IndexedDB `leansync`, store `kv`: `record` = `{v:1, replicaHi, replicaLo (BigInt), state:Uint8Array}`;
-`rotateId` = true when the next start must use a fresh id; `label` = device name. OPFS:
-`blobs/<64 hex>` (complete, verified), `incoming/<random>` (partial; emptied at start-up).
-`navigator.storage.persist()` is requested at first start (result shown under "Storage").
+IndexedDB `leansync`/`kv`: `record` `{v:1, hi, lo (BigInt), state}`, `rotateId`, `label`. OPFS
+`blobs/<64 hex>` (verified), `incoming/<rand>` (partial, emptied at start-up). Crash cases are as in
+the plan: the record transaction is atomic and unacknowledged states were never sent; a blob is in
+`blobs/` only after verification; an add interrupted before its `putMany` leaves an orphan blob.
+`e2e reload-and-kill-mid-session` kills the browser (SIGKILL) right after an add and checks that
+after restart every listed file is complete and sync resumes (in the runs so far the add had been
+saved each time; the "lost" branch is accepted by the test but was not observed).
 
-- *Tab dies mid-persist:* the transaction is atomic: the old or the new record survives. Neither
-  was sent unacknowledged (save-before-send), so restarting from either is safe under the host rule.
-- *Tab dies after a blob was moved into `blobs/` but before `blobStored`:* the start-up inventory
-  reports it. *Before the move:* the partial file in `incoming/` is deleted at start-up and the blob
-  is fetched again. *During a local add, before `putMany`:* an orphan blob, no entry; the user re-adds.
-- *Storage partly evicted:* record without blobs → blobs show as missing and are re-fetched; blobs
-  without a record → `initFresh` with a new id, blobs reported (no GC, as decided).
-- *Durability limits:* `strict` IDB durability and OPFS `close()` are the strongest the platform
-  offers but are not a documented fsync guarantee everywhere (risk 2).
+Browser behaviour found by the feature probe (`test/e2e/probe-features.mjs`) and the tests:
+- OPFS `move()` and IDB `durability:'strict'` work in Chromium 154, Firefox 146 and ESR 140.
+- **Firefox:** after a transaction aborts for quota, the next `db.transaction()` on that connection
+  throws `InvalidStateError` ("did not allow mutations"), and kept doing so after space was freed.
+  `storage.mjs` then reopens the connection and tries the same write once more (nothing was
+  written by the failed call). A record rewritten in place does not grow and fits in pages IDB
+  already owns, so a full disk only fails saves whose record grows.
+- `navigator.storage.persist()` shows a permission prompt in Firefox (never answered in headless
+  mode); it is requested without blocking start-up.
 
-## 6. Transport interface and the test transport
+## 6. Transport interface and the test transport (as built)
 
-```js
-transport.start({ onLink(link) }) / stop()
-link = { label, send(frame: Uint8Array), close(), bufferedAmount, onFrame(cb), onDrain(cb), onClose(cb) }
-```
-Ordered, reliable byte frames per link, plus a buffered-amount signal for backpressure — the
-`RTCDataChannel` model, so WebRTC replaces only `transport/relay.mjs`. Frames are ≤ 16 KiB (safe
-for data channels). The host framing on a link (`links.mjs`): `MSG more:bool bytes` fragments of
-Lean messages; `BLOB_START hash size`, `BLOB_DATA hash bytes`, `BLOB_END hash`, `BLOB_ABORT hash`;
-`CREDIT hash n`; `CLOSE`. Lean never sees frames.
+Interface: in the header of `app/js/transport/relay.mjs` (`start({onLink, onStatus})`,
+`setOnline`, `stop`; link: `send`, `close`, `bufferedAmount`, `onFrame`, `onClose`, `onDrain`).
+Host framing (`links.mjs`): MSG (fragment), START, DATA, END, ABORT, CREDIT, HELLO; payload ≤ 16 KiB.
+The relay (`dev/serve.mjs`, hand-written RFC 6455, 127.0.0.1 only) links devices of a room; the
+device with the smaller relay id asks for each link, with a per-remote back-off (0.5 s doubling to
+30 s, reset after a link lived 20 s) so a session closed for an error cannot spin. Admin API:
+topology, cut at a byte offset, corrupt the next blob frame, inject a garbage message, state. The
+relay client is in `app/` because it is this version's only transport; the server is not.
 
-**Test transport: a WebSocket relay** in `dev/serve.mjs` (127.0.0.1 only, never shipped). Each page
-opens one WebSocket to it; the relay announces devices present in a room, the host asks to link to
-a device (the lower label initiates; backoff on failure; no automatic re-link after `sameReplicaId`
-or `incompatible`), and the relay multiplexes `[linkId][frame]` and reports link closure to both
-ends. It genuinely crosses browser profiles and browsers (each device has its own profile directory
-and storage; a Chromium device can sync with a Firefox one). The relay pauses reading a sender's
-socket while the receiver's is congested, so TCP pushes back to the sender's `bufferedAmount`
-(polled, since WebSocket has no drain event). An admin HTTP API lets tests set the allowed topology
-(chain A–B–C), cut links at a byte offset, and inject garbage or corrupted blob bytes. BroadcastChannel
-was rejected: same-origin tabs share storage.
+## 7. Blob streaming and backpressure (as built)
 
-## 7. Blob streaming and backpressure
+One outgoing blob at a time per device: read whole (≤ 256 MiB), verify, START, then DATA frames
+interleaved behind Lean messages while the link buffer is under 1 MiB and the receiver's credit
+allows; END. The receiver grants credit up to 4 MiB beyond what it has written; bytes beyond the
+credit, or beyond the announced size, fail the stream; a START above 256 MiB is refused before any
+byte is accepted. So a peer can make this device buffer at most 4 MiB per stream in memory, and the
+receiving side's hashing buffer is bounded by the same 256 MiB limit as local adds. The limit exists
+because WebCrypto hashes one in-memory buffer (decision 6); adds above it are refused with a message.
 
-Files go whole, in 16 KiB `BLOB_DATA` frames. **Sender:** one blob at a time per link, chunks
-interleaved with Lean messages (messages first), produced only while `bufferedAmount` < 1 MiB
-**and** the receiver's credit allows. **Receiver:** grants 4 MiB of credit per stream, extending it
-as chunks are written to `incoming/`, so receiver memory is bounded even on a transport that cannot
-pause reads (data channels). At `BLOB_END`: close the file, check the size, read it and hash it with
-WebCrypto, `move()` it, enqueue `blobStored h (some p)`. Since WebCrypto has no incremental digest,
-hashing needs the whole file in memory once (risk 1); a per-file cap (proposed 256 MiB, rejected at
-add with a message, `blobFailed` on receive) bounds that. Resume after a disconnect means re-fetching
-the whole blob (Lean re-plans on `disconnected`).
+## 8. Traps and re-instantiation (as built)
 
-## 8. Traps and re-instantiation
+On a trap while running: bump the epoch, drop the queue, close all links, wait for the in-flight
+save, create a new instance and start again from the stored record with the same identity; the
+user sees a "restarted" banner. A trap during start-up stops at once with an error screen (no
+automatic retry: a trap on the stored state would loop); the user can retry. Three traps in five
+minutes stop sync. **E2E:** the driver wraps the instance's exports so that `ls_process` first calls
+`ls_input(0xffffffff)` inside the module — a real trap (Lean's out-of-memory abort) — then
+`trap-mid-sync-reinstantiates` checks one trap, two instances, the dead one never called again
+(a call would count as a second trap), and that sync completes; `trap-at-startup-does-not-loop`
+makes every call trap from page load on and checks one instance, one trap, an error screen, and a
+working manual retry.
 
-On `EngineTrap`: stop the pump; bump the epoch; drop the queue; close every link; wait for the
-in-flight persist (at most one) to settle; create a new instance; run start-up as at page load
-(record, inventory, `init`), then restart the transport (new links, new PeerIds). The dead instance
-is never called again (the wrapper throws `EngineDead`). More than 3 traps in 5 minutes → stop and
-show an error with the diagnostic log (a trap triggered by a peer's message would otherwise loop).
-Test hook (test mode only): force a real trap via the out-of-memory path of §0.
+## 9. UI (as built)
 
-## 9. UI
+As in the wireframe of the plan, plus a "saving… / saved / not saved" indicator. Rules: a file is
+"complete" only when Lean reports every version present, i.e. verified and stored; a missing version
+shows fetching (from whom), queued, waiting ("nobody reachable has it") or "not yet available";
+conflicts list their versions with Keep / Download, and Keep both for two versions (the other one
+becomes `name (2).ext`). Adding under an existing name supersedes the versions shown; Delete
+supersedes the versions shown. Flat names only: folder drops are refused with a message; a name
+containing `/` that arrives from another device is shown in full with the part up to the last `/`
+dimmed, and downloads under its last component (nothing below the UI restricts paths). Files over
+256 MiB are refused with a message giving the reason.
 
-```
-┌ LeanSync ───────────────────────────── this device: laptop (3fa2c1d0) ┐
-│ [ Add files… ]  drop files anywhere           Storage: persistent ✓   │
-│ ⚠ Changes could not be saved (quota). Retrying in 8 s.  [Retry now]   │  banners: saveFailed,
-│ Peers: phone (91be…) in sync · tablet (07c4…) syncing                 │  rollback, trap restart
-│ Pending: 3 fetching · 1 queued · 2 waiting                            │
-├───────────────────────────────────────────────────────────────────────┤
-│ notes.txt          12 KB   complete            [Download] [Delete]    │
-│ photo.jpg           —      fetching from tablet                       │
-│ report.pdf          —      waiting (nobody reachable has it)          │
-│ plan.md                    CONFLICT  ▸ version a1b2 (12 KB) [Keep][↓] │
-│                                      ▸ version 9c0d (14 KB) [Keep][↓] │
-│                                      [Keep both]                      │
-└───────────────────────────────────────────────────────────────────────┘
-```
-Add (picker or drop; names NFC-normalised) = `putMany` superseding the versions shown for that
-name, i.e. adding under an existing name replaces it. Delete = `deleteMany` with the versions
-shown (not `none`, so a version that arrived unseen survives). Keep = `putMany` of that hash
-superseding all shown versions; Keep both = one `putMany` that also writes the other version under
-`name (2).ext`. Download reads, verifies and saves via an object URL. Status comes from `snapshot`
-(re-queried, debounced, on `indexChanged`) and `pending` (on `blobsChanged`); sizes come from OPFS
-(the index has none). Rollback disables the edit controls; `startupFailed` and the lock replace the
-whole page.
+## 10. Tests and results
 
-## 10. Test plan
+Unit (`node --test test/unit/*.test.mjs`): 28 tests — codec vs Lean (5), links (12), core with the
+real engine (8), view (3). Engine checks: §0. End-to-end (`node test/e2e/run.mjs`): 17 scenarios,
+44 runs; browsers per run in the table below (Chromium 154.0.8037.92, Firefox 146.0, Firefox ESR
+140.16.0esr, all headless, each device its own browser process and profile).
 
-**Node unit** (`node --test`, real wasm where Lean is involved): codec vectors and truncation (§2);
-framing and reassembly; view model; core with fake storage/transport and the real engine — event
-ordering, epochs, inventory before connect, persist hold/fail, trap recovery; engine replay, heap
-bound and scale (existing). **E2E** in headless Chromium 154 and Firefox 146 (ESR 140 where cheap),
-driven over CDP (Chromium) and WebDriver BiDi (Firefox, probed: works from Node's built-in
-`WebSocket`); each device is a separate browser process with its own profile directory; one mixed
-Chromium↔Firefox pair. Scenarios:
-1. add / replace / delete / download (bytes compared with what the test generated);
-2. both offline, edits on both, reconnect, converge; 3. concurrent edit → conflict → Keep, and Keep
-both; 4. edit vs delete (edit survives); 5. three-device chain A–B–C (relay topology), C gets A's
-blobs through B; 6. disconnect mid-transfer (relay cut at a byte offset), reconnect, complete;
-7. storage failure (quota) → banner, nothing new sent, recovery; 8. reload mid-session and kill
-mid-persist → state intact, sync resumes; 9. second tab in the same profile → lock message, first
-tab unaffected; 10. corrupted record → `startupFailed` → confirmed reset; 11. rollback (restore an
-older record copy) → banner, restart with new id, no data lost on the peer.
-Carried-forward: (1) a forced trap mid-sync → new instance (counter checked), no call to the dead
-one, sync completes; (2) every run gets random file names and contents from the test, and every
-check compares against those, never against what the page reports; (3) repeated add/delete of one
-file 300× in the browser → wasm heap growth between cycle 50 and 300 ≤ 1 MiB (plus the Node loop).
+| Scenario | Configurations (device A + B [+ C]) |
+|---|---|
+| `add-replace-delete-download` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146; Firefox ESR 140 + Firefox 146; Chromium 154 + Firefox 146 |
+| `offline-edits-both-sides` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146; Firefox 146 + Chromium 154 |
+| `conflict-keep-one-and-keep-both` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146; Chromium 154 + Firefox 146 |
+| `edit-vs-delete` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146; Firefox 146 + Chromium 154 |
+| `three-device-chain` | Chromium 154 + Chromium 154 + Chromium 154; Firefox 146 + Firefox 146 + Firefox 146; Chromium 154 + Firefox 146 + Chromium 154 |
+| `disconnect-mid-transfer-and-resume` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146; Chromium 154 + Firefox 146 |
+| `corrupted-blob-and-garbage-message` | Chromium 154 + Chromium 154; Firefox 146 + Chromium 154 |
+| `storage-failure` | Chromium 154 + Chromium 154; Firefox 146 + Chromium 154; Firefox ESR 140 + Firefox 146 |
+| `reload-and-kill-mid-session` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146; Chromium 154 + Firefox 146 |
+| `second-tab-lock` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146 |
+| `startup-failure-and-reset` | Chromium 154 + Chromium 154; Firefox 146 + Chromium 154 |
+| `rollback-detected-then-new-identity` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146; Firefox 146 + Chromium 154 |
+| `same-replica-id-refused` | Chromium 154; Firefox 146 |
+| `trap-mid-sync-reinstantiates` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146 |
+| `trap-at-startup-does-not-loop` | Chromium 154; Firefox 146 |
+| `repeated-edits-heap-bound` | Chromium 154; Firefox 146 |
+| `file-size-limit-and-folder-drop` | Chromium 154; Firefox 146 |
 
-## 11. Risks and open questions for the user
+`same-replica-id-refused` runs two profiles of one browser, the second a copy of the first.
+App bugs found by these tests and fixed: start-up hung in Firefox on `storage.persist()` (permission
+prompt); a host-driven write-retry loop while saves failed (§3); a restart lost the pending file-list
+refresh (§3); on `rollbackDetected` the Add button stayed enabled until the next status reply (a
+false state; seen once in 44 runs, Firefox + Chromium).
 
-1. **Hashing large files** (decision 6). WebCrypto cannot hash incrementally, so a file is hashed
-   from one in-memory buffer: memory peak ≈ file size at add, receive, serve and download. Proposal:
-   a 256 MiB per-file cap for this version. Alternative: a JS incremental SHA-256 (tested against
-   WebCrypto), which lifts the cap but departs from "SHA-256 via WebCrypto". **Which?**
-2. Browser durability is best-effort (see §5); eviction is mitigated by `storage.persist()`, and an
-   evicted device restarts as a new replica (unsynced changes on it are lost).
-3. Rollback: restart with a new id automatically, or only when the user clicks? I propose the
-   button (edits are already blocked, nothing is lost by waiting).
-4. Flat file list: names only, folders not supported in this version (folder drops rejected). OK?
-5. Not yet verified in these browsers, to be probed first in stage 2: OPFS `FileSystemFileHandle.move()`
-   and IDB `durability:'strict'` in Firefox 146/140, Chromium's CDP quota override. If `move()` is
-   missing I will report before choosing a fallback.
-6. The engine runs on the main thread; large merges and snapshots may cause 10–100 ms jank.
-7. Peer-triggered deterministic traps are contained by the restart limit, not prevented.
-8. Removal of the spike demo (§1), and `Tests/Sync.lean` gained `trace` (and will gain `vectors`)
-   subcommands — test code only; `LeanCrdt/` and `LeanSync/` are untouched.
-9. Accepted limits carried over: whole-state send per edit and peer, no blob GC, no file sizes in
-   the index.
+Storage failures, per browser: Firefox 146 and ESR 140 — real (quota pref `dom.quotaManager.
+temporaryStorage.fixedLimit` = 20 MiB, storage filled with random data) for both OPFS and the
+IndexedDB record; Chromium — OPFS real (CDP `Storage.overrideQuotaForOrigin`), IndexedDB record
+**injected** by the driver (an init script aborts the transaction writing `record`), because
+Chromium 154 does not apply the override to IndexedDB.
+
+## 11. Deviations forced by the browser, and what is not done
+
+Deviations from sync-design §8 / the plan:
+1. **Retries are event-driven** (a protocol property made visible by the browser): any event retries
+   a failed save, so incoming traffic causes failed writes in bursts (138 in one test). The host adds
+   no events of its own while saves fail.
+2. **Firefox `InvalidStateError` after a quota abort**: the host reopens the IDB connection and
+   repeats that one write (§5). Not a retry of Lean's persist in Lean's sense: the failed call wrote
+   nothing.
+3. **Durability**: IDB `strict` and OPFS `close()` are the strongest available, not a documented
+   fsync everywhere (unchanged risk).
+4. **`storage.persist()`** is requested without waiting (Firefox prompts the user).
+5. **Chromium storage-failure test** injects the IndexedDB failure (above).
+6. **A blob that fails to store locally** (disk full) must be reported as `blobFailed`, which Lean
+   records as "this peer lacks it" for the session; after space is freed it is fetched again only in
+   a later session (reconnect, or toggling online). No event says "my storage failed".
+
+Planned in the stage-1 note and not done:
+- Relay faults are injected at the relay, not by a "corrupting relay mode" per link direction for
+  every frame type; a garbage-message test covers protocol errors.
+- No e2e test restores a *whole* backup (record plus blobs); the rollback test restores the record.
+- The "kill mid-persist → add lost" branch is accepted but was not observed (timing).
+- Firefox ESR 140 runs only in some scenarios (basic, storage failure); Chromium and Firefox 146 run
+  all of them.
+- Downloads are verified from the Blob the app hands to the browser (captured by an init script),
+  not from a file written to disk.
+
+## 12. Risks and open questions
+
+1. Browser durability is best-effort (§5); eviction is mitigated by `storage.persist()`, and an
+   evicted device restarts as a new replica (its unsynced changes are lost).
+2. The engine runs on the main thread: large merges and snapshots may cause 10–100 ms jank; moving
+   it to a Worker changes only `engine.mjs` and the call sites become async (the one-at-a-time
+   guarantee would then rest on the pump alone).
+3. A peer-triggered deterministic trap is contained by the restart limit, not prevented.
+4. Files are limited to 256 MiB (WebCrypto hashes whole buffers); serving and downloading also read a
+   whole file into memory, one at a time.
+5. One outgoing blob at a time per device: a slow peer delays others.
+6. Accepted limits carried over: whole-state send per edit and peer, no blob GC, no file sizes in the
+   index.
+7. The relay client and the dev server are unauthenticated; the next task (WebRTC) replaces both.

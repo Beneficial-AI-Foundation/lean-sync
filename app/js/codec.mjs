@@ -25,7 +25,16 @@ export const MAX_BATCH = 1024;
 export const DECODE_ERRORS = ['truncated', 'trailing', 'tooLarge', 'badVersion', 'badKind', 'badTag', 'nonCanonical', 'badUtf8'];
 export const CLOSE_REASONS = ['protocolError', 'incompatible', 'sameReplicaId', 'tooManyPeers', 'stateTooLarge'];
 export const PEER_STATUS = ['handshaking', 'syncing', 'inSync'];
-const QUERIES = { snapshot: 0, pending: 1, status: 2 };
+export const QUERIES = { snapshot: 0, pending: 1, status: 2 };
+// What this codec handles; test/unit/codec.test.mjs checks these against Lean's constructor lists.
+// Event `localOp` is flattened into its three operations.
+export const EVENT_TYPES = ['init', 'initFresh', 'connected', 'disconnected', 'received', 'putMany', 'deleteMany', 'resolve',
+  'persisted', 'persistFailed', 'blobStored', 'blobsStored', 'blobFailed', 'blobLost', 'query'];
+export const EFFECT_TYPES = ['send', 'close', 'persist', 'fetch', 'serveBlob', 'notify', 'reply'];   // + sendAgain (encoding only)
+export const NOTICES = ['indexChanged', 'blobsChanged', 'peerStatus', 'peerClosed', 'peerLeft', 'peerError', 'rollbackDetected',
+  'opRejected', 'badEvent', 'startupFailed', 'notInitialized', 'alreadyInitialized', 'pendingSummary', 'saveFailed'];  // by tag
+export const REPLIES = ['snapshot', 'pending', 'status'];                                   // by tag
+export const PENDING_STATUS = ['waiting', 'requested', 'queued'];                           // by tag
 
 export class CodecError extends Error {
   constructor(msg) { super(msg); this.name = 'CodecError'; }

@@ -75,13 +75,17 @@ export async function launch(kind, { profile, prefs = {}, keepProfile = false } 
   }
   const exited = new Promise((r) => proc.once('exit', r));
 
-  async function newPage(url) {
+  // initScripts: JS source strings run in every document of the page before its own scripts
+  // (CDP Page.addScriptToEvaluateOnNewDocument / BiDi script.addPreloadScript). This is how the
+  // tests instrument the page from outside, leaving the app's code byte-identical to what ships.
+  async function newPage(url, { initScripts = [] } = {}) {
     if (kind === 'chromium') {
       const { targetId } = await send('Target.createTarget', { url: 'about:blank' });
       const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
       const s = (m, p) => send(m, p, { sessionId });
       await s('Page.enable');
       await s('Runtime.enable');
+      for (const src of initScripts) await s('Page.addScriptToEvaluateOnNewDocument', { source: src });
       const page = {
         targetId, sessionId,
         async eval(expr) {
@@ -98,6 +102,7 @@ export async function launch(kind, { profile, prefs = {}, keepProfile = false } 
       return page;
     }
     const { context } = await send('browsingContext.create', { type: 'tab' });
+    for (const src of initScripts) await send('script.addPreloadScript', { functionDeclaration: `() => {\n${src}\n}`, contexts: [context] });
     const page = {
       context,
       async eval(expr) {
