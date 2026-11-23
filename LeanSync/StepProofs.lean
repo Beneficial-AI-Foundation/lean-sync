@@ -1751,4 +1751,147 @@ theorem traceInv (evs : List Event) : ∀ k, k ≤ evs.length → TraceInv evs k
             · exact absurd hp (handle_no_persist _ _ t s)
             · exact .inr (finish_persist hi1 hp).2.2.2.1 }
 
+/-! ## The trace theorems -/
+
+/-- `s` was handed to the host by `persist t s` at step `j`, and the host acknowledged tag `t`
+at a step `k` with `j < k ≤ i`. -/
+def AckedBy (evs : List Event) (i : Nat) (s : State) : Prop :=
+  ∃ j k t d, j < k ∧ k ≤ i ∧ Effect.persist t s ∈ effectsAt evs j ∧
+    evs[k]? = some (.persisted t d)
+
+theorem lt_length_of_mem {evs : List Event} {i : Nat} {e : Effect} (h : e ∈ effectsAt evs i) :
+    i < evs.length := by
+  apply Classical.byContradiction
+  intro hc
+  rw [effectsAt_ge (by omega)] at h; cases h
+
+theorem sent_state_acked' (evs : List Event) (i : Nat) (p : PeerId) (d : Digest) (s : State)
+    (h : Effect.send p (.state d s) ∈ effectsAt evs i) : AckedBy evs i s := by
+  have hi := lt_length_of_mem h
+  have ti := traceInv evs i (by omega)
+  rw [effectsAt_eq hi] at h
+  cases hm : machineAt evs i with
+  | uninit =>
+    rw [hm] at h
+    rcases step_uninit evs[i] with ⟨-, hnot⟩ | ⟨self, s0, blobs, hs, hst⟩
+    · obtain ⟨x, hx⟩ := hnot _ h; cases hx
+    · rw [hst] at h; exact absurd h ((startNode_facts self hs blobs).2.2.2.2.2 p d s)
+  | running n =>
+    rw [hm, step_running] at h
+    have hn : n.Inv := by have := machineAt_inv evs i; rw [hm] at this; exact this
+    simp only [List.mem_append] at h
+    rcases h with h | h
+    · exact absurd h (handle_no_state _ _ p d s)
+    · obtain ⟨P, hP, -, rfl⟩ := finish_state (handle_inv hn _) h
+      rcases (handle_persistence n evs[i]).2 with ⟨-, hp1⟩ | ⟨t, s1, hin, -, -, hp1 | ⟨d1, hev, hp1⟩⟩
+      · rw [hp1] at hP
+        obtain ⟨j, k', t, d', h1, h2, h3, h4⟩ := ti.published n hm P hP
+        exact ⟨j, k', t, d', h1, by omega, h3, h4⟩
+      · rw [hp1] at hP
+        obtain ⟨j, k', t, d', h1, h2, h3, h4⟩ := ti.published n hm P hP
+        exact ⟨j, k', t, d', h1, by omega, h3, h4⟩
+      · rw [hp1] at hP; simp only [Option.some.injEq] at hP; subst hP
+        obtain ⟨j, hj, hpj⟩ := ti.inflight n hm t s1 hin
+        exact ⟨j, i, t, d1, hj, Nat.le_refl _, hpj, by rw [List.getElem?_eq_getElem hi, hev]⟩
+
+/-- How far into replica `r`'s own dots a message reveals. -/
+def Message.revealed (r : ReplicaId) : Message → Nat
+  | .state _ s => s.context.get r
+  | _ => 0
+
+theorem save_before_send' (evs : List Event) (i : Nat) (e : Effect) (p : PeerId) (m : Message)
+    (r : ReplicaId) (h : e ∈ effectsAt evs i) (hm : e.sentMessage? = some (p, m)) :
+    m.revealed r = 0 ∨ ∃ s, AckedBy evs i s ∧ m.revealed r ≤ s.context.get r := by
+  cases e with
+  | send p' m' =>
+    simp only [Effect.sentMessage?, Option.some.injEq, Prod.mk.injEq] at hm
+    obtain ⟨rfl, rfl⟩ := hm
+    cases m' with
+    | state d s => exact .inr ⟨s, sent_state_acked' evs i p' d s h, Nat.le_refl _⟩
+    | _ => exact .inl rfl
+  | fetch p' hs =>
+    simp only [Effect.sentMessage?, Option.some.injEq, Prod.mk.injEq] at hm
+    obtain ⟨rfl, rfl⟩ := hm; exact .inl rfl
+  | _ => simp [Effect.sentMessage?] at hm
+
+/-- Within one step, all persists are the same. -/
+theorem step_persist_unique {m : Machine} (hm : m.Inv) {ev : Event} {t t' : Nat} {s s' : State}
+    (h : .persist t s ∈ (step m ev).2) (h' : .persist t' s' ∈ (step m ev).2) : t = t' ∧ s = s' := by
+  cases m with
+  | uninit =>
+    rcases step_uninit ev with ⟨-, hnot⟩ | ⟨self, s0, blobs, hs, hst⟩
+    · obtain ⟨x, hx⟩ := hnot _ h; cases hx
+    · rw [hst] at h h'
+      obtain ⟨a1, a2⟩ := (startNode_facts self hs blobs).2.2.2.1 t s h
+      obtain ⟨b1, b2⟩ := (startNode_facts self hs blobs).2.2.2.1 t' s' h'
+      exact ⟨a1.trans b1.symm, a2.trans b2.symm⟩
+  | running n =>
+    rw [step_running] at h h'
+    simp only [List.mem_append] at h h'
+    rcases h with h | h
+    · exact absurd h (handle_no_persist _ _ _ _)
+    rcases h' with h' | h'
+    · exact absurd h' (handle_no_persist _ _ _ _)
+    obtain ⟨-, a1, a2, -⟩ := finish_persist (handle_inv hm _) h
+    obtain ⟨-, b1, b2, -⟩ := finish_persist (handle_inv hm _) h'
+    exact ⟨a1.trans b1.symm, a2.trans b2.symm⟩
+
+/-- A persist at step `j` with the machine running: its tag is the machine's `nextTag`, and the
+persist in flight (if any) was answered at this step. -/
+theorem step_persist_running {n : Node} (hn : n.Inv) {ev : Event} {t : Nat} {s : State}
+    (h : .persist t s ∈ (step (.running n) ev).2) :
+    t = n.nextTag ∧ ∀ t0 s0, n.inflight = some (t0, s0) → Answers t0 ev := by
+  rw [step_running] at h
+  simp only [List.mem_append] at h
+  rcases h with h | h
+  · exact absurd h (handle_no_persist _ _ _ _)
+  obtain ⟨hnone, ht, -⟩ := finish_persist (handle_inv hn _) h
+  obtain ⟨htag, hpc⟩ := handle_persistence n ev
+  refine ⟨by rw [ht, htag], fun t0 s0 hi => ?_⟩
+  rcases hpc with ⟨hf, -⟩ | ⟨t1, s1, hi1, ha, -, -⟩
+  · rw [hf, hi] at hnone; cases hnone
+  · rw [hi] at hi1; simp only [Option.some.injEq, Prod.mk.injEq] at hi1; obtain ⟨rfl, rfl⟩ := hi1; exact ha
+
+theorem persist_tag_unique' (evs : List Event) {j j' t : Nat} {s s' : State}
+    (h : Effect.persist t s ∈ effectsAt evs j) (h' : Effect.persist t s' ∈ effectsAt evs j') :
+    j = j' ∧ s = s' := by
+  -- a persist at a later step has a strictly larger tag
+  have later : ∀ {a b : Nat} {sa sb : State}, a < b → Effect.persist t sa ∈ effectsAt evs a →
+      Effect.persist t sb ∈ effectsAt evs b → False := by
+    intro a b sa sb hab ha hb
+    have hbl := lt_length_of_mem hb
+    have tb := traceInv evs b (by omega)
+    rw [effectsAt_eq hbl] at hb
+    cases hm : machineAt evs b with
+    | uninit => exact tb.uninitClean hm a hab t sa ha
+    | running n =>
+      rw [hm] at hb
+      have hn : n.Inv := by have := machineAt_inv evs b; rw [hm] at this; exact this
+      have h1 := tb.tagsBelow n hm a hab t sa ha
+      have h2 := (step_persist_running hn hb).1
+      omega
+  rcases Nat.lt_trichotomy j j' with hlt | rfl | hgt
+  · exact (later hlt h h').elim
+  · have hl := lt_length_of_mem h
+    rw [effectsAt_eq hl] at h h'
+    exact ⟨rfl, (step_persist_unique (machineAt_inv evs j) h h').2⟩
+  · exact (later hgt h' h).elim
+
+theorem persist_one_in_flight' (evs : List Event) {j j' t t' : Nat} {s s' : State}
+    (h : Effect.persist t s ∈ effectsAt evs j) (h' : Effect.persist t' s' ∈ effectsAt evs j')
+    (hlt : j < j') : ∃ k, j < k ∧ k ≤ j' ∧
+      ((∃ d, evs[k]? = some (.persisted t d)) ∨ evs[k]? = some (.persistFailed t)) := by
+  have hl' := lt_length_of_mem h'
+  have tj := traceInv evs j' (by omega)
+  rw [effectsAt_eq hl'] at h'
+  cases hm : machineAt evs j' with
+  | uninit => exact (tj.uninitClean hm j hlt t s h).elim
+  | running n =>
+    rw [hm] at h'
+    have hn : n.Inv := by have := machineAt_inv evs j'; rw [hm] at this; exact this
+    rcases tj.answered n hm j hlt t s h with ⟨k', h1, h2, h3⟩ | hfl
+    · exact ⟨k', h1, by omega, h3⟩
+    · have ha := (step_persist_running hn h').2 t s hfl
+      exact ⟨j', hlt, Nat.le_refl _, answers_of hl' ha⟩
+
 end LeanSync
