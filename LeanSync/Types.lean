@@ -76,9 +76,13 @@ inductive Query where
   deriving DecidableEq, Repr, Inhabited
 
 inductive Event where
-  /-- First event of a run. `stored` is the state record exactly as last persisted (if any);
-  `blobs` lists the blob hashes present in local storage. -/
-  | init (self : ReplicaId) (stored : Option ByteArray) (blobs : List Hash)
+  /-- Start by restoring the state record exactly as last persisted. `blobs` lists the blob
+  hashes present in local storage. If `stored` does not decode, Lean answers
+  `startupFailed` and stays uninitialised: it never resets on its own. -/
+  | init (self : ReplicaId) (stored : ByteArray) (blobs : List Hash)
+  /-- Start with an empty index: first run on this storage, or a reset the user confirmed after
+  `startupFailed` (it loses changes never synced). `self` must be a fresh replica id. -/
+  | initFresh (self : ReplicaId) (blobs : List Hash)
   | connected (p : PeerId)
   | disconnected (p : PeerId)
   /-- One complete Lean message from `p` (the host reassembles its own fragments). -/
@@ -128,13 +132,20 @@ inductive Notice where
   | blobsChanged                          -- presence or pending status changed: re-query
   | peerStatus (p : PeerId) (s : PeerStatus) (replica : Option ReplicaId)
   | peerClosed (p : PeerId) (reason : CloseReason) (byPeer : Bool)
+  | peerLeft (p : PeerId)                -- the host reported the connection gone
   | peerError (p : PeerId) (e : DecodeError)
   /-- A peer knows dots of our replica id that we do not: our storage was rolled back or the id
-  is shared. The host must restart with a fresh replica id (see the host rule). -/
+  is shared. From now on this node refuses local edits and never sends its state; the host
+  must restart with a fresh replica id (see the host rule). -/
   | rollbackDetected
   | opRejected (why : String)             -- invalid local op (bad hash size, too long path, too large)
   | badEvent (e : DecodeError)            -- the event envelope did not decode
-  | corruptStore (e : DecodeError)        -- `init` with an undecodable stored state
+  /-- `init` with a stored state that does not decode. Lean stays uninitialised; the host may
+  retry, or (after user confirmation) start with `initFresh` and a fresh replica id. -/
+  | startupFailed (e : DecodeError)
+  /-- Missing blobs: `fetching` are requested from a peer now, `waiting` have no ready peer that
+  might have them. Emitted whenever the pair changes. -/
+  | pendingSummary (fetching : Nat) (waiting : Nat)
   | notInitialized                        -- an event other than `init` before `init`
   | alreadyInitialized                    -- a second `init`
 
@@ -212,6 +223,10 @@ structure Node where
   dirty : Bool := false
   /-- Blob hashes present in local storage, strictly sorted. -/
   blobs : List Hash := []
+  /-- Hashes referenced by `current` and not in `blobs`, strictly sorted (a cache). -/
+  missing : List Hash := []
+  /-- Last `pendingSummary` reported. -/
+  summary : Nat × Nat := (0, 0)
   /-- Sessions, strictly sorted by `peer`. -/
   sessions : List Session := []
   /-- A peer revealed dots of `self` beyond `current`: host-rule violation detected. -/

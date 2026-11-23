@@ -1,4 +1,4 @@
-import LeanSync.Wire
+import LeanSync.Step
 
 /-!
 # What the host can carry out
@@ -32,6 +32,7 @@ def addBlobs (v : HostView) (hs : List Hash) : HostView :=
 
 def onEvent (v : HostView) : Event → HostView
   | .init _ _ bs => v.addBlobs bs
+  | .initFresh _ bs => v.addBlobs bs
   | .connected p => if p ∈ v.peers then v else { v with peers := p :: v.peers }
   | .disconnected p => { v with peers := v.peers.filter (· ≠ p) }
   | .localOp (.putMany items) => v.addBlobs (items.map (·.hash))

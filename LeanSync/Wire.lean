@@ -841,4 +841,45 @@ theorem decodeMessage_tooLarge' {b : ByteArray} (h : maxMessageBytes < b.size) :
     decodeMessage b = .error .tooLarge := by
   simp [decodeMessage, decodeTop]; omega
 
+theorem length_encHashes (hs : List Hash) (h : ∀ x ∈ hs, x.bytes.size = hashLen) :
+    (hs.flatMap encHash).length = hashLen * hs.length := by
+  induction hs with
+  | nil => simp
+  | cons x xs ih =>
+    simp only [List.flatMap_cons, List.length_append, List.length_cons]
+    rw [ih (fun y hy => h y (.tail _ hy))]
+    have : (encHash x).length = hashLen := by
+      simp [encHash, ByteArray.size_data, h x (.head _)]
+    rw [this, Nat.mul_succ]; omega
+
+theorem length_encU64 (x : UInt64) : (encU64 x).length ≤ 10 :=
+  length_encVar_of_lt (by unfold varBound; exact x.toNat_lt)
+
+theorem length_encDigest (d : Digest) : (encDigest d).length = 32 := by
+  simp [encDigest, ByteArray.size_data, d.size_eq]
+
+theorem length_encBatch_le {hs : List Hash} (h : HashBatchOk hs) : (encBatch hs).length ≤ 10 + 32 * 1024 := by
+  obtain ⟨-, -, hmax, hsz⟩ := h
+  simp only [encBatch, List.length_append, length_encHashes hs hsz]
+  have := length_encVar_of_lt (n := hs.length) (by unfold varBound maxBatch at *; omega)
+  unfold hashLen maxBatch at *; omega
+
+/-- Every well-formed message fits the message limit. -/
+theorem size_encodeMessage_le (m : Message) (h : m.WireOk) : (encodeMessage m).size ≤ maxMessageBytes := by
+  rw [size_encodeMessage]
+  cases m with
+  | hello v r d =>
+    have := length_encU64 r.hi; have := length_encU64 r.lo
+    simp [encMsg, encMsgBody, length_encDigest, maxMessageBytes, maxStateBytes]; omega
+  | digest d => simp [encMsg, encMsgBody, length_encDigest, maxMessageBytes, maxStateBytes]
+  | state d s =>
+    have hs := h.2
+    rw [size_encodeState] at hs
+    simp only [encState, List.length_append, List.length_cons, List.length_nil] at hs
+    simp [encMsg, encMsgBody, length_encDigest, maxMessageBytes]; omega
+  | want hs => have := length_encBatch_le h; simp [encMsg, encMsgBody, maxMessageBytes, maxStateBytes]; omega
+  | noBlob hs => have := length_encBatch_le h; simp [encMsg, encMsgBody, maxMessageBytes, maxStateBytes]; omega
+  | «have» hs => have := length_encBatch_le h; simp [encMsg, encMsgBody, maxMessageBytes, maxStateBytes]; omega
+  | bye r => simp [encMsg, encMsgBody, maxMessageBytes, maxStateBytes]
+
 end LeanSync

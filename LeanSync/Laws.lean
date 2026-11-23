@@ -1,4 +1,4 @@
-import LeanSync.Step
+import LeanSync.Envelope
 import LeanSync.HostModel
 import LeanCrdt.Laws
 
@@ -20,34 +20,38 @@ open LeanCrdt
 
 /-- Round trip for states (decision 5). -/
 theorem decodeState_encodeState (s : State) (h : s.WireOk) :
-    decodeState (encodeState s) = .ok s := sorry -- STAGE-1 PLACEHOLDER
+    decodeState (encodeState s) = .ok s := decodeState_encodeState' s h
 
 /-- Canonicity: the decoder accepts only the encoding of what it returns. This is the precise form
 of "rejects non-canonical input": unsorted or duplicate entries, zero counters, overlong
 varints, trailing bytes, and any other second spelling of a state all fail to decode. -/
 theorem encodeState_of_decodeState {b : ByteArray} {s : State} (h : decodeState b = .ok s) :
-    encodeState s = b := sorry -- STAGE-1 PLACEHOLDER
+    encodeState s = b := encodeState_of_decodeState' h
 
 /-- Decoded states respect the limits (and, being `State`s, carry the CRDT invariants). -/
 theorem wireOk_of_decodeState {b : ByteArray} {s : State} (h : decodeState b = .ok s) :
-    s.WireOk := sorry -- STAGE-1 PLACEHOLDER
+    s.WireOk := wireOk_of_decodeState' h
 
 /-- Equal digests mean equal states, given a collision-free hash (decision 1). -/
 theorem encodeState_inj {a b : State} (ha : a.WireOk) (hb : b.WireOk)
-    (h : encodeState a = encodeState b) : a = b := sorry -- STAGE-1 PLACEHOLDER
+    (h : encodeState a = encodeState b) : a = b := by
+  have h1 := decodeState_encodeState' a ha
+  rw [h, decodeState_encodeState' b hb] at h1
+  exact (Except.ok.inj h1).symm
 
 theorem decodeMessage_encodeMessage (m : Message) (h : m.WireOk) :
-    decodeMessage (encodeMessage m) = .ok m := sorry -- STAGE-1 PLACEHOLDER
+    decodeMessage (encodeMessage m) = .ok m :=
+  decodeMessage_encodeMessage' m h (size_encodeMessage_le m h)
 
 theorem encodeMessage_of_decodeMessage {b : ByteArray} {m : Message}
-    (h : decodeMessage b = .ok m) : encodeMessage m = b := sorry -- STAGE-1 PLACEHOLDER
+    (h : decodeMessage b = .ok m) : encodeMessage m = b := encodeMessage_of_decodeMessage' h
 
 theorem wireOk_of_decodeMessage {b : ByteArray} {m : Message} (h : decodeMessage b = .ok m) :
-    m.WireOk := sorry -- STAGE-1 PLACEHOLDER
+    m.WireOk := wireOk_of_decodeMessage' h
 
 /-- Oversized input is rejected before it is parsed. -/
 theorem decodeMessage_tooLarge {b : ByteArray} (h : maxMessageBytes < b.size) :
-    decodeMessage b = .error .tooLarge := sorry -- STAGE-1 PLACEHOLDER
+    decodeMessage b = .error .tooLarge := decodeMessage_tooLarge' h
 
 /-! ## 2. Trace vocabulary -/
 
@@ -150,7 +154,7 @@ to the peer, and either the peer announced the same digest or we have sent it ou
 state in this session. (This is the local half of the convergence argument.) -/
 theorem step_settles (n : Node) (ev : Event) (h : n.Inv) (n' : Node)
     (hstep : (step (.running n) ev).1 = .running n') (P : Published)
-    (hP : n'.published = some P) :
+    (hP : n'.published = some P) (hrb : n'.rollback = false) :
     ∀ x ∈ n'.sessions, x.Ready → x.announced = some P.digest ∧
       (x.peerDigest = some P.digest ∨ x.lastSent = some P.digest) :=
   sorry -- STAGE-1 PLACEHOLDER
