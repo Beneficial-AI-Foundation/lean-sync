@@ -1,9 +1,13 @@
 name = "lean-crdt"
 version = "0.1.0"
-defaultTargets = ["LeanCrdt"]
+defaultTargets = ["LeanCrdt", "LeanSync"]
 
 [[lean_lib]]
 name = "LeanCrdt"
+
+# Sync protocol and wire format on top of the CRDT (see docs/sync-design.md).
+[[lean_lib]]
+name = "LeanSync"
 
 # Spike: Lean -> WebAssembly feasibility demo (see docs/spike-lean-wasm.md).
 [[lean_lib]]
