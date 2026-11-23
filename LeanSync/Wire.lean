@@ -478,11 +478,38 @@ theorem encodeState_toList (s : State) : (encodeState s).data.toList = encState 
 theorem size_encodeState (s : State) : (encodeState s).size = (encState s).length := by
   rw [← ByteArray.size_data, ← Array.length_toList, encodeState_toList]
 
-/-- A state the wire can carry: 32-byte hashes, paths of at most `maxPathBytes` bytes, counts and
-counters below 2^64, and an encoding of at most `maxStateBytes` bytes. (Sortedness, positive
-counters and coverage are already fields of `State`.) -/
+/-- A hash the protocol accepts: exactly 32 bytes (SHA-256). -/
+def _root_.LeanCrdt.Hash.WireOk (h : Hash) : Prop := h.bytes.size = hashLen
+
+/-- A state the wire can carry: 32-byte hashes, paths of at most `maxPathBytes` bytes, counters
+below 2^64, and an encoding of at most `maxStateBytes` bytes. (Sortedness, positive counters and
+coverage are already fields of `State`; the entry and replica counts are bounded by the size.) -/
 def _root_.LeanCrdt.State.WireOk (s : State) : Prop :=
-  s.FieldsOk ∧ (encodeState s).size ≤ maxStateBytes
+  (∀ e ∈ s.entries, Hash.WireOk e.hash ∧ e.path.toByteArray.size ≤ maxPathBytes) ∧
+  (∀ p ∈ s.context.entries, p.2 < varBound) ∧
+  (encodeState s).size ≤ maxStateBytes
+
+theorem length_le_flatMap {α} (f : α → List UInt8) (hf : ∀ x, f x ≠ []) :
+    ∀ (l : List α), l.length ≤ (l.flatMap f).length
+  | [] => by simp
+  | x :: xs => by
+    have := length_le_flatMap f hf xs
+    have hx : 1 ≤ (f x).length := by
+      cases h : f x with
+      | nil => exact absurd h (hf x)
+      | cons _ _ => simp
+    simp only [List.flatMap_cons, List.length_append, List.length_cons]; omega
+
+theorem fieldsOk_of_wireOk {s : State} (h : s.WireOk) : s.FieldsOk := by
+  obtain ⟨he, hc, hsz⟩ := h
+  rw [size_encodeState] at hsz
+  have hl1 := length_le_flatMap encCtxEntry (fun x => by simp [encCtxEntry, encU64, encVar_ne_nil]) s.context.entries
+  have hl2 := length_le_flatMap (encEntry s.context.entries)
+    (fun x => by simp [encEntry, encStr, encVar_ne_nil]) s.entries
+  simp only [encState, encStateBody, List.length_append] at hsz
+  refine ⟨he, hc, ?_, ?_⟩
+  · unfold varBound maxStateBytes at *; omega
+  · unfold varBound maxStateBytes at *; omega
 
 /-- Decode a state record and rebuild its invariants. Total, one pass. -/
 def decodeState (b : ByteArray) : Except DecodeError State :=
@@ -490,9 +517,9 @@ def decodeState (b : ByteArray) : Except DecodeError State :=
 
 theorem decodeState_encodeState' (s : State) (h : s.WireOk) :
     decodeState (encodeState s) = .ok s := by
-  apply decodeTop_complete (readWithHeader_complete readStateBody_complete) h.1
+  apply decodeTop_complete (readWithHeader_complete readStateBody_complete) (fieldsOk_of_wireOk h)
   · rw [encodeState_toList]; rfl
-  · have := h.2; rw [size_encodeState] at this; exact this
+  · have := h.2.2; rw [size_encodeState] at this; exact this
 
 theorem encodeState_of_decodeState' {b : ByteArray} {s : State} (h : decodeState b = .ok s) :
     encodeState s = b := by
@@ -502,7 +529,7 @@ theorem encodeState_of_decodeState' {b : ByteArray} {s : State} (h : decodeState
 
 theorem wireOk_of_decodeState' {b : ByteArray} {s : State} (h : decodeState b = .ok s) : s.WireOk := by
   obtain ⟨hq, -, hle⟩ := decodeTop_sound (readWithHeader_sound readStateBody_sound) h
-  exact ⟨hq, by rw [encodeState_of_decodeState' h]; exact hle⟩
+  exact ⟨hq.1, hq.2.1, by rw [encodeState_of_decodeState' h]; exact hle⟩
 
 /-! ## Decidable well-formedness (used by the step function) -/
 
@@ -514,15 +541,16 @@ def checkFields (s : State) : Bool :=
 theorem checkFields_iff (s : State) : checkFields s = true ↔ s.FieldsOk := by
   simp [checkFields, State.FieldsOk, and_assoc]
 
-/-- `s.WireOk`, decided; returns the encoding too so callers can reuse it. -/
-def checkWire (s : State) : Bool := checkFields s && decide ((encodeState s).size ≤ maxStateBytes)
+/-- `s.WireOk`, decided (one pass over the entries plus one encoding). -/
+def checkWire (s : State) : Bool :=
+  s.entries.all (fun e => e.hash.bytes.size == hashLen && decide (e.path.toByteArray.size ≤ maxPathBytes)) &&
+  s.context.entries.all (fun p => decide (p.2 < varBound)) &&
+  decide ((encodeState s).size ≤ maxStateBytes)
 
 theorem checkWire_iff (s : State) : checkWire s = true ↔ s.WireOk := by
-  simp [checkWire, checkFields_iff, State.WireOk]
+  simp [checkWire, State.WireOk, Hash.WireOk, and_assoc]
 
 /-! ## Hash batches -/
-
-def _root_.LeanCrdt.Hash.WireOk (h : Hash) : Prop := h.bytes.size = hashLen
 
 /-- A strictly sorted, non-empty batch of at most `maxBatch` 32-byte hashes. -/
 def HashBatchOk (hs : List Hash) : Prop :=
@@ -699,7 +727,7 @@ theorem readMsgBody_sound : Sound readMsgBody encMsgBody Message.WireOk := by
             obtain ⟨rfl, rfl⟩ := h
             obtain ⟨-, hpd, hbd⟩ := readDigest_sound b (pos + 1) d q1 hd
             obtain ⟨hf, hps, hbs⟩ := readStateBody_sound b q1 s q2 hs
-            refine ⟨⟨hf, ?_⟩, ?_, ?_⟩
+            refine ⟨⟨hf.1, hf.2.1, ?_⟩, ?_, ?_⟩
             · rw [size_encodeState]; simp [encState]; omega
             · simp [encMsgBody, hps, hpd]; omega
             · rw [hb1, hbd, hbs]; simp [encMsgBody]
@@ -763,8 +791,8 @@ theorem readMsgBody_complete : Complete readMsgBody encMsgBody Message.WireOk :=
     obtain ⟨e0, h1, hp1⟩ := tagOk 2 (encDigest d ++ encStateBody s) (by rw [h]; rfl)
     rw [List.append_assoc] at h1
     have e1 := readDigest_complete b (pos + 1) d _ hp1 trivial h1
-    have e2 := readStateBody_complete b _ s rest (le_size_of_bytesFrom hp1 h1) hm.1 (bytesFrom_skip h1)
-    have hsz := hm.2
+    have e2 := readStateBody_complete b _ s rest (le_size_of_bytesFrom hp1 h1) (fieldsOk_of_wireOk hm) (bytesFrom_skip h1)
+    have hsz := hm.2.2
     rw [size_encodeState] at hsz
     simp only [encState, List.length_append, List.length_cons, List.length_nil] at hsz
     simp only [readMsgBody, e0, readStateMsg, e1, e2]
@@ -873,7 +901,7 @@ theorem size_encodeMessage_le (m : Message) (h : m.WireOk) : (encodeMessage m).s
     simp [encMsg, encMsgBody, length_encDigest, maxMessageBytes, maxStateBytes]; omega
   | digest d => simp [encMsg, encMsgBody, length_encDigest, maxMessageBytes, maxStateBytes]
   | state d s =>
-    have hs := h.2
+    have hs := h.2.2
     rw [size_encodeState] at hs
     simp only [encState, List.length_append, List.length_cons, List.length_nil] at hs
     simp [encMsg, encMsgBody, length_encDigest, maxMessageBytes]; omega

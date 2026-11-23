@@ -53,8 +53,7 @@ theorem State.eq_of_beq {a b : State} (h : State.beq a b = true) : a = b := by
 /-! ## Wire facts -/
 
 theorem wireOk_empty : State.empty.WireOk := by
-  refine ⟨⟨by simp [State.empty], by simp [State.empty, VersionVector.empty],
-    by simp [State.empty, VersionVector.empty, varBound], by simp [State.empty, varBound]⟩, ?_⟩
+  refine ⟨by simp [State.empty], by simp [State.empty, VersionVector.empty], ?_⟩
   rw [size_encodeState]
   simp [encState, encStateBody, State.empty, VersionVector.empty, maxStateBytes, encVar]
 
@@ -248,11 +247,39 @@ theorem Inv.withCurrent {n : Node} (h : n.Inv) {s : State} (hs : s.WireOk) (hle 
 theorem length_eraseH_le (h : Hash) (l : List Hash) : (eraseH h l).length ≤ l.length :=
   List.length_filter_le _ _
 
-theorem inv_gotBlob {n : Node} (h : n.Inv) (hb : Hash) : (gotBlob n hb).1.Inv := by
-  unfold gotBlob
+theorem length_dedupGo : ∀ (xs acc : List Hash), (dedupGo xs acc).length ≤ xs.length + acc.length
+  | [], acc => by simp [dedupGo]
+  | x :: xs, [] => by
+    have := length_dedupGo xs [x]; simp only [dedupGo]; simp at this ⊢; omega
+  | x :: xs, a :: acc => by
+    simp only [dedupGo]
+    split
+    · have := length_dedupGo xs (a :: acc); simp at this ⊢; omega
+    · have := length_dedupGo xs (x :: a :: acc); simp at this ⊢; omega
+
+theorem length_sortDedup_le (l : List Hash) : (sortDedup l).length ≤ l.length := by
+  have := length_dedupGo (l.mergeSort hashLe) []
+  simp only [List.length_nil, Nat.add_zero, List.length_mergeSort] at this
+  exact this
+
+theorem length_sdiff_le {xs ys : List Hash} (hx : StrictlySorted xs) (hy : StrictlySorted ys) :
+    (sdiff xs ys).length ≤ xs.length := by
+  rw [sdiff_eq hx hy]; exact List.length_filter_le _ _
+
+/-- The new blobs of a batch: listed, not already present. -/
+theorem mem_newBlobs {n : Node} (hn : n.Inv) (hs : List Hash) (z : Hash) :
+    z ∈ sdiff (sortDedup hs) n.blobs ↔ z ∈ hs ∧ z ∉ n.blobs := by
+  rw [mem_sdiff (sorted_sortDedup _) hn.blobsSorted, mem_sortDedup]
+
+theorem inv_gotBlobs {n : Node} (h : n.Inv) (hs : List Hash) : (gotBlobs n hs).1.Inv := by
+  unfold gotBlobs
+  dsimp only
   split
   · exact h
-  · next hnot =>
+  · have hnew := sorted_sdiff (sorted_sortDedup hs) h.blobsSorted
+    have mnew := mem_newBlobs h hs
+    have mblobs : ∀ z, z ∈ union (sdiff (sortDedup hs) n.blobs) n.blobs ↔ z ∈ hs ∨ z ∈ n.blobs := by
+      intro z; rw [mem_union z hnew h.blobsSorted, mnew]; grind
     exact {
       currentOk := h.currentOk
       publishedOk := h.publishedOk
@@ -260,11 +287,11 @@ theorem inv_gotBlob {n : Node} (h : n.Inv) (hb : Hash) : (gotBlob n hb).1.Inv :=
       inflightOk := h.inflightOk
       inflightLe := h.inflightLe
       tagFresh := h.tagFresh
-      blobsSorted := sorted_insertH h.blobsSorted
-      missingSorted := sorted_eraseH h.missingSorted
+      blobsSorted := sorted_union hnew h.blobsSorted
+      missingSorted := sorted_sdiff h.missingSorted hnew
       missingSpec := fun z => by
         simp only [Node.Missing]
-        rw [mem_eraseH, h.missingSpec z, mem_insertH h.blobsSorted]
+        rw [mem_sdiff h.missingSorted hnew, h.missingSpec z, mnew, mblobs]
         simp only [Node.Missing]; grind
       sessionsSorted := sessSorted_map _ (fun _ => rfl) h.sessionsSorted
       sessionCap := by simpa using h.sessionCap
@@ -272,53 +299,23 @@ theorem inv_gotBlob {n : Node} (h : n.Inv) (hb : Hash) : (gotBlob n hb).1.Inv :=
         simp only [List.mem_map] at hx
         obtain ⟨y, hy, rfl⟩ := hx
         have ho := h.sessOk y hy
+        have hT := sorted_sortDedup y.toldNo
         exact {
-          inflightCap := Nat.le_trans (length_eraseH_le _ _) ho.inflightCap
+          inflightCap := Nat.le_trans (List.length_filter_le _ _) ho.inflightCap
           lacksSorted := ho.lacksSorted
-          toldNoCap := Nat.le_trans (length_eraseH_le _ _) ho.toldNoCap
+          toldNoCap := Nat.le_trans (length_sdiff_le hT hnew) (Nat.le_trans (length_sortDedup_le _) ho.toldNoCap)
           toldNoOk := fun z hz => by
-            rw [mem_eraseH] at hz
-            obtain ⟨hs, hn⟩ := ho.toldNoOk z hz.1
-            refine ⟨hs, ?_⟩
-            rw [mem_insertH h.blobsSorted]; simp [hz.2, hn] } }
-
-/-- Facts that `gotBlob` leaves alone. -/
-theorem gotBlob_frame (n : Node) (hb : Hash) :
-    let n' := (gotBlob n hb).1
-    n'.self = n.self ∧ n'.current = n.current ∧ n'.published = n.published ∧ n'.inflight = n.inflight ∧
-      n'.nextTag = n.nextTag ∧ n'.rollback = n.rollback ∧ n'.dirty = n.dirty := by
-  unfold gotBlob; split <;> simp
-
-theorem inv_gotBlobs {n : Node} (h : n.Inv) (hs : List Hash) : (gotBlobs n hs).1.Inv := by
-  unfold gotBlobs
-  suffices ∀ (l : List Hash) (acc : Node × List Effect), acc.1.Inv →
-      (l.foldl (fun (acc : Node × List Effect) h => ((gotBlob acc.1 h).1, acc.2 ++ (gotBlob acc.1 h).2)) acc).1.Inv by
-    exact this hs (n, []) h
-  intro l
-  induction l with
-  | nil => intro acc ha; exact ha
-  | cons x xs ih => intro acc ha; exact ih _ (inv_gotBlob ha x)
+            simp only at hz
+            rw [mem_sdiff hT hnew, mem_sortDedup, mnew] at hz
+            obtain ⟨hs', hn'⟩ := ho.toldNoOk z hz.1
+            refine ⟨hs', ?_⟩
+            simp only; rw [mblobs]; grind } }
 
 theorem gotBlobs_frame (n : Node) (hs : List Hash) :
     let n' := (gotBlobs n hs).1
     n'.self = n.self ∧ n'.current = n.current ∧ n'.published = n.published ∧ n'.inflight = n.inflight ∧
       n'.nextTag = n.nextTag ∧ n'.rollback = n.rollback ∧ n'.dirty = n.dirty := by
-  unfold gotBlobs
-  suffices ∀ (l : List Hash) (acc : Node × List Effect),
-      let n' := (l.foldl (fun (acc : Node × List Effect) h => ((gotBlob acc.1 h).1, acc.2 ++ (gotBlob acc.1 h).2)) acc).1
-      n'.self = acc.1.self ∧ n'.current = acc.1.current ∧ n'.published = acc.1.published ∧
-        n'.inflight = acc.1.inflight ∧ n'.nextTag = acc.1.nextTag ∧ n'.rollback = acc.1.rollback ∧
-        n'.dirty = acc.1.dirty by
-    exact this hs (n, [])
-  intro l
-  induction l with
-  | nil => intro acc; simp
-  | cons x xs ih =>
-    intro acc
-    obtain ⟨a1, a2, a3, a4, a5, a6, a7⟩ := ih ((gotBlob acc.1 x).1, acc.2 ++ (gotBlob acc.1 x).2)
-    obtain ⟨b1, b2, b3, b4, b5, b6, b7⟩ := gotBlob_frame acc.1 x
-    simp only [List.foldl_cons]
-    exact ⟨a1.trans b1, a2.trans b2, a3.trans b3, a4.trans b4, a5.trans b5, a6.trans b6, a7.trans b7⟩
+  unfold gotBlobs; dsimp only; split <;> simp
 
 theorem closeWith_fst (n : Node) (p : PeerId) (r : CloseReason) (extra : List Effect) :
     (closeWith n p r extra).1 = n.dropSession p := rfl
@@ -618,7 +615,7 @@ theorem planGo_spec (missing : List Hash) (hm : StrictlySorted missing) :
       ∃ l' es, planGo missing busy l acc effs = (acc.reverse ++ l', effs ++ es) ∧
         Forall2 (PlanRel missing) l l' ∧ (∀ e ∈ es, FetchOk missing l e) ∧
         ∀ h ∈ missing, (∃ x ∈ acc ++ l', h ∈ x.inflight) ∨
-          ∀ s' ∈ l', s'.ready = true → h ∈ s'.lacks ∨ maxInflightPerPeer ≤ s'.inflight.length
+          ∀ s' ∈ l', s'.ready = true → s'.helloSent = true → h ∈ s'.lacks ∨ maxInflightPerPeer ≤ s'.inflight.length
   | [], busy, acc, effs, _, _, _ => by
     refine ⟨[], [], by simp [planGo], .nil, by simp, fun h _ => .inr (by simp)⟩
   | s :: rest, busy, acc, effs, hb, hl, hbusy => by
@@ -631,7 +628,7 @@ theorem planGo_spec (missing : List Hash) (hm : StrictlySorted missing) :
     split
     · next hroom =>
       simp only [Bool.and_eq_true, decide_eq_true_eq] at hroom
-      obtain ⟨hready, hlt⟩ := hroom
+      obtain ⟨⟨hready, -⟩, hlt⟩ := hroom
       dsimp only
       split
       · next hempty =>
@@ -665,7 +662,7 @@ theorem planGo_spec (missing : List Hash) (hm : StrictlySorted missing) :
               intro s' hs'
               simp only [List.mem_cons] at hs'
               rcases hs' with rfl | hs'
-              · exact fun _ => .inl hlz
+              · exact fun _ _ => .inl hlz
               · exact hall s' hs'
             · have : h ∈ sdiff (sdiff missing busy) s.lacks := (memL h).2 ⟨hh, hbz, hlz⟩
               rw [hL0] at this; cases this
@@ -707,7 +704,7 @@ theorem planGo_spec (missing : List Hash) (hm : StrictlySorted missing) :
             · exact .inr (fun x hx => by
                 simp only [List.mem_cons] at hx
                 rcases hx with rfl | hx
-                · exact fun _ => .inr hfull
+                · exact fun _ _ => .inr hfull
                 · exact hall x hx)
             · -- not full: the whole candidate list was taken
               have hall' : cands = sdiff (sdiff missing busy) s.lacks := by
@@ -728,7 +725,7 @@ theorem planGo_spec (missing : List Hash) (hm : StrictlySorted missing) :
                 · exact .inr (fun x hx => by
                     simp only [List.mem_cons] at hx
                     rcases hx with rfl | hx
-                    · exact fun _ => .inl hlz
+                    · exact fun _ _ => .inl hlz
                     · exact hall x hx)
                 · have hin : h ∈ cands := by rw [hall']; exact (memL h).2 ⟨hh, hbz, hlz⟩
                   exact .inl ⟨s', by simp, by simp [s', hin]⟩
@@ -746,8 +743,8 @@ theorem planGo_spec (missing : List Hash) (hm : StrictlySorted missing) :
       · refine .inr (fun x hx => ?_)
         simp only [List.mem_cons] at hx
         rcases hx with rfl | hx
-        · intro hr
-          simp only [hr, Bool.true_and, decide_eq_true_eq, Nat.not_lt] at hnoroom
+        · intro hr hh
+          simp only [hr, hh, Bool.true_and, decide_eq_true_eq, Nat.not_lt] at hnoroom
           exact .inr hnoroom
         · exact hall x hx
 
@@ -788,7 +785,7 @@ theorem planPass_spec {n : Node} (h : n.Inv) :
     ∃ l', (planPass n).1 = { n with sessions := l' } ∧ Forall2 (PlanRel n.missing) n.sessions l' ∧
       (∀ e ∈ (planPass n).2, FetchOk n.missing n.sessions e) ∧
       ∀ hb ∈ n.missing, (∃ x ∈ l', hb ∈ x.inflight) ∨
-        ∀ s' ∈ l', s'.ready = true → hb ∈ s'.lacks ∨ maxInflightPerPeer ≤ s'.inflight.length := by
+        ∀ s' ∈ l', s'.ready = true → s'.helloSent = true → hb ∈ s'.lacks ∨ maxInflightPerPeer ≤ s'.inflight.length := by
   obtain ⟨l', es, heq, hrel, hes, hcov⟩ := planGo_spec n.missing h.missingSorted n.sessions (busyOf n.sessions)
     [] [] (sorted_sortDedup _) (fun x hx => (h.sessOk x hx).lacksSorted)
     (fun hb hh => by simpa using mem_busyOf hh)
@@ -1071,7 +1068,8 @@ theorem step_settles' (n : Node) (ev : Event) (h : n.Inv) (n' : Node)
 theorem step_plans_blobs' (n : Node) (ev : Event) (h : n.Inv) (n' : Node)
     (hstep : (step (.running n) ev).1 = .running n') (hb : Hash) (hm : n'.Missing hb) :
     (∃ x ∈ n'.sessions, hb ∈ x.inflight) ∨
-    (∀ x ∈ n'.sessions, x.peerReplica.isSome = true → hb ∈ x.lacks ∨ x.inflight.length = maxInflightPerPeer) := by
+    (∀ x ∈ n'.sessions, x.peerReplica.isSome = true → x.helloSent = true →
+      hb ∈ x.lacks ∨ x.inflight.length = maxInflightPerPeer) := by
   have hinv' : n'.Inv := by
     have := step_inv' (.running n) ev h; rw [hstep] at this; exact this
   have hmiss : hb ∈ n'.missing := (hinv'.missingSpec hb).2 hm
@@ -1088,17 +1086,17 @@ theorem step_plans_blobs' (n : Node) (ev : Event) (h : n.Inv) (n' : Node)
       l'.map (fun s => { s with reported := sessionStatus (planPass n2).1 s }) := by
     unfold reportPass; rw [heq]; simp only; split <;> rfl
   change (∃ x ∈ (reportPass (planPass n2).1).1.sessions, hb ∈ x.inflight) ∨
-    ∀ x ∈ (reportPass (planPass n2).1).1.sessions, x.peerReplica.isSome = true →
+    ∀ x ∈ (reportPass (planPass n2).1).1.sessions, x.peerReplica.isSome = true → x.helloSent = true →
       hb ∈ x.lacks ∨ x.inflight.length = maxInflightPerPeer
   have hcap : ∀ x ∈ (reportPass (planPass n2).1).1.sessions, x.inflight.length ≤ maxInflightPerPeer :=
     fun x hx => (hinv'.sessOk x hx).inflightCap
   rw [hsess] at hcap ⊢
   rcases hcov hb hm2 with ⟨x, hx, hxi⟩ | hall
   · exact .inl ⟨_, List.mem_map_of_mem hx, hxi⟩
-  · refine .inr (fun x hx hr => ?_)
+  · refine .inr (fun x hx hr hh => ?_)
     simp only [List.mem_map] at hx
     obtain ⟨y, hy, rfl⟩ := hx
-    rcases hall y hy (by simpa [Session.ready] using hr) with h1 | h2
+    rcases hall y hy (by simpa [Session.ready] using hr) hh with h1 | h2
     · exact .inl h1
     · exact .inr (Nat.le_antisymm (hcap _ (List.mem_map_of_mem hy)) h2)
 
@@ -1115,35 +1113,39 @@ def HandleEff : Effect → Prop
   | .reply _ => True
   | _ => False
 
-theorem gotBlob_effs (n : Node) (hb : Hash) : ∀ e ∈ (gotBlob n hb).2,
-    ∃ s ∈ n.sessions, hb ∈ s.toldNo ∧ e = .send s.peer (.have [hb]) := by
-  unfold gotBlob
+theorem sdiffGo_sub : ∀ (xs ys acc : List Hash) (z : Hash), z ∈ sdiffGo xs ys acc → z ∈ xs ∨ z ∈ acc := by
+  intro xs ys acc
+  fun_induction sdiffGo xs ys acc with
+  | case1 ys acc => intro z hz; simp at hz; exact .inr hz
+  | case2 x xs acc => intro z hz; simp [List.reverseAux_eq] at hz ⊢; grind
+  | case3 x xs y ys acc _ ih =>
+    intro z hz; rcases ih z hz with h | h
+    · exact .inl (.tail _ h)
+    · simp at h; rcases h with rfl | h; exact .inl (.head _); exact .inr h
+  | case4 x xs y ys acc _ ih => intro z hz; rcases ih z hz with h | h; exact .inl (.tail _ h); exact .inr h
+  | case5 x xs y ys acc _ ih => intro z hz; exact ih z hz
+
+theorem mem_of_mem_sdiff {xs ys : List Hash} {z : Hash} (h : z ∈ sdiff xs ys) : z ∈ xs := by
+  rcases sdiffGo_sub xs ys [] z h with h | h
+  · exact h
+  · cases h
+
+theorem gotBlobs_effs (n : Node) (hs : List Hash) : ∀ e ∈ (gotBlobs n hs).2,
+    ∃ s ∈ n.sessions, ∃ h ∈ s.toldNo, e = .send s.peer (.have [h]) := by
+  unfold gotBlobs
+  dsimp only
   split
   · simp
   · intro e he
-    simp only [List.mem_filterMap] at he
-    obtain ⟨s, hs, hse⟩ := he
-    split at hse
-    · next hm => simp only [Option.some.injEq] at hse; exact ⟨s, hs, hm, hse.symm⟩
-    · cases hse
+    simp only [List.mem_flatMap, List.mem_map] at he
+    obtain ⟨s, hs', h, hh, rfl⟩ := he
+    have : h ∈ sortDedup s.toldNo := mem_of_mem_sdiff hh
+    exact ⟨s, hs', h, mem_sortDedup.1 this, rfl⟩
 
 theorem gotBlobs_effs_handle (n : Node) (hs : List Hash) : ∀ e ∈ (gotBlobs n hs).2, HandleEff e := by
-  unfold gotBlobs
-  suffices ∀ (l : List Hash) (acc : Node × List Effect), (∀ e ∈ acc.2, HandleEff e) →
-      ∀ e ∈ (l.foldl (fun (acc : Node × List Effect) h => ((gotBlob acc.1 h).1, acc.2 ++ (gotBlob acc.1 h).2)) acc).2,
-        HandleEff e by
-    exact this hs (n, []) (by simp)
-  intro l
-  induction l with
-  | nil => intro acc h; exact h
-  | cons x xs ih =>
-    intro acc h
-    apply ih
-    intro e he
-    simp only [List.mem_append] at he
-    rcases he with he | he
-    · exact h e he
-    · obtain ⟨s, -, -, rfl⟩ := gotBlob_effs acc.1 x e he; trivial
+  intro e he
+  obtain ⟨s, -, h, -, rfl⟩ := gotBlobs_effs n hs e he
+  trivial
 
 theorem heff_ite_notify (c : Bool) (x : Notice) :
     ∀ e ∈ (if c = true then [Effect.notify x] else []), HandleEff e := by
@@ -1959,7 +1961,7 @@ theorem finish_exec {n : Node} (hn : n.Inv) {v : HostView} (hpeers : ∀ x ∈ n
     split
     · next hc =>
       simp only [Bool.and_eq_true, Option.isNone_iff_eq_none] at hc
-      have hsz := hn.currentOk.2
+      have hsz := hn.currentOk.2.2
       refine ⟨{ v with pendingPersist := some n.nextTag }, ?_, rfl, rfl, rfl⟩
       simp [HostView.execAll, HostView.exec, hpend, hc.1, hsz]
     · exact ⟨v, rfl, rfl, rfl, hpend⟩
@@ -2005,7 +2007,7 @@ theorem finish_exec {n : Node} (hn : n.Inv) {v : HostView} (hpeers : ∀ x ∈ n
       obtain ⟨rfl, rfl⟩ := he'
       refine exec_fetch (hpm x hx) ⟨hs, h0, Nat.le_trans hcap (by decide), fun h hh => ?_⟩
       obtain ⟨⟨e, he, rfl⟩, -⟩ := (hm.missingSpec h).1 (hmiss h hh)
-      exact (hm.currentOk.1.1 e he).1
+      exact (hm.currentOk.1 e he).1
     | notify => rfl
     | _ => cases he
   have hall : ∀ e ∈ (reconcilePass r1.1).2 ++ (planPass (reconcilePass r1.1).1).2 ++
@@ -2029,51 +2031,25 @@ theorem finish_exec {n : Node} (hn : n.Inv) {v : HostView} (hpeers : ∀ x ∈ n
 
 /-! ### `handle` -/
 
-theorem gotBlob_exec {n : Node} (hn : n.Inv) (hb : Hash) (P : List PeerId) (hp : ∀ x ∈ n.sessions, x.peer ∈ P) :
-    (∀ x ∈ (gotBlob n hb).1.sessions, x.peer ∈ P) ∧ (∀ z ∈ (gotBlob n hb).1.blobs, z ∈ n.blobs ∨ z = hb) ∧
-    ∀ e ∈ (gotBlob n hb).2, ∃ p h, e = .send p (.have [h]) ∧ p ∈ P ∧ h.bytes.size = hashLen := by
-  refine ⟨?_, ?_, ?_⟩
-  · unfold gotBlob; split
-    · exact hp
-    · intro x hx; simp only [List.mem_map] at hx; obtain ⟨y, hy, rfl⟩ := hx; exact hp y hy
-  · unfold gotBlob; split
-    · intro z hz; exact .inl hz
-    · intro z hz; simp only at hz; rw [mem_insertH hn.blobsSorted] at hz
-      rcases hz with h | h
-      · exact .inr h
-      · exact .inl h
-  · intro e he
-    obtain ⟨y, hy, hyt, rfl⟩ := gotBlob_effs n hb e he
-    exact ⟨y.peer, hb, rfl, hp y hy, ((hn.sessOk y hy).toldNoOk hb hyt).1⟩
-
 theorem gotBlobs_exec {n : Node} (hn : n.Inv) (hs : List Hash) (P : List PeerId) (hp : ∀ x ∈ n.sessions, x.peer ∈ P) :
     (∀ x ∈ (gotBlobs n hs).1.sessions, x.peer ∈ P) ∧ (∀ z ∈ (gotBlobs n hs).1.blobs, z ∈ n.blobs ∨ z ∈ hs) ∧
     ∀ e ∈ (gotBlobs n hs).2, ∃ p h, e = .send p (.have [h]) ∧ p ∈ P ∧ h.bytes.size = hashLen := by
-  unfold gotBlobs
-  suffices ∀ (l : List Hash) (acc : Node × List Effect), acc.1.Inv → (∀ x ∈ acc.1.sessions, x.peer ∈ P) →
-      (∀ e ∈ acc.2, ∃ p h, e = .send p (.have [h]) ∧ p ∈ P ∧ h.bytes.size = hashLen) →
-      let r := l.foldl (fun (acc : Node × List Effect) h => ((gotBlob acc.1 h).1, acc.2 ++ (gotBlob acc.1 h).2)) acc
-      (∀ x ∈ r.1.sessions, x.peer ∈ P) ∧ (∀ z ∈ r.1.blobs, z ∈ acc.1.blobs ∨ z ∈ l) ∧
-      ∀ e ∈ r.2, ∃ p h, e = .send p (.have [h]) ∧ p ∈ P ∧ h.bytes.size = hashLen by
-    exact this hs (n, []) hn hp (by simp)
-  intro l
-  induction l with
-  | nil => intro acc _ hp he; exact ⟨hp, fun z hz => .inl hz, he⟩
-  | cons x xs ih =>
-    intro acc hi hp he
-    obtain ⟨g1, g2, g3⟩ := gotBlob_exec hi x P hp
-    obtain ⟨r1, r2, r3⟩ := ih ((gotBlob acc.1 x).1, acc.2 ++ (gotBlob acc.1 x).2) (inv_gotBlob hi x) g1
-      (fun e he' => by
-        simp only [List.mem_append] at he'
-        rcases he' with he' | he'
-        · exact he e he'
-        · exact g3 e he')
-    refine ⟨r1, fun z hz => ?_, r3⟩
-    rcases r2 z hz with h | h
-    · rcases g2 z h with h | rfl
+  refine ⟨?_, ?_, ?_⟩
+  · unfold gotBlobs; dsimp only; split
+    · exact hp
+    · intro x hx; simp only [List.mem_map] at hx; obtain ⟨y, hy, rfl⟩ := hx; exact hp y hy
+  · unfold gotBlobs; dsimp only; split
+    · intro z hz; exact .inl hz
+    · intro z hz
+      simp only at hz
+      rw [mem_union z (sorted_sdiff (sorted_sortDedup hs) hn.blobsSorted) hn.blobsSorted,
+        mem_newBlobs hn] at hz
+      rcases hz with h | h
+      · exact .inr h.1
       · exact .inl h
-      · exact .inr (.head _)
-    · exact .inr (.tail _ h)
+  · intro e he
+    obtain ⟨s, hs', h, hh, rfl⟩ := gotBlobs_effs n hs e he
+    exact ⟨s.peer, h, rfl, hp s hs', ((hn.sessOk s hs').toldNoOk h hh).1⟩
 
 /-- After `handle`, the node and the view agree except for the persist bookkeeping, which is
 settled by the event itself. -/
@@ -2177,6 +2153,20 @@ theorem preRel_mono {v v' : HostView} {n : Node} (h : PreRel v n) (hp : ∀ p �
     (hb : ∀ z ∈ v.blobs, z ∈ v'.blobs) (hpend : v'.pendingPersist = v.pendingPersist) : PreRel v' n :=
   ⟨fun x hx => hp _ (h.1 x hx), fun z hz => hb _ (h.2.1 z hz), by rw [hpend]; exact h.2.2⟩
 
+/-- The host's answer to a persist moves only the pending tag. -/
+theorem answer_rel {v : HostView} {n : Node} (hr : PreRel v n) (t : Nat) (ev : Event)
+    (hev : (∃ d, ev = .persisted t d) ∨ ev = .persistFailed t) (n' : Node)
+    (hs : n'.sessions = n.sessions) (hb : n'.blobs = n.blobs)
+    (hi : n'.inflight.map (·.1) = if v.pendingPersist = some t then none else v.pendingPersist) :
+    PreRel (v.onEvent ev) n' := by
+  have hv : (v.onEvent ev).peers = v.peers ∧ (v.onEvent ev).blobs = v.blobs ∧
+      (v.onEvent ev).pendingPersist = if v.pendingPersist = some t then none else v.pendingPersist := by
+    rcases hev with ⟨d, rfl⟩ | rfl <;> (simp only [HostView.onEvent]; split <;> simp_all)
+  refine ⟨fun x hx => ?_, fun z hz => ?_, ?_⟩
+  · rw [hv.1]; rw [hs] at hx; exact hr.1 x hx
+  · rw [hv.2.1]; rw [hb] at hz; exact hr.2.1 z hz
+  · rw [hv.2.2, hi]
+
 theorem handle_exec {v : HostView} {n : Node} (hn : n.Inv) (hr : PreRel v n) (ev : Event) :
     ∃ v', (v.onEvent ev).execAll (handle n ev).2 = some v' ∧ PreRel v' (handle n ev).1 := by
   have hnotify : ∀ (w : HostView) (x : Notice), w.execAll [.notify x] = some w := fun _ _ => rfl
@@ -2276,39 +2266,31 @@ theorem handle_exec {v : HostView} {n : Node} (hn : n.Inv) (hr : PreRel v n) (ev
         · rw [(gotBlobs_frame _ _).2.2.2.1]; exact hr1.2.2
       · exact ⟨_, hnotify _ _, hr1⟩
   | persisted t d =>
+    have hrel := answer_rel hr t (.persisted t d) (.inl ⟨d, rfl⟩)
     simp only [handle]
     split
     · next t' s hi =>
       split
+      · next ht => subst ht; exact ⟨_, rfl, hrel _ rfl rfl (by simp [hr.2.2, hi])⟩
       · next ht =>
-        subst ht
-        refine ⟨_, rfl, hr.1, hr.2.1, ?_⟩
-        simp [HostView.onEvent, hr.2.2, hi]
-      · next ht =>
-        refine ⟨_, rfl, hr.1, hr.2.1, ?_⟩
         have : v.pendingPersist ≠ some t := by rw [hr.2.2, hi]; simp; exact ht
-        simp [HostView.onEvent, this, hr.2.2]
+        exact ⟨_, rfl, hrel _ rfl rfl (by rw [if_neg this, hr.2.2])⟩
     · next hi =>
-      refine ⟨_, rfl, hr.1, hr.2.1, ?_⟩
       have : v.pendingPersist = none := by rw [hr.2.2]; cases h : n.inflight <;> simp_all
-      simp [HostView.onEvent, this, hr.2.2]
+      exact ⟨_, rfl, hrel _ rfl rfl (by rw [if_neg (by rw [this]; simp), hr.2.2])⟩
   | persistFailed t =>
+    have hrel := answer_rel hr t (.persistFailed t) (.inr rfl)
     simp only [handle]
     split
     · next t' s hi =>
       split
+      · next ht => subst ht; exact ⟨_, rfl, hrel _ rfl rfl (by simp [hr.2.2, hi])⟩
       · next ht =>
-        subst ht
-        refine ⟨_, rfl, hr.1, hr.2.1, ?_⟩
-        simp [HostView.onEvent, hr.2.2, hi]
-      · next ht =>
-        refine ⟨_, rfl, hr.1, hr.2.1, ?_⟩
         have : v.pendingPersist ≠ some t := by rw [hr.2.2, hi]; simp; exact ht
-        simp [HostView.onEvent, this, hr.2.2]
+        exact ⟨_, rfl, hrel _ rfl rfl (by rw [if_neg this, hr.2.2])⟩
     · next hi =>
-      refine ⟨_, rfl, hr.1, hr.2.1, ?_⟩
       have : v.pendingPersist = none := by rw [hr.2.2]; cases h : n.inflight <;> simp_all
-      simp [HostView.onEvent, this, hr.2.2]
+      exact ⟨_, rfl, hrel _ rfl rfl (by rw [if_neg (by rw [this]; simp), hr.2.2])⟩
   | blobStored h src =>
     have hr1 : PreRel (v.onEvent (.blobStored h src)) n :=
       preRel_mono hr (fun p hp => hp) (fun z hz => by simp only [HostView.onEvent]; rw [mem_addBlobs]; exact .inl hz) rfl
@@ -2412,5 +2394,135 @@ theorem effects_executable' : ∀ (evs : List Event) (v : HostView) (m : Machine
     obtain ⟨v2, h1, h2⟩ := step_exec hm hr ev
     simp only [Executable, h1]
     exact effects_executable' evs v2 _ (step_inv' m ev hm) h2
+
+/-! ## Rollback mode: no state is ever sent -/
+
+theorem onMessage_rollback_mono (n : Node) (s : Session) (msg : Message) (h : n.rollback = true) :
+    (onMessage n s msg).1.rollback = true := by
+  unfold onMessage closeWith
+  split
+  · split
+    · split
+      · exact h
+      · split
+        · exact h
+        · exact h
+    · exact h
+  · cases msg with
+    | state d st =>
+      simp only
+      split
+      · split
+        · split <;> first | rfl | exact h
+        · split <;> first | rfl | exact h
+      · split <;> first | rfl | exact h
+    | want hs => simp only; split <;> exact h
+    | _ => exact h
+
+theorem handle_rollback_mono (n : Node) (ev : Event) (h : n.rollback = true) :
+    (handle n ev).1.rollback = true := by
+  cases ev with
+  | received p b =>
+    simp only [handle]
+    split
+    · exact h
+    · split
+      · exact h
+      · exact onMessage_rollback_mono _ _ _ h
+  | localOp op => simp only [handle, h, ite_true]
+  | blobStored hb src => simp only [handle]; rw [(gotBlobs_frame _ _).2.2.2.2.2.1]; exact h
+  | connected p => simp only [handle]; split; exact h; split <;> exact h
+  | disconnected p => simp only [handle]; split <;> exact h
+  | persisted t d => simp only [handle]; split; split <;> exact h; exact h
+  | persistFailed t => simp only [handle]; split; split <;> exact h; exact h
+  | blobFailed p hb => simp only [handle]; split; split <;> exact h; exact h
+  | blobLost hb => simp only [handle]; split <;> exact h
+  | init => exact h
+  | initFresh => exact h
+  | query q => exact h
+
+theorem reconcileSession_no_state (self : ReplicaId) (P : Published) (s : Session) (p : PeerId)
+    (d : Digest) (st : State) : .send p (.state d st) ∉ (reconcileSession self true P s).2 := by
+  have hp : ∀ e ∈ (helloPart self P s).2, e = .send s.peer (.hello 1 self P.digest) := by
+    unfold helloPart; split <;> simp
+  intro he
+  unfold reconcileSession at he
+  simp only [Bool.not_true, Bool.false_and, Bool.false_eq_true, ite_false] at he
+  split at he
+  · split at he
+    · simp only [List.mem_append, List.mem_singleton] at he
+      rcases he with he | he
+      · have := hp _ he; cases this
+      · cases he
+    · have := hp _ he; cases this
+  · have := hp _ he; cases this
+
+theorem finish_rollback_no_state {n : Node} (h : n.rollback = true) (p : PeerId) (d : Digest) (s : State) :
+    .send p (.state d s) ∉ (finish n).2 := by
+  intro he
+  unfold finish at he
+  simp only [List.mem_append] at he
+  rcases he with ((he | he) | he) | he
+  · unfold persistPass at he; split at he <;> simp at he
+  · unfold reconcilePass at he
+    split at he
+    · cases he
+    · simp only [List.mem_flatMap] at he
+      obtain ⟨x, -, hx⟩ := he
+      have hrb : (persistPass n).1.rollback = true := by rw [(persistPass_core n).rollback]; exact h
+      rw [hrb] at hx
+      exact reconcileSession_no_state _ _ x p d s hx
+  · -- planning emits only `fetch`
+    have : ∀ e ∈ (planPass (reconcilePass (persistPass n).1).1).2, ∃ q c, e = .fetch q c := by
+      unfold planPass
+      simp only
+      suffices ∀ (busy : List Hash) (l acc : List Session) (effs : List Effect),
+          (∀ e ∈ effs, ∃ q c, e = .fetch q c) →
+          ∀ e ∈ (planGo (reconcilePass (persistPass n).1).1.missing busy l acc effs).2, ∃ q c, e = .fetch q c by
+        exact this _ _ _ _ (by simp)
+      intro busy l
+      induction l generalizing busy with
+      | nil => intro acc effs he; simpa [planGo] using he
+      | cons x xs ih =>
+        intro acc effs he
+        unfold planGo
+        split
+        · dsimp only
+          split
+          · exact ih _ _ _ he
+          · apply ih
+            intro e he'
+            simp only [List.mem_append, List.mem_singleton] at he'
+            rcases he' with he' | rfl
+            · exact he e he'
+            · exact ⟨_, _, rfl⟩
+        · exact ih _ _ _ he
+    obtain ⟨q, c, hc⟩ := this _ he
+    cases hc
+  · have : ∀ m : Node, ∀ e ∈ (reportPass m).2, ∃ x, e = .notify x := by
+      intro m e he
+      unfold reportPass at he
+      simp only at he
+      have hf : ∀ e ∈ m.sessions.filterMap (fun s =>
+          if (sessionStatus m s == s.reported) = true then none
+          else some (Effect.notify (.peerStatus s.peer (sessionStatus m s) s.peerReplica))), ∃ x, e = .notify x := by
+        intro e he
+        simp only [List.mem_filterMap] at he
+        obtain ⟨s, -, hse⟩ := he
+        split at hse
+        · cases hse
+        · simp only [Option.some.injEq] at hse; exact ⟨_, hse.symm⟩
+      split at he
+      · exact hf e he
+      · simp only [List.mem_append, List.mem_singleton] at he
+        rcases he with he | rfl
+        · exact hf e he
+        · exact ⟨_, rfl⟩
+    obtain ⟨x, hx⟩ := this _ _ he
+    cases hx
+
+theorem rollback_mode_no_state {n : Node} (_hn : n.Inv) (h : n.rollback = true) (ev : Event)
+    {p : PeerId} {d : Digest} {s : State} : .send p (.state d s) ∉ (finish (handle n ev).1).2 :=
+  finish_rollback_no_state (handle_rollback_mono n ev h) p d s
 
 end LeanSync

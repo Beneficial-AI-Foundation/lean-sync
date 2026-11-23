@@ -53,21 +53,19 @@ end Node
 
 /-! ## Blob arrival: presence, inflight, and owed `have` messages -/
 
-/-- Record one stored blob: present, no longer missing or in flight anywhere, and tell every
-peer we had answered `noBlob` for it. -/
-def gotBlob (n : Node) (h : Hash) : Node × List Effect :=
-  if h ∈ n.blobs then (n, [])
+/-- Record a batch of stored blobs in one pass: present, no longer missing or in flight anywhere,
+and tell every peer we had answered `noBlob` for one of them. Cost: O(b log b + n) for b hashes
+and n known blobs, plus O(i·b) per session for its i ≤ `maxInflightPerPeer` requests. -/
+def gotBlobs (n : Node) (hs : List Hash) : Node × List Effect :=
+  let new := sdiff (sortDedup hs) n.blobs
+  if new.isEmpty then (n, [])
   else
     let sessions := n.sessions.map (fun s =>
-      { s with inflight := eraseH h s.inflight, toldNo := eraseH h s.toldNo })
-    ({ n with blobs := insertH h n.blobs, missing := eraseH h n.missing, sessions := sessions },
-      n.sessions.filterMap (fun s => if h ∈ s.toldNo then some (.send s.peer (.have [h])) else none))
-
-def gotBlobs (n : Node) (hs : List Hash) : Node × List Effect :=
-  let r := hs.foldl (fun (acc : Node × List Effect) h =>
-    let x := gotBlob acc.1 h
-    (x.1, acc.2 ++ x.2)) (n, [])
-  (r.1, r.2)
+      { s with inflight := s.inflight.filter (fun h => h ∉ new),
+               toldNo := sdiff (sortDedup s.toldNo) new })
+    let effs := n.sessions.flatMap (fun s =>
+      (sdiff (sortDedup s.toldNo) (sdiff (sortDedup s.toldNo) new)).map (fun h => Effect.send s.peer (.have [h])))
+    ({ n with blobs := union new n.blobs, missing := sdiff n.missing new, sessions := sessions }, effs)
 
 /-! ## Local operations -/
 
@@ -240,13 +238,14 @@ def reconcilePass (n : Node) : Node × List Effect :=
     ({ n with sessions := n.sessions.map (fun s => (reconcileSession n.self n.rollback P s).1) },
       n.sessions.flatMap (fun s => (reconcileSession n.self n.rollback P s).2))
 
-/-- Give each ready session with room the first missing hashes that are in flight nowhere and
-that it has not said it lacks. -/
+/-- Give each ready session that we have sent our hello to, and that has room, the first missing
+hashes that are in flight nowhere and that it has not said it lacks. (No request may precede our
+hello: the peer would reject it.) -/
 def planGo (missing : List Hash) : List Hash → List Session → List Session → List Effect →
     List Session × List Effect
   | _, [], acc, effs => (acc.reverse, effs)
   | busy, s :: rest, acc, effs =>
-    if s.ready && s.inflight.length < maxInflightPerPeer then
+    if s.ready && s.helloSent && s.inflight.length < maxInflightPerPeer then
       let cands := (sdiff (sdiff missing busy) s.lacks).take (maxInflightPerPeer - s.inflight.length)
       if cands.isEmpty then planGo missing busy rest (s :: acc) effs
       else planGo missing (union cands busy) rest ({ s with inflight := s.inflight ++ cands } :: acc)
