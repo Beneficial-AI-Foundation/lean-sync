@@ -133,6 +133,14 @@ def onMessage (n : Node) (s : Session) (msg : Message) : Node × List Effect :=
 
 /-! ## Queries -/
 
+/-- Hashes no greeted ready session can serve: the intersection of their `lacks` (sorted). The
+flag says whether there is any greeted ready session at all (if not, nothing has a source). -/
+def sourceless (sessions : List Session) : Bool × List Hash :=
+  let greeted := sessions.filter (fun s => s.ready && s.helloSent)
+  match greeted with
+  | [] => (false, [])
+  | g :: gs => (true, gs.foldl (fun acc s => sdiff acc (sdiff acc s.lacks)) g.lacks)
+
 def sessionStatus (n : Node) (s : Session) : PeerStatus :=
   if !s.ready then .handshaking
   else match n.published with
@@ -144,10 +152,12 @@ def answer (n : Node) : Query → Reply
     let arr := n.missing.toArray
     .snapshot (n.current.snapshot.map (fun (p, hs) => (p, hs.map (fun h => ⟨h, !binSearch arr h⟩))))
   | .pending =>
+    let src := sourceless n.sessions
+    let arr := src.2.toArray
     .pending (n.missing.map (fun h =>
       match n.sessions.find? (fun s => h ∈ s.inflight) with
       | some s => (h, .requested s.peer)
-      | none => (h, .waiting)))
+      | none => if src.1 && !binSearch arr h then (h, .queued) else (h, .waiting)))
   | .status =>
     .status n.inflight.isSome n.dirty n.rollback (n.sessions.map (fun s => (s.peer, sessionStatus n s)))
 
@@ -190,6 +200,9 @@ def handle (n : Node) : Event → Node × List Effect
   | .blobStored h _ =>
     let r := gotBlobs n [h]
     (r.1, if (sdiff [h] n.blobs).isEmpty then [] else .notify .blobsChanged :: r.2)
+  | .blobsStored hs =>
+    let r := gotBlobs n hs
+    (r.1, if (sdiff (sortDedup hs) n.blobs).isEmpty then [] else .notify .blobsChanged :: r.2)
   | .blobFailed p h =>
     match n.findSession? p with
     | some s =>
@@ -259,18 +272,27 @@ def planPass (n : Node) : Node × List Effect :=
   let r := planGo n.missing (busyOf n.sessions) n.sessions [] []
   ({ n with sessions := r.1 }, r.2)
 
+/-- `(fetching, queued, waiting)` for the UI. Fetching: missing and requested from some peer
+(walks `missing` only as far as the small set in flight). Waiting: missing, not requested, and
+lacked by every greeted ready peer (or there is none). Queued: the rest, i.e. some greeted ready
+peer may have it but its request slots are full. -/
+def pendingCounts (n : Node) : Nat × Nat × Nat :=
+  let busy := busyOf n.sessions
+  let fetching := (sdiff busy (sdiff busy n.missing)).length
+  let notInFlight := n.missing.length - fetching
+  let src := sourceless n.sessions
+  let waiting := if src.1 then (sdiff src.2 (sdiff src.2 (sdiff n.missing busy))).length else notInFlight
+  (fetching, notInFlight - waiting, waiting)
+
 def reportPass (n : Node) : Node × List Effect :=
   let sessions := n.sessions.map (fun s => { s with reported := sessionStatus n s })
   let effs : List Effect := n.sessions.filterMap (fun s =>
     let st := sessionStatus n s
     if st == s.reported then none else some (.notify (.peerStatus s.peer st s.peerReplica)))
-  -- requests in flight that are still missing: walks `missing` only as far as the (small) busy set
-  let busy := busyOf n.sessions
-  let fetching := (sdiff busy (sdiff busy n.missing)).length
-  let sum := (fetching, n.missing.length - fetching)
+  let sum := pendingCounts n
   let n1 := { n with sessions := sessions }
   if sum == n.summary then (n1, effs)
-  else ({ n1 with summary := sum }, effs ++ [.notify (.pendingSummary sum.1 sum.2)])
+  else ({ n1 with summary := sum }, effs ++ [.notify (.pendingSummary sum.1 sum.2.1 sum.2.2)])
 
 def finish (n : Node) : Node × List Effect :=
   let r1 := persistPass n

@@ -101,6 +101,9 @@ inductive Event where
   | persistFailed (tag : Nat)
   /-- Blob `h` was verified and durably stored (`src` = the peer it came from, if any). -/
   | blobStored (h : Hash) (src : Option PeerId)
+  /-- These blobs are durably stored: a batch of `blobStored`, used to report the start-up
+  inventory in chunks after `init` (send them all before connecting peers). -/
+  | blobsStored (hs : List Hash)
   /-- A transfer of `h` from `p` failed (hash mismatch, abort by the sender, size limit). -/
   | blobFailed (p : PeerId) (h : Hash)
   /-- The host found that a blob it had reported present is gone or unreadable. -/
@@ -118,7 +121,8 @@ inductive PeerStatus where
 /-- Where a missing blob is. -/
 inductive PendingStatus where
   | requested (p : PeerId)   -- a `want` is outstanding at `p`
-  | waiting                  -- no ready peer that has not said `noBlob` for it
+  | queued                   -- a greeted ready peer may have it, but its request slots are full
+  | waiting                  -- every greeted ready peer said it lacks it (or there is none)
   deriving DecidableEq, Repr, Inhabited
 
 /-- Why a host input was rejected. -/
@@ -149,9 +153,11 @@ inductive Notice where
   /-- `init` with a stored state that does not decode. Lean stays uninitialised; the host may
   retry, or (after user confirmation) start with `initFresh` and a fresh replica id. -/
   | startupFailed (e : DecodeError)
-  /-- Missing blobs: `fetching` are requested from a peer now, `waiting` have no ready peer that
-  might have them. Emitted whenever the pair changes. -/
-  | pendingSummary (fetching : Nat) (waiting : Nat)
+  /-- Missing blobs: `fetching` are requested from a peer now; `queued` are not requested yet
+  but some greeted ready peer may have them (its request slots are full); `waiting` have no
+  reachable source (every greeted ready peer lacks them, or none is connected). Emitted
+  whenever the triple changes. -/
+  | pendingSummary (fetching : Nat) (queued : Nat) (waiting : Nat)
   | notInitialized                        -- an event other than `init` before `init`
   | alreadyInitialized                    -- a second `init`
 
@@ -232,7 +238,7 @@ structure Node where
   /-- Hashes referenced by `current` and not in `blobs`, strictly sorted (a cache). -/
   missing : List Hash := []
   /-- Last `pendingSummary` reported. -/
-  summary : Nat × Nat := (0, 0)
+  summary : Nat × Nat × Nat := (0, 0, 0)
   /-- Sessions, strictly sorted by `peer`. -/
   sessions : List Session := []
   /-- A peer revealed dots of `self` beyond `current`: host-rule violation detected. -/

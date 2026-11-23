@@ -438,12 +438,22 @@ def freshReplica : WM ReplicaId := do
 /-- Start (or restart) a device from its persisted record. -/
 def boot (d : Nat) : WM Unit := do
   let dev ← getDev d
+  let all := dev.store.toList
+  -- half the time, report the blob inventory in chunks after `init` (before any connection)
+  let chunked := (← rand 2) == 0
+  let first := if chunked then [] else all
   match dev.record with
-  | some r => feed d (.init dev.replica r dev.store.toList)
+  | some r => feed d (.init dev.replica r first)
   | none =>
     let r ← freshReplica
     setDev d { dev with replica := r }
-    feed d (.initFresh r dev.store.toList)
+    feed d (.initFresh r first)
+  if chunked then
+    let mut rest := all
+    while !rest.isEmpty do
+      let k := 1 + (← rand 3)
+      feed d (.blobsStored (rest.take k))
+      rest := rest.drop k
 
 /-- Crash: the in-flight write may or may not have completed; every connection drops. -/
 def crash (d : Nat) : WM Unit := do
@@ -707,33 +717,6 @@ def mutSendAfterClose (m : Machine) (ev : Event) : Machine × List Effect :=
   | .disconnected p => (m', effs ++ [.send p (.digest (digestOf ByteArray.empty))])
   | _ => (m', effs)
 
-/-- One strict simulator run (all checks, strict quiescence) with a given step function. -/
-def mutRun (s : Nat) (f : Machine → Event → Machine × List Effect) : IO (Array String) := do
-  let (vs, _) ← simRun s 4 300 f false
-  return vs
-
-def mutationTests (c : Ctx) (budget : Nat := 30) : IO Unit := do
-  let muts : List (String × (Machine → Event → Machine × List Effect)) :=
-    [("state sends carry current", mutCurrent), ("no have", mutNoHave),
-     ("ignore received states", mutIgnoreState), ("send after disconnect", mutSendAfterClose)]
-  for (name, f) in muts do
-    let mut caught := 0
-    let mut firstMsg := ""
-    for s in [1:budget + 1] do
-      let vs ← mutRun s f
-      if !vs.isEmpty then
-        caught := caught + 1
-        if firstMsg == "" then firstMsg := vs[0]!
-    IO.println s!"mutation '{name}': caught on {caught}/{budget} seeds (e.g. {firstMsg})"
-    check c s!"mutation '{name}' is caught" (caught > 0)
-  -- and the real step function passes the same budget
-  let mut clean := 0
-  for s in [1:budget + 1] do
-    let vs ← mutRun s step
-    if vs.isEmpty then clean := clean + 1
-  IO.println s!"unmutated step: clean on {clean}/{budget} seeds"
-  check c "unmutated step passes the mutation budget" (clean == budget)
-
 /-! ## Unit tests -/
 
 def runW {α} (w : World) (act : WM α) : IO (α × World) := act.run w
@@ -772,6 +755,61 @@ partial def deliverMsgs (fuel : Nat := 100000) : WM Unit := do
 
 def hasNotice (effs : List Effect) (f : Notice → Bool) : Bool :=
   effs.any fun | .notify n => f n | _ => false
+
+/-- Deliver messages and acknowledge persists until neither moves; blob streams stay queued. -/
+partial def syncMsgs (fuel : Nat := 10000) : WM Unit := do
+  if fuel == 0 then return
+  deliverMsgs
+  match (← get).devs.findIdx? (·.pending.isSome) with
+  | some d => ackPersist d; syncMsgs (fuel - 1)
+  | none => pure ()
+
+/-- Directed chain A–B–C: only A holds the blobs; B learns the index and starts fetching from A,
+but A's streams are held back; then C connects to B only, learns the index from B and asks B, which
+answers `noBlob`. Then everything is delivered, **without reconnecting**: C can obtain the blobs only
+through B's `have`. -/
+def chainRun (seed : Nat) (f : Machine → Event → Machine × List Effect) : IO (Array String) := do
+  let act : WM Unit := do
+    for d in [0:3] do boot d; ackPersist d
+    let k := 1 + (← rand 4)
+    for i in [0:k] do
+      putOp 0 s!"chain/{i}" (h32 (900 + 10 * seed + i)); ackPersist 0
+    let _ ← connect 0 1
+    syncMsgs
+    let _ ← connect 1 2
+    syncMsgs
+    unless ← drainAll 100000 do violate "chain: did not quiesce"
+    checkConverged
+  let ((), w) ← act.run (newWorld 3 seed f false)
+  return w.violations
+
+/-- One strict simulator run plus the directed chain scenario. -/
+def mutRun (s : Nat) (f : Machine → Event → Machine × List Effect) : IO (Array String) := do
+  let (vs, _) ← simRun s 4 300 f false
+  let vc ← chainRun s f
+  return vs ++ vc
+
+def mutationTests (c : Ctx) (budget : Nat := 30) : IO Unit := do
+  let muts : List (String × (Machine → Event → Machine × List Effect)) :=
+    [("state sends carry current", mutCurrent), ("no have", mutNoHave),
+     ("ignore received states", mutIgnoreState), ("send after disconnect", mutSendAfterClose)]
+  for (name, f) in muts do
+    let mut caught := 0
+    let mut firstMsg := ""
+    for s in [1:budget + 1] do
+      let vs ← mutRun s f
+      if !vs.isEmpty then
+        caught := caught + 1
+        if firstMsg == "" then firstMsg := vs[0]!
+    IO.println s!"mutation '{name}': caught on {caught}/{budget} seeds (e.g. {firstMsg})"
+    check c s!"mutation '{name}' is caught" (caught > 0)
+  -- and the real step function passes the same budget
+  let mut clean := 0
+  for s in [1:budget + 1] do
+    let vs ← mutRun s step
+    if vs.isEmpty then clean := clean + 1
+  IO.println s!"unmutated step: clean on {clean}/{budget} seeds"
+  check c "unmutated step passes the mutation budget" (clean == budget)
 
 def unitTests (c : Ctx) : IO Unit := do
   -- 1. two empty devices: hello only, no state sent
@@ -972,13 +1010,13 @@ def unitTests (c : Ctx) : IO Unit := do
   -- device 1 knows "x" but nobody reachable has the blob
   let n1 := (nodeOr w 1).get!
   check c "pending: one missing blob" (n1.missing == [h32 11])
-  check c "pendingSummary: waiting" (n1.summary == (0, 1)) (fun _ => toString n1.summary)
+  check c "pendingSummary: waiting" (n1.summary == (0, 0, 1)) (fun _ => toString n1.summary)
   let (_, w) ← runW { w with log := #[] } do
     let _ ← connect 1 0
     deliverMsgs
   let n1 := (nodeOr w 1).get!
-  check c "pendingSummary: fetching" (n1.summary == (1, 0)) (fun _ => toString n1.summary)
-  check c "pendingSummary notice emitted" (hasNotice (logOf w 1) (fun | .pendingSummary 1 0 => true | _ => false))
+  check c "pendingSummary: fetching" (n1.summary == (1, 0, 0)) (fun _ => toString n1.summary)
+  check c "pendingSummary notice emitted" (hasNotice (logOf w 1) (fun | .pendingSummary 1 0 0 => true | _ => false))
   let (_, w) ← runW { w with log := #[] } do
     feed 1 (.query .snapshot); feed 1 (.query .pending); feed 1 (.query .status)
   let replies := (logOf w 1).filterMap (fun | .reply r => some r | _ => none)
@@ -996,6 +1034,53 @@ def unitTests (c : Ctx) : IO Unit := do
     let _ ← drainAll 1000
     checkConverged
   check c "pending case converges" w.violations.isEmpty (fun _ => toString w.violations)
+  -- 11b. queued: 33 missing blobs and one peer with 32 request slots
+  let (_, w) ← runW (unitWorld 2) do
+    for d in [0:2] do boot d; ackPersist d
+    let items := (List.range 33).map (fun i => ({ path := s!"q/{i}", hash := h32 (500 + i), supersedes := [] } : PutItem))
+    let dev ← getDev 0
+    setDev 0 { dev with store := items.foldl (fun st it => st.insert it.hash) dev.store }
+    feed 0 (.localOp (.putMany items)); ackPersist 0
+    let _ ← connect 0 1
+    syncMsgs
+    clearLog
+    feed 1 (.query .pending)
+  let n1 := (nodeOr w 1).get!
+  check c "queued: summary is 32 fetching, 1 queued, 0 waiting" (n1.summary == (32, 1, 0))
+    (fun _ => toString n1.summary)
+  let pend := (logOf w 1).filterMap (fun | .reply (.pending items) => some items | _ => none)
+  let items := pend.headD []
+  let nReq := (items.filter (fun x => match x.2 with | .requested _ => true | _ => false)).length
+  let nQ := (items.filter (fun x => match x.2 with | .queued => true | _ => false)).length
+  let nW := (items.filter (fun x => match x.2 with | .waiting => true | _ => false)).length
+  check c "queued: pending reply has 32 requested, 1 queued, 0 waiting" (nReq == 32 && nQ == 1 && nW == 0)
+    (fun _ => s!"{nReq} {nQ} {nW}")
+  let (_, w) ← runW w do
+    let _ ← drainAll 100000
+    checkConverged
+  check c "queued case converges" w.violations.isEmpty (fun _ => toString w.violations)
+  -- 11c. start-up inventory reported late: a peer connecting before it is complete
+  let (_, w) ← runW (unitWorld 2) do
+    for d in [0:2] do boot d; ackPersist d
+    putOp 0 "inv" (h32 600); ackPersist 0
+    -- restart device 0, reporting no blobs at `init` (the inventory comes later)
+    let dev ← getDev 0
+    setDev 0 { dev with m := .uninit, view := {} }
+    feed 0 (.init dev.replica dev.record.get! [])
+    ackPersist 0
+    let _ ← connect 0 1
+    syncMsgs
+  let n1 := (nodeOr w 1).get!
+  check c "late inventory: the peer was told noBlob, so the blob is waiting" (n1.summary == (0, 0, 1))
+    (fun _ => toString n1.summary)
+  let (_, w) ← runW { w with log := #[] } do
+    feed 0 (.blobsStored [h32 600])
+    let _ ← drainAll 100000
+    checkConverged
+  check c "late inventory: blobsStored sends `have` to the peer" (logOf w 0 |>.any fun
+    | .send _ (.have [h]) => h == h32 600 | _ => false)
+  check c "late inventory: converges once the inventory arrives" w.violations.isEmpty
+    (fun _ => toString w.violations)
   -- 12. too many peers
   let (_, w) ← runW (unitWorld 1) do
     boot 0; ackPersist 0
@@ -1074,7 +1159,7 @@ def randomEffects (st : State) : RM (List Effect) := do
   let p : PeerId := ⟨(← rr 70000).toUInt32⟩
   let mut out := []
   for _ in [0:1 + (← rr 6)] do
-    let k ← rr 7
+    let k ← rr 8
     let m ← randomMessage st
     let hs ← randomHashes (1 + (← rr 30))
     let t ← rr 100
@@ -1084,9 +1169,9 @@ def randomEffects (st : State) : RM (List Effect) := do
     let notices : Array Notice := #[Notice.indexChanged, .blobsChanged, .peerStatus p .inSync (some ⟨1, 2⟩),
       .peerClosed p .incompatible true, .peerLeft p, .peerError p (.badVersion 7), .rollbackDetected,
       .opRejected "nope é", .badEvent .trailing, .startupFailed .nonCanonical, .notInitialized,
-      .alreadyInitialized, .pendingSummary 3 4]
+      .alreadyInitialized, .pendingSummary 3 5 4]
     let replies : Array Reply := #[Reply.snapshot [("a", [⟨h32 1, true⟩, ⟨h32 2, false⟩]), ("b", [])],
-      .pending [(h32 3, .waiting), (h32 4, .requested p)], .status true false true [(p, .syncing)]]
+      .pending [(h32 3, .waiting), (h32 4, .requested p), (h32 5, .queued)], .status true false true [(p, .syncing)]]
     let e : Effect :=
       if k == 0 then .send p m
       else if k == 1 then .close p .stateTooLarge
@@ -1094,7 +1179,9 @@ def randomEffects (st : State) : RM (List Effect) := do
       else if k == 3 then .fetch p hs
       else if k == 4 then .serveBlob p (h32 hi)
       else if k == 5 then .notify (notices[ni]?.getD .indexChanged)
-      else .reply (replies[ri]?.getD (.pending []))
+      else if k == 6 then .reply (replies[ri]?.getD (.pending []))
+      -- the same state message again (to another peer): encoded once, then as `sendAgain`
+      else .send ⟨p.val + t.toUInt32⟩ (.state (digestOf ByteArray.empty) st)
     out := e :: out
   return out
 
@@ -1133,6 +1220,19 @@ def decE (b : ByteArray) : Option ByteArray := match decodeEvent b with | .ok e 
 def decF (b : ByteArray) : Option ByteArray := match decodeEffects b with | .ok e => some (encodeEffects e) | .error _ => none
 
 def codecTests (c : Ctx) (mutations : Nat := 24000) : IO Unit := do
+  -- P1 regression: one step sending the published state to 32 peers (plus the persist) must carry
+  -- the state at most twice in the envelope, and the envelope must decode back
+  let items := (List.range 20000).map (fun i => ({ path := s!"dir{i % 100}/file{i}", hash := h32 i, supersedes := [] } : PutItem))
+  let big := State.empty.putMany ⟨1, 1⟩ items
+  let dg := digestOf (encodeState big)
+  let effs : List Effect := .persist 3 big :: (List.range 32).map (fun i => .send ⟨i.toUInt32⟩ (.state dg big))
+  let env := encodeEffects effs
+  let st := (encodeState big).size
+  IO.println s!"codec: 32 state sends + persist of a {st}-byte state: envelope {env.size} bytes"
+  check c "dedup: envelope holds at most two copies of the state" (env.size < 2 * st + 1000)
+  check c "dedup: envelope decodes back to the same effects" (match decodeEffects env with
+    | .ok effs' => effs'.length == 33 && baEq (encodeEffects effs') env
+    | .error _ => false)
   let act : RM Unit := do
     -- round trips of random states
     for i in [0:200] do

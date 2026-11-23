@@ -177,4 +177,22 @@ theorem rollback_rejects_local (n : Node) (op : LocalOp) (hrb : n.rollback = tru
   rw [(finish_core _).current]
   simp only [handle, hrb, ite_true]
 
+/-! ## 5. The effects envelope -/
+
+/-- New: everything `process` outputs is an effects envelope that decodes back to exactly the
+effects the step function emitted (or to `[notify (badEvent e)]` for a malformed input). So the
+host can decode and carry out every effect, and no session's `lastSent` is ever advanced for a
+send the host cannot have received. -/
+theorem process_output_decodes (m : Machine) (hm : m.Inv) (input : ByteArray) :
+    ∃ effs, decodeEffects (process m input).2 = .ok effs ∧
+      ∀ ev, decodeEvent input = .ok ev → effs = (step m ev).2 := by
+  unfold process
+  split
+  · next ev hev =>
+    refine ⟨(step m ev).2, decodeEffects_encodeEffects _ (step_effects_ok m hm ev), fun ev' hev' => ?_⟩
+    rw [hev] at hev'; cases hev'; rfl
+  · next e hev =>
+    refine ⟨_, decodeEffects_encodeEffects [.notify (.badEvent e)] (by simp [EffOk]), fun ev' hev' => ?_⟩
+    rw [hev] at hev'; cases hev'
+
 end LeanSync

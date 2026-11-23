@@ -556,6 +556,17 @@ theorem checkWire_iff (s : State) : checkWire s = true ↔ s.WireOk := by
 def HashBatchOk (hs : List Hash) : Prop :=
   StrictlySorted hs ∧ 0 < hs.length ∧ hs.length ≤ maxBatch ∧ ∀ h ∈ hs, h.bytes.size = hashLen
 
+instance (hs : List Hash) : Decidable (StrictlySorted hs) :=
+  inferInstanceAs (Decidable (List.Pairwise _ hs))
+
+/-- `HashBatchOk`, decided. -/
+def checkBatch (hs : List Hash) : Bool :=
+  decide (StrictlySorted hs) && decide (0 < hs.length) && decide (hs.length ≤ maxBatch) &&
+    hs.all (fun h => h.bytes.size == hashLen)
+
+theorem checkBatch_iff (hs : List Hash) : checkBatch hs = true ↔ HashBatchOk hs := by
+  simp [checkBatch, HashBatchOk, and_assoc]
+
 def encBatch (hs : List Hash) : List UInt8 := encVar hs.length ++ hs.flatMap encHash
 
 def readBatch : Parser (List Hash) := fun b pos =>
@@ -639,6 +650,17 @@ def Message.WireOk : Message → Prop
   | .noBlob hs => HashBatchOk hs
   | .have hs => HashBatchOk hs
   | .bye _ => True
+
+/-- `Message.WireOk`, decided. -/
+def checkMessage : Message → Bool
+  | .state _ s => checkWire s
+  | .want hs => checkBatch hs
+  | .noBlob hs => checkBatch hs
+  | .have hs => checkBatch hs
+  | _ => true
+
+theorem checkMessage_iff (m : Message) : checkMessage m = true ↔ m.WireOk := by
+  cases m <;> simp [checkMessage, Message.WireOk, checkWire_iff, checkBatch_iff]
 
 def encMsgBody : Message → List UInt8
   | .hello v r d => [0, v] ++ encU64 r.hi ++ encU64 r.lo ++ encDigest d

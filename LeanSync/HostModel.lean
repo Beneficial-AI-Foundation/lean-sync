@@ -7,7 +7,8 @@ A model of the host's knowledge, built only from the events it has given Lean an
 has already executed. An effect is *executable* when the host can carry it out in that view: a
 send or close goes to a connection that is open as far as Lean has been told, a persist is not
 issued while another is unacknowledged, a blob is served only if the host has reported it
-present, and every message fits the wire limits.
+present, and every message and persisted state is well formed for the wire (`WireOk`, which
+includes the size limits), so that the receiving peer, and the host itself, can decode it.
 
 Used by the theorem `effects_executable` and checked on every step by the simulator.
 The definitions here are real (not placeholders).
@@ -40,18 +41,19 @@ def onEvent (v : HostView) : Event → HostView
   | .persisted t _ => if v.pendingPersist = some t then { v with pendingPersist := none } else v
   | .persistFailed t => if v.pendingPersist = some t then { v with pendingPersist := none } else v
   | .blobStored h _ => v.addBlobs [h]
+  | .blobsStored hs => v.addBlobs hs
   | .blobLost h => { v with blobs := v.blobs.filter (· ≠ h) }
   | _ => v
 
 /-- Carry out one effect, or `none` if the host could not. -/
 def exec (v : HostView) : Effect → Option HostView
-  | .send p m => if p ∈ v.peers ∧ (encodeMessage m).size ≤ maxMessageBytes then some v else none
+  | .send p m => if p ∈ v.peers ∧ checkMessage m = true then some v else none
   | .close p _ => if p ∈ v.peers then some { v with peers := v.peers.filter (· ≠ p) } else none
   | .persist t s =>
-    if v.pendingPersist = none ∧ (encodeState s).size ≤ maxStateBytes
+    if v.pendingPersist = none ∧ checkWire s = true
     then some { v with pendingPersist := some t } else none
   | .fetch p hs =>
-    if p ∈ v.peers ∧ (encodeMessage (.want hs)).size ≤ maxMessageBytes then some v else none
+    if p ∈ v.peers ∧ checkBatch hs = true then some v else none
   | .serveBlob p h => if p ∈ v.peers ∧ h ∈ v.blobs then some v else none
   | .notify _ => some v
   | .reply _ => some v

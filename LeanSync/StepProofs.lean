@@ -489,6 +489,7 @@ theorem handle_inv {n : Node} (h : n.Inv) (ev : Event) : (handle n ev).1.Inv := 
       · exact h
     · exact h
   | blobStored hb src => exact inv_gotBlobs h [hb]
+  | blobsStored hs => exact inv_gotBlobs h hs
   | blobFailed p hb =>
     simp only [handle]
     split
@@ -913,6 +914,9 @@ theorem handle_grows (n : Node) (ev : Event) :
   | blobStored hb src =>
     obtain ⟨h1, h2, -⟩ := gotBlobs_frame n [hb]
     exact ⟨h1, by simp only [handle]; rw [h2]; exact State.le_refl' _⟩
+  | blobsStored hs =>
+    obtain ⟨h1, h2, -⟩ := gotBlobs_frame n hs
+    exact ⟨h1, by simp only [handle]; rw [h2]; exact State.le_refl' _⟩
   | connected p => simp only [handle]; split; exact ⟨rfl, State.le_refl' _⟩; split <;> exact ⟨rfl, State.le_refl' _⟩
   | disconnected p => simp only [handle]; split <;> exact ⟨rfl, State.le_refl' _⟩
   | persisted t d => simp only [handle]; split; split <;> exact ⟨rfl, State.le_refl' _⟩; exact ⟨rfl, State.le_refl' _⟩
@@ -1223,6 +1227,15 @@ theorem handle_effs (n : Node) (ev : Event) : ∀ e ∈ (handle n ev).2, HandleE
       rcases he with rfl | he
       · trivial
       · exact gotBlobs_effs_handle _ _ e he
+  | blobsStored hs =>
+    simp only [handle]
+    split
+    · simp
+    · intro e he
+      simp only [List.mem_cons] at he
+      rcases he with rfl | he
+      · trivial
+      · exact gotBlobs_effs_handle _ _ e he
   | connected p => simp only [handle]; split; simp; split <;> simp [HandleEff]
   | disconnected p => simp only [handle]; split <;> simp [HandleEff]
   | persisted t d => simp only [handle]; split; split <;> simp; simp
@@ -1283,6 +1296,9 @@ theorem handle_persistence (n : Node) (ev : Event) :
       · exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
   | blobStored hb src =>
     obtain ⟨-, -, h3, h4, h5, -, -⟩ := gotBlobs_frame n [hb]
+    exact ⟨h5, .inl ⟨h4, h3⟩⟩
+  | blobsStored hs =>
+    obtain ⟨-, -, h3, h4, h5, -, -⟩ := gotBlobs_frame n hs
     exact ⟨h5, .inl ⟨h4, h3⟩⟩
   | persisted t d =>
     simp only [handle]
@@ -1923,11 +1939,11 @@ theorem execAll_benign (v : HostView) : ∀ (l : List Effect), (∀ e ∈ l, v.e
 
 theorem exec_send {v : HostView} {p : PeerId} {m : Message} (hp : p ∈ v.peers) (hm : m.WireOk) :
     v.exec (.send p m) = some v := by
-  simp [HostView.exec, hp, size_encodeMessage_le m hm]
+  simp [HostView.exec, hp, (checkMessage_iff m).2 hm]
 
 theorem exec_fetch {v : HostView} {p : PeerId} {hs : List Hash} (hp : p ∈ v.peers) (hm : HashBatchOk hs) :
     v.exec (.fetch p hs) = some v := by
-  simp [HostView.exec, hp, size_encodeMessage_le (.want hs) hm]
+  simp [HostView.exec, hp, (checkBatch_iff hs).2 hm]
 
 theorem mem_addBlobs (v : HostView) (hs : List Hash) (z : Hash) : z ∈ (v.addBlobs hs).blobs ↔ z ∈ v.blobs ∨ z ∈ hs := by
   unfold HostView.addBlobs
@@ -1961,7 +1977,7 @@ theorem finish_exec {n : Node} (hn : n.Inv) {v : HostView} (hpeers : ∀ x ∈ n
     split
     · next hc =>
       simp only [Bool.and_eq_true, Option.isNone_iff_eq_none] at hc
-      have hsz := hn.currentOk.2.2
+      have hsz := (checkWire_iff _).2 hn.currentOk
       refine ⟨{ v with pendingPersist := some n.nextTag }, ?_, rfl, rfl, rfl⟩
       simp [HostView.execAll, HostView.exec, hpend, hc.1, hsz]
     · exact ⟨v, rfl, rfl, rfl, hpend⟩
@@ -2313,6 +2329,25 @@ theorem handle_exec {v : HostView} {n : Node} (hn : n.Inv) (hr : PreRel v n) (ev
     · refine ⟨_, ?_, hpre⟩
       simp only [HostView.execAll, HostView.exec]
       exact execAll_benign _ _ hben
+  | blobsStored hs =>
+    have hr1 : PreRel (v.onEvent (.blobsStored hs)) n :=
+      preRel_mono hr (fun p hp => hp) (fun z hz => by simp only [HostView.onEvent]; rw [mem_addBlobs]; exact .inl hz) rfl
+    obtain ⟨g1, g2, g3⟩ := gotBlobs_exec hn hs (v.onEvent (.blobsStored hs)).peers hr1.1
+    have hben : ∀ e ∈ (gotBlobs n hs).2, (v.onEvent (.blobsStored hs)).exec e = some (v.onEvent (.blobsStored hs)) := by
+      intro e he
+      obtain ⟨q, x, rfl, hq, hx⟩ := g3 e he
+      exact exec_send hq (hashBatchOk_single hx)
+    have hpre : PreRel (v.onEvent (.blobsStored hs)) (gotBlobs n hs).1 := by
+      refine ⟨g1, fun z hz => ?_, by rw [(gotBlobs_frame _ _).2.2.2.1]; exact hr1.2.2⟩
+      rcases g2 z hz with hz | hz
+      · exact hr1.2.1 z hz
+      · simp only [HostView.onEvent]; rw [mem_addBlobs]; exact .inr hz
+    simp only [handle]
+    split
+    · exact ⟨_, rfl, hpre⟩
+    · refine ⟨_, ?_, hpre⟩
+      simp only [HostView.execAll, HostView.exec]
+      exact execAll_benign _ _ hben
   | blobFailed p h =>
     simp only [handle]
     split
@@ -2432,6 +2467,7 @@ theorem handle_rollback_mono (n : Node) (ev : Event) (h : n.rollback = true) :
       · exact onMessage_rollback_mono _ _ _ h
   | localOp op => simp only [handle, h, ite_true]
   | blobStored hb src => simp only [handle]; rw [(gotBlobs_frame _ _).2.2.2.2.2.1]; exact h
+  | blobsStored hs => simp only [handle]; rw [(gotBlobs_frame _ _).2.2.2.2.2.1]; exact h
   | connected p => simp only [handle]; split; exact h; split <;> exact h
   | disconnected p => simp only [handle]; split <;> exact h
   | persisted t d => simp only [handle]; split; split <;> exact h; exact h
@@ -2525,5 +2561,54 @@ theorem finish_rollback_no_state {n : Node} (h : n.rollback = true) (p : PeerId)
 theorem rollback_mode_no_state {n : Node} (_hn : n.Inv) (h : n.rollback = true) (ev : Event)
     {p : PeerId} {d : Digest} {s : State} : .send p (.state d s) ∉ (finish (handle n ev).1).2 :=
   finish_rollback_no_state (handle_rollback_mono n ev h) p d s
+
+/-! ## Everything a step emits decodes back -/
+
+theorem exec_effOk {v v' : HostView} {e : Effect} (h : v.exec e = some v') : EffOk e := by
+  cases e with
+  | send p m =>
+    simp only [HostView.exec] at h
+    split at h
+    · next hc => exact (checkMessage_iff m).1 hc.2
+    · cases h
+  | persist t s =>
+    simp only [HostView.exec] at h
+    split at h
+    · next hc => exact (checkWire_iff s).1 hc.2
+    · cases h
+  | fetch p hs =>
+    simp only [HostView.exec] at h
+    split at h
+    · next hc => exact (checkBatch_iff hs).1 hc.2
+    · cases h
+  | _ => trivial
+
+theorem execAll_effOk : ∀ {v v' : HostView} {l : List Effect}, v.execAll l = some v' → ∀ e ∈ l, EffOk e
+  | _, _, [], _, e, he => by cases he
+  | v, v', x :: xs, h, e, he => by
+    simp only [HostView.execAll] at h
+    split at h
+    · next v1 hx =>
+      simp only [List.mem_cons] at he
+      rcases he with rfl | he
+      · exact exec_effOk hx
+      · exact execAll_effOk h e he
+    · cases h
+
+/-- A host view that agrees with the machine. -/
+def canonView : Machine → HostView
+  | .uninit => {}
+  | .running n => { peers := n.sessions.map (·.peer), pendingPersist := n.inflight.map (·.1), blobs := n.blobs }
+
+theorem hostRel_canon (m : Machine) : HostRel (canonView m) m := by
+  cases m with
+  | uninit => rfl
+  | running n =>
+    exact ⟨fun x hx => List.mem_map_of_mem hx, fun h hh => hh, rfl⟩
+
+/-- Every effect a step emits is well formed for the effects codec. -/
+theorem step_effects_ok (m : Machine) (hm : m.Inv) (ev : Event) : ∀ e ∈ (step m ev).2, EffOk e := by
+  obtain ⟨v2, h1, -⟩ := step_exec hm (hostRel_canon m) ev
+  exact execAll_effOk h1
 
 end LeanSync

@@ -1,4 +1,4 @@
-import LeanSync.Step
+import LeanSync.EffectsWire
 
 /-!
 # Host envelopes and the wasm boundary
@@ -25,14 +25,10 @@ event   := 01 03 tag:u8 ...
   6 persisted   tag:varint digest:32       7 persistFailed tag:varint
   8 blobStored  hash (00 | 01 peer)        9 blobFailed peer hash
   10 blobLost   hash                       11 query (0 snapshot | 1 pending | 2 status)
-effects := 01 04 k:varint {effect}^k
-  0 send peer msg:bytes                    1 close peer reason:u8
-  2 persist tag:varint state:bytes          (state = the record to store; hash exactly these bytes)
-  3 fetch peer k:varint {hash}^k msg:bytes  (msg = the encoded `want`, to send verbatim)
-  4 serveBlob peer hash                    5 notify notice              6 reply reply
+  12 blobsStored k:varint {hash}^k         (start-up inventory in chunks, or any batch of stored blobs)
 ```
-Notices and replies are listed at `wNotice` and `wReply`. Decoding of events is total and
-linear; any malformed event yields the single effect `notify (badEvent e)`.
+The effects envelope (Lean → host) is in `LeanSync/EffectsWire.lean`. Decoding of events is total
+and linear; any malformed event yields the single effect `notify (badEvent e)`.
 -/
 
 set_option linter.unusedSectionVars false
@@ -116,21 +112,13 @@ def dEvent : Dec Event := do
   | 9 => do let p ← dPeer; let h ← dHash; pure (.blobFailed p h)
   | 10 => do let h ← dHash; pure (.blobLost h)
   | 11 => do let q ← dQuery; pure (.query q)
+  | 12 => do let hs ← dHashes; pure (.blobsStored hs)
   | n => .fail (.badTag n)
 
 def decodeEvent (b : ByteArray) : Except DecodeError Event :=
   decodeTop (readWithHeader kindEvent dEvent.run) maxEnvelopeBytes b
 
 /-! ## Writers -/
-
-def wPeer (acc : ByteArray) (p : PeerId) : ByteArray := wVar acc p.val.toNat
-def wReplica (acc : ByteArray) (r : ReplicaId) : ByteArray := wVar (wVar acc r.hi.toNat) r.lo.toNat
-def wLen (acc : ByteArray) (x : ByteArray) : ByteArray := wBytes (wVar acc x.size) x
-def wHash (acc : ByteArray) (h : Hash) : ByteArray := wLen acc h.bytes
-def wHashes (acc : ByteArray) (hs : List Hash) : ByteArray := hs.foldl wHash (wVar acc hs.length)
-def wBool (acc : ByteArray) (b : Bool) : ByteArray := acc.push (if b then 1 else 0)
-def wList {α} (w : ByteArray → α → ByteArray) (acc : ByteArray) (l : List α) : ByteArray :=
-  l.foldl w (wVar acc l.length)
 
 def wLocalOp (acc : ByteArray) : LocalOp → ByteArray
   | .putMany items => wList (fun a (it : PutItem) => wHashes (wHash (wStr a it.path) it.hash) it.supersedes)
@@ -163,157 +151,7 @@ def encodeEvent (e : Event) : ByteArray :=
   | .blobFailed p h => wHash (wPeer (acc.push 9) p) h
   | .blobLost h => wHash (acc.push 10) h
   | .query q => wQuery (acc.push 11) q
-
-def errCode : DecodeError → UInt8 × Nat
-  | .truncated => (0, 0) | .trailing => (1, 0) | .tooLarge => (2, 0) | .badVersion v => (3, v)
-  | .badKind k => (4, k) | .badTag t => (5, t) | .nonCanonical => (6, 0) | .badUtf8 => (7, 0)
-
-def wErr (acc : ByteArray) (e : DecodeError) : ByteArray :=
-  let (c, v) := errCode e; wVar (acc.push c) v
-
-def statusByte : PeerStatus → UInt8
-  | .handshaking => 0 | .syncing => 1 | .inSync => 2
-
-/-- Notices: 0 indexChanged · 1 blobsChanged · 2 peerStatus peer status:u8 (00 | 01 replica) ·
-3 peerClosed peer reason:u8 byPeer:u8 · 4 peerLeft peer · 5 peerError peer err ·
-6 rollbackDetected · 7 opRejected str · 8 badEvent err · 9 startupFailed err ·
-10 notInitialized · 11 alreadyInitialized · 12 pendingSummary fetching:varint waiting:varint.
-`err` = code:u8 value:varint (0 truncated, 1 trailing, 2 tooLarge, 3 badVersion v, 4 badKind k,
-5 badTag t, 6 nonCanonical, 7 badUtf8). -/
-def wNotice (acc : ByteArray) : Notice → ByteArray
-  | .indexChanged => acc.push 0
-  | .blobsChanged => acc.push 1
-  | .peerStatus p s r =>
-    let a := (wPeer (acc.push 2) p).push (statusByte s)
-    match r with
-    | none => wBool a false
-    | some r => wReplica (wBool a true) r
-  | .peerClosed p r byPeer => wBool ((wPeer (acc.push 3) p).push (reasonByte r)) byPeer
-  | .peerLeft p => wPeer (acc.push 4) p
-  | .peerError p e => wErr (wPeer (acc.push 5) p) e
-  | .rollbackDetected => acc.push 6
-  | .opRejected why => wLen (acc.push 7) why.toByteArray
-  | .badEvent e => wErr (acc.push 8) e
-  | .startupFailed e => wErr (acc.push 9) e
-  | .notInitialized => acc.push 10
-  | .alreadyInitialized => acc.push 11
-  | .pendingSummary f w => wVar (wVar (acc.push 12) f) w
-
-/-- Replies: 0 snapshot k {path:str m {hash present:u8}^m}^k · 1 pending k {hash (00 | 01 peer)}^k ·
-2 status persistInFlight:u8 dirty:u8 rollback:u8 k {peer status:u8}^k. -/
-def wReply (acc : ByteArray) : Reply → ByteArray
-  | .snapshot files => wList (fun a (f : String × List VersionInfo) =>
-      wList (fun a (v : VersionInfo) => wBool (wHash a v.hash) v.present) (wStr a f.1) f.2)
-      (acc.push 0) files
-  | .pending items => wList (fun a (x : Hash × PendingStatus) =>
-      match x.2 with
-      | .waiting => wBool (wHash a x.1) false
-      | .requested p => wPeer (wBool (wHash a x.1) true) p) (acc.push 1) items
-  | .status pf d rb peers => wList (fun a (x : PeerId × PeerStatus) => (wPeer a x.1).push (statusByte x.2))
-      (wBool (wBool (wBool (acc.push 2) pf) d) rb) peers
-
-def wEffect (acc : ByteArray) : Effect → ByteArray
-  | .send p m => wLen (wPeer (acc.push 0) p) (encodeMessage m)
-  | .close p r => (wPeer (acc.push 1) p).push (reasonByte r)
-  | .persist t s => wLen (wVar (acc.push 2) t) (encodeState s)
-  | .fetch p hs => wLen (wHashes (wPeer (acc.push 3) p) hs) (encodeMessage (.want hs))
-  | .serveBlob p h => wHash (wPeer (acc.push 4) p) h
-  | .notify n => wNotice (acc.push 5) n
-  | .reply r => wReply (acc.push 6) r
-
-def encodeEffects (effs : List Effect) : ByteArray :=
-  wList wEffect ((ByteArray.empty.push wireVersion).push kindEffects) effs
-
-/-! ## Decoding effects (what the JS host does; here for tests and the simulator) -/
-
-def dErr : Dec DecodeError := do
-  let c ← dByte; let v ← dVar
-  match c.toNat with
-  | 0 => pure .truncated | 1 => pure .trailing | 2 => pure .tooLarge | 3 => pure (.badVersion v)
-  | 4 => pure (.badKind v) | 5 => pure (.badTag v) | 6 => pure .nonCanonical | 7 => pure .badUtf8
-  | n => .fail (.badTag n)
-
-def dStatus : Dec PeerStatus := do
-  let x ← dByte
-  match x.toNat with
-  | 0 => pure .handshaking | 1 => pure .syncing | 2 => pure .inSync | n => .fail (.badTag n)
-
-def dReason : Dec CloseReason := do
-  let x ← dByte
-  match reasonOfByte x with
-  | some r => pure r
-  | none => .fail (.badTag x.toNat)
-
-def dAnyHash : Dec Hash := do let b ← dBytes maxStateBytes; pure ⟨b⟩
-
-def dNotice : Dec Notice := do
-  let t ← dByte
-  match t.toNat with
-  | 0 => pure .indexChanged
-  | 1 => pure .blobsChanged
-  | 2 => do
-    let p ← dPeer; let s ← dStatus; let has ← dBool
-    if has then do let r ← dReplica; pure (.peerStatus p s (some r)) else pure (.peerStatus p s none)
-  | 3 => do let p ← dPeer; let r ← dReason; let b ← dBool; pure (.peerClosed p r b)
-  | 4 => do let p ← dPeer; pure (.peerLeft p)
-  | 5 => do let p ← dPeer; let e ← dErr; pure (.peerError p e)
-  | 6 => pure .rollbackDetected
-  | 7 => do
-    let b ← dBytes maxStateBytes
-    if h : b.IsValidUTF8 then pure (.opRejected (String.ofByteArray b h)) else .fail .badUtf8
-  | 8 => do let e ← dErr; pure (.badEvent e)
-  | 9 => do let e ← dErr; pure (.startupFailed e)
-  | 10 => pure .notInitialized
-  | 11 => pure .alreadyInitialized
-  | 12 => do let f ← dVar; let w ← dVar; pure (.pendingSummary f w)
-  | n => .fail (.badTag n)
-
-def dReply : Dec Reply := do
-  let t ← dByte
-  match t.toNat with
-  | 0 => do
-    let k ← dVar
-    let files ← .many k (do
-      let p ← dStr; let m ← dVar
-      let vs ← .many m (do let h ← dAnyHash; let pr ← dBool; pure (VersionInfo.mk h pr))
-      pure (p, vs))
-    pure (.snapshot files)
-  | 1 => do
-    let k ← dVar
-    let items ← .many k (do
-      let h ← dAnyHash; let has ← dBool
-      if has then do let p ← dPeer; pure (h, PendingStatus.requested p) else pure (h, PendingStatus.waiting))
-    pure (.pending items)
-  | 2 => do
-    let pf ← dBool; let d ← dBool; let rb ← dBool; let k ← dVar
-    let peers ← .many k (do let p ← dPeer; let s ← dStatus; pure (p, s))
-    pure (.status pf d rb peers)
-  | n => .fail (.badTag n)
-
-def dEmbedded {α} (dec : ByteArray → Except DecodeError α) : Dec α := do
-  let b ← dBytes maxMessageBytes
-  match dec b with
-  | .ok x => pure x
-  | .error e => .fail e
-
-def dEffect : Dec Effect := do
-  let t ← dByte
-  match t.toNat with
-  | 0 => do let p ← dPeer; let m ← dEmbedded decodeMessage; pure (.send p m)
-  | 1 => do let p ← dPeer; let r ← dReason; pure (.close p r)
-  | 2 => do let tag ← dVar; let s ← dEmbedded decodeState; pure (.persist tag s)
-  | 3 => do
-    let p ← dPeer; let hs ← (do let k ← dVar; .many k dAnyHash); let m ← dEmbedded decodeMessage
-    match m with
-    | .want hs' => if hs' == hs then pure (.fetch p hs) else .fail .nonCanonical
-    | _ => .fail .nonCanonical
-  | 4 => do let p ← dPeer; let h ← dAnyHash; pure (.serveBlob p h)
-  | 5 => do let n ← dNotice; pure (.notify n)
-  | 6 => do let r ← dReply; pure (.reply r)
-  | n => .fail (.badTag n)
-
-def decodeEffects (b : ByteArray) : Except DecodeError (List Effect) :=
-  decodeTop (readWithHeader kindEffects (do let k ← dVar; Dec.many k dEffect).run) (8 * maxEnvelopeBytes) b
+  | .blobsStored hs => wHashes (acc.push 12) hs
 
 /-! ## The boundary -/
 

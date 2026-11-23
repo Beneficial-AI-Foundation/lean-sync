@@ -20,6 +20,9 @@ open LeanSync
 #print axioms step_detects_rollback
 #print axioms rollback_no_state
 #print axioms rollback_rejects_local
+#print axioms process_output_decodes
+#print axioms decodeEffects_encodeEffects
+#print axioms step_effects_ok
 #print axioms step_received_state
 #print axioms step_putMany
 #print axioms step_current_grows
