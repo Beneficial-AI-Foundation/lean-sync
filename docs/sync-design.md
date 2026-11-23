@@ -55,7 +55,7 @@ Checked against the C that Lean 4.36 generates (`.lake/build/ir/LeanSync/Envelop
 - **`lw_init`.** Call `initialize_lean_x2dcrdt_LeanSync_Envelope(1)` instead of the demo's
   initializer.
   - Its import closure is `Init`, `LeanCrdt.{Types,SortedList,VersionVector,State}` and
-    `LeanSync.{Types,Bytes,Wire,Sets,Step,Envelope}`. It imports no `Std`, and none of the
+    `LeanSync.{Types,Bytes,Wire,Sets,Step,EffectsWire,Envelope}`. It imports no `Std`, and none of the
     proof modules.
   - It also creates `machineRef`, unconditionally.
 - **`lw_process`.** In place of `g_result = lean_wasm_demo_process(in)`:
