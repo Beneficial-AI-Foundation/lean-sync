@@ -27,7 +27,9 @@ const HOST = '127.0.0.1';
 const TYPES = { '.html': 'text/html; charset=utf-8', '.mjs': 'text/javascript', '.js': 'text/javascript',
   '.css': 'text/css', '.wasm': 'application/wasm', '.json': 'application/json', '.svg': 'image/svg+xml' };
 
-export async function startServer({ port = 0, root, admin: adminEnabled = false } = {}) {
+export async function startServer({ port = 0, root, admin: adminEnabled = false, anyOrigin = false } = {}) {
+  // anyOrigin: tests only (a stand-in for someone else's relay); never with the app's own server.
+  const stats = { upgrades: 0 };
   // Loopback is not an access control: any page open in the user's browser can reach 127.0.0.1.
   // So the relay accepts WebSocket upgrades only from pages of this server's own origin (browsers
   // always send Origin on WebSocket handshakes), devices without an explicit room join a random
@@ -35,7 +37,7 @@ export async function startServer({ port = 0, root, admin: adminEnabled = false 
   // asked for, and refuses any request that carries a foreign Origin.
   const defaultRoom = randomBytes(16).toString('hex');
   let ownOrigins = new Set();
-  const originOk = (o) => o !== undefined && ownOrigins.has(o);
+  const originOk = (o) => anyOrigin || (o !== undefined && ownOrigins.has(o));
   root = resolve(root ?? join(dirname(fileURLToPath(import.meta.url)), '../build/site'));
   const rooms = new Map();          // room -> { devices: Map id -> dev, links: Map linkId -> link, allow: Set|null }
   let nextDevice = 1, nextLink = 1;
@@ -75,7 +77,7 @@ export async function startServer({ port = 0, root, admin: adminEnabled = false 
     switch (url.pathname) {
       case '/admin/state':
         return reply({ devices: [...r.devices.values()].map((d) => ({ id: d.id, label: d.label, online: d.online })),
-          links: [...r.links.values()].map((k) => ({ id: k.id, a: k.a.label, b: k.b.label, bytes: k.bytes })), cuts: r.cuts });
+          links: [...r.links.values()].map((k) => ({ id: k.id, a: k.a.label, b: k.b.label, bytes: k.bytes })), cuts: r.cuts, upgrades: stats.upgrades });
       case '/admin/topology':
         r.allow = body.allow ? new Set(body.allow.map(([a, b]) => pairKey(a, b))) : null;
         for (const k of [...r.links.values()]) if (!allowed(r, k.a, k.b)) dropLink(r, k, 'topology');
@@ -148,6 +150,7 @@ export async function startServer({ port = 0, root, admin: adminEnabled = false 
   }
 
   server.on('upgrade', (req, sock) => {
+    stats.upgrades++;
     const url = new URL(req.url, 'http://x');
     const key = req.headers['sec-websocket-key'];
     if (url.pathname !== '/relay' || !key) { sock.destroy(); return; }

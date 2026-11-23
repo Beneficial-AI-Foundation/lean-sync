@@ -174,3 +174,72 @@ test('close goes out after the bytes already queued', async () => {
   await sleep(5);
   assert.deepEqual(link.sent.map((f) => f[0]), [1]); assert.equal(link.closed, true);
 });
+
+// ---- the single serving slot is always released ----
+function server({ stallMs } = {}) {
+  const events = []; const storage = memoryStorage();
+  const links = createLinks({ emit: (ev) => events.push(ev), storage, self: () => ({ replica: ME, label: 'me' }), epoch: () => 0, log: () => {}, stallMs });
+  links.setAccepting(true);
+  const a = fakeLink(1), b = fakeLink(2);
+  links.attach(a); a.deliver(hello(OTHER));
+  links.attach(b); b.deliver(hello({ hi: 7n, lo: 8n }));
+  a.sent.length = 0; b.sent.length = 0;
+  return { events, storage, links, a, b };
+}
+const put = async (storage, bytes) => { const h = await sha256(bytes); storage.blobs.set(hex(h), bytes); return h; };
+
+test('an empty blob is served as START + END and frees the slot', async () => {
+  const t = server();
+  const empty = await put(t.storage, new Uint8Array(0)), next = await put(t.storage, new Uint8Array(10).fill(1));
+  t.links.serve(1, empty); t.links.serve(2, next);
+  await sleep(20);
+  assert.deepEqual(t.a.sent.map((f) => f[0]), [2, 4], 'START then END, no credit needed');
+  assert.deepEqual(t.b.sent.map((f) => f[0]), [2], 'the next blob is served');
+});
+
+test('an empty blob is received and stored', async () => {
+  const { events, link, links, storage } = setup(); link.deliver(hello(OTHER));
+  const h = await sha256(new Uint8Array(0));
+  links.expect(1, [h]);
+  link.deliver(start(h, 0)); link.deliver(end(h));
+  await sleep(10);
+  assert.deepEqual(events.at(-1), { type: 'blobStored', hash: h, peer: 1 }); assert.ok(storage.blobs.has(hex(h)));
+});
+
+test('if no file can be created for a stream: blobFailed, and ABORT so the sender moves on', async () => {
+  const { events, link, links, storage } = setup(); link.deliver(hello(OTHER));
+  storage.beginIncoming = async () => { throw Object.assign(new Error('quota'), { name: 'QuotaExceededError' }); };
+  const h = new Uint8Array(32).fill(3);
+  links.expect(1, [h]);
+  link.sent.length = 0;
+  link.deliver(start(h, 10 * 1024 * 1024));                 // larger than the initial credit window
+  await sleep(10);
+  assert.deepEqual(types(events), ['connected', 'blobFailed']);
+  assert.ok(link.sent.some((f) => f[0] === 5), 'ABORT sent');
+});
+
+test('a receiver that grants no credit is abandoned after the stall timeout, freeing the slot', async () => {
+  const t = server({ stallMs: 50 });
+  const big = await put(t.storage, new Uint8Array(1000).fill(2)), next = await put(t.storage, new Uint8Array(10).fill(3));
+  t.links.serve(1, big); t.links.serve(2, next);
+  await sleep(20);
+  assert.deepEqual(t.a.sent.map((f) => f[0]), [2]); assert.deepEqual(t.b.sent.map((f) => f[0]), []);
+  await sleep(100);
+  assert.deepEqual(t.a.sent.map((f) => f[0]), [2, 5], 'ABORT after the stall');
+  assert.equal(t.b.sent[0]?.[0], 2, 'next blob served');
+});
+
+test('the slot is freed when the receiving link closes, when the receiver aborts, and when a blob is unreadable', async () => {
+  const t = server();
+  const x = await put(t.storage, new Uint8Array(100).fill(4)), y = await put(t.storage, new Uint8Array(100).fill(5));
+  const z = await put(t.storage, new Uint8Array(100).fill(6)), gone = new Uint8Array(32).fill(9);
+  t.links.serve(1, x); t.links.serve(2, gone); t.links.serve(2, y); t.links.serve(2, z);
+  await sleep(20);
+  t.a.drop();                                              // receiver of x goes away mid-transfer
+  await sleep(20);
+  assert.deepEqual(t.b.sent.map((f) => f[0]), [5, 2], 'gone: ABORT (+ blobLost); then y starts');
+  t.b.deliver(Uint8Array.from([5, ...y]));                 // the receiver aborts y
+  await sleep(20);
+  assert.deepEqual(t.b.sent.map((f) => f[0]), [5, 2, 2], 'z starts');
+  assert.ok(t.events.some((e) => e.type === 'blobLost'));
+});

@@ -133,7 +133,7 @@ never reach the new machine (its tags restart at 0).
 ## 4. Host obligations
 
 Audited by mutation (`node test/mutations.mjs`): for each row the mechanism was removed or broken
-in the app's source and the named test was run (e2e in Chromium); **28 of 28 mutants were caught**.
+in the app's source and the named test was run (e2e in Chromium); **36 of 36 mutants were caught**.
 "Mutant" names the break that was tried.
 
 | Obligation (sync-design §8, decision 7) | Mechanism | Test (fails when the mechanism is broken) | Mutant |
@@ -157,6 +157,10 @@ in the app's source and the named test was run (e2e in Chromium); **28 of 28 mut
 | `received`: one complete message ≤ limit | reassembly; over the limit closes | unit `links` | no limit |
 | Persist answers only for persists given | epochs | unit `core` | stale epochs delivered |
 | Rollback mode; restart only on click + confirm | banner, edits disabled, dialog, `init newId bytes` | e2e `rollback-detected-then-new-identity` | edits allowed in rollback |
+| The single serving slot is always released | END right after START for an empty blob; ABORT from the receiver when it cannot create the file; release on END, receiver ABORT, link close, unreadable blob; abort after 60 s without credit | e2e `empty-file-then-normal-file`, `incoming-file-creation-fails-then-next-file`; unit `links` (all six paths) | no END for an empty blob; sink failure ignored; no stall timeout |
+| A blob is replaced only by a verified copy, never deleted first | an intact existing copy is kept; a damaged one is overwritten by one `move()` | e2e `existing-blob-kept-when-replacement-fails` | delete, then move |
+| Row statuses follow request planning | `pending` re-queried on peer changes and on `pendingSummary` | e2e `peer-leaves-mid-fetch-row-updates` | refresh removed |
+| Transport only to the serving origin | no URL parameter selects the relay | e2e `relay-parameter-ignored` (a second relay that accepts any origin sees no connection) | `?relay=` honoured |
 | Re-instantiate after a trap; no loop | §8 | e2e `trap-mid-sync…`, `trap-at-startup…`; unit `core` | no restart; start-up trap retried; restart stays `running` |
 | Refuse a peer with our own replica id | host HELLO check before Lean | unit `links`; e2e `same-replica-id-refused` | check removed |
 | Nothing else persisted | IDB holds the record, `rotateId`, the label | review only (not mutation-tested) | — |
@@ -173,6 +177,14 @@ saved each time; the "lost" branch is accepted by the test but was not observed)
 
 Browser behaviour found by the feature probe (`test/e2e/probe-features.mjs`) and the tests:
 - OPFS `move()` and IDB `durability:'strict'` work in Chromium 154, Firefox 146 and ESR 140.
+- **Replacing a blob.** `move()` onto an existing name overwrites it in Chromium 154, Firefox 146
+  and ESR 140 (probed). `publish` keeps an intact existing copy (the new one is dropped) and
+  overwrites a damaged or unreadable one with a single `move()`; it never deletes first. What we get:
+  a failed `move()` leaves the old file in place; a tab closed during the move leaves the old or the
+  new file under that name (the browsers do not document crash atomicity for `move()`); the temp
+  copy left in `incoming/` is deleted at start-up, and an old damaged copy is detected again when it
+  is served or downloaded (`blobLost`, then fetched again). *(Review: the first fix for the damaged
+  copy deleted it before the move, so a failed move or a closed tab left the index with no copy.)*
 - **Firefox:** after a transaction aborts for quota, the next `db.transaction()` on that connection
   throws `InvalidStateError` ("did not allow mutations"), and kept doing so after space was freed.
   `storage.mjs` then reopens the connection and tries the same write once more (nothing was
@@ -197,7 +209,9 @@ Access (review P1: loopback is not access control — any page open in the same 
 (`http://127.0.0.1:<port>` or `http://localhost:<port>`; no `Origin`, no upgrade); devices that name
 no room join a random 128-bit room chosen when the server starts; the admin API is off unless the
 server is started with `--admin` (the tests do) and refuses requests carrying a foreign `Origin`.
-Unit `relay` checks all four.
+Unit `relay` checks all four. There is no URL parameter to choose the relay: the app always uses
+`/relay` on the origin that served it. *(Review P1: a `?relay=` parameter let a crafted link
+connect the profile's files to someone else's endpoint.)*
 
 ## 7. Blob streaming and backpressure (as built)
 
@@ -208,6 +222,22 @@ credit, or beyond the announced size, fail the stream; a START above 256 MiB is 
 byte is accepted. So a peer can make this device buffer at most 4 MiB per stream in memory, and the
 receiving side's hashing buffer is bounded by the same 256 MiB limit as local adds. The limit exists
 because WebCrypto hashes one in-memory buffer (decision 6); adds above it are refused with a message.
+
+**The single serving slot.** Because outgoing blobs are served one at a time per device, any
+transfer that never ends blocks every later file for every peer. Every way out, and its test:
+
+| How a transfer ends | Mechanism | Test |
+|---|---|---|
+| normal | END after the last DATA | e2e (every sync) |
+| empty blob (no credit will ever come) | END right after START | unit `links`; e2e `empty-file-then-normal-file` *(review P1)* |
+| receiver cannot create the file | receiver: `blobFailed` + ABORT; sender: releases on ABORT | unit `links`; e2e `incoming-file-creation-fails-then-next-file` *(review P1)* |
+| receiver aborts for another reason (bad size, over credit, unexpected) | sender releases on ABORT | unit `links` |
+| receiving link closes mid-transfer (or ABORT lost with it) | link close releases the slot | unit `links` |
+| blob gone or unreadable on the sender | ABORT + `blobLost`, release | unit `links`; e2e `damaged-or-missing-blob-recovers` |
+| receiver stops granting credit without saying why | sender aborts after 60 s without credit | unit `links` (short timeout) |
+
+A lost ABORT on a live link cannot happen (links are reliable and ordered); if a link breaks, its
+close releases the slot.
 
 ## 8. Traps and re-instantiation (as built)
 
@@ -236,13 +266,18 @@ dimmed, and downloads under its last component (nothing below the UI restricts p
 
 ## 10. Tests and results
 
-Unit (`node --test test/unit/*.test.mjs`): 34 tests — codec vs Lean (5), links (14), core with the
+Unit (`node --test test/unit/*.test.mjs`): 39 tests — codec vs Lean (5), links (19), core with the
 real engine (10), relay access (2), view (3), plus the mutation audit of §4. Engine checks: §0.
-End-to-end (`node test/e2e/run.mjs`): 20 scenarios, 51 runs; browsers per run in the table below (Chromium 154.0.8037.92, Firefox 146.0, Firefox ESR
+End-to-end (`node test/e2e/run.mjs`): 25 scenarios, 62 runs; browsers per run in the table below (Chromium 154.0.8037.92, Firefox 146.0, Firefox ESR
 140.16.0esr, all headless, each device its own browser process and profile).
 
 | Scenario | Configurations (device A + B [+ C]) |
 |---|---|
+| `empty-file-then-normal-file` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146; Chromium 154 + Firefox 146 |
+| `incoming-file-creation-fails-then-next-file` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146 |
+| `peer-leaves-mid-fetch-row-updates` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146 |
+| `existing-blob-kept-when-replacement-fails` | Chromium 154; Firefox 146 |
+| `relay-parameter-ignored` | Chromium 154; Firefox 146 |
 | `record-request-error-not-acknowledged` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146 |
 | `peer-edit-during-upload-becomes-conflict` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146; Chromium 154 + Firefox 146 |
 | `damaged-or-missing-blob-recovers` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146 |
@@ -349,7 +384,7 @@ Planned in the stage-1 note and not done:
 3. A peer-triggered deterministic trap is contained by the restart limit, not prevented.
 4. Files are limited to 256 MiB (WebCrypto hashes whole buffers); serving and downloading also read a
    whole file into memory, one at a time.
-5. One outgoing blob at a time per device: a slow peer delays others.
+5. One outgoing blob at a time per device: a slow peer delays others (a stalled one by at most 60 s).
 6. Accepted limits carried over: whole-state send per edit and peer, no blob GC, no file sizes in the
    index.
 7. The dev relay accepts only its own origin and uses a random room, but is otherwise unauthenticated;

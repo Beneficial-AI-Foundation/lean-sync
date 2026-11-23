@@ -4,6 +4,7 @@
 import assert from 'node:assert/strict';
 import { cpSync } from 'node:fs';
 import { tempDir, removeDir } from '../proc.mjs';
+import { startServer } from '../../dev/serve.mjs';
 import { openDevice, randomFile, sleep, admin, sha } from './lib.mjs';
 
 const CH = 'chromium', FF = 'firefox', ESR = 'firefox-esr';
@@ -35,7 +36,106 @@ const incomingCount = (dev) => dev.eval(`navigator.storage.getDirectory().then((
 
 const blobsDir = `navigator.storage.getDirectory().then((r) => r.getDirectoryHandle('blobs'))`;
 
+const blobSize = (dev, hx) => dev.eval(`navigator.storage.getDirectory().then((r) => r.getDirectoryHandle('blobs')).then((d) => d.getFileHandle(${JSON.stringify(hx)})).then((h) => h.getFile()).then((f) => f.size, () => -1)`);
+const rowStatus = async (dev, path) => (await dev.rows()).find((r) => r.path === path)?.status;
+
 export const scenarios = [
+  {
+    name: 'empty-file-then-normal-file',
+    kinds: [[CH, CH], [FF, FF], [CH, FF]],
+    async run(ctx, kinds) {
+      // A zero-byte file needs no credit; its transfer must still end and free the sender's single
+      // serving slot, or every later file waits.
+      const [A, B] = await devices(ctx, kinds);
+      await waitPeers(A, 1);
+      const e = { name: `empty-${ctx.id}.txt`, bytes: Buffer.alloc(0), sha: sha(Buffer.alloc(0)) };
+      const n = randomFile(`after-empty-${ctx.id}.bin`, 300000);
+      await A.add([e]);
+      await B.waitFor(`document.querySelectorAll('#files tr').length === 1`, 20000, 'B sees the empty file');
+      await A.add([n]);
+      await B.waitFiles(files(e, n), 30000);
+      await expectSha(B, e.name, e); await expectSha(B, n.name, n);
+    },
+  },
+  {
+    name: 'incoming-file-creation-fails-then-next-file',
+    kinds: [[CH, CH], [FF, FF]],
+    async run(ctx, kinds) {
+      // B cannot create the temporary file for an incoming stream larger than the initial credit
+      // window: B must report the failure (the file shows `waiting`, never stuck on `fetching`) and
+      // abort, so A serves the next file.
+      const [A, B] = await devices(ctx, kinds);
+      await waitPeers(A, 1);
+      const big = randomFile(`big-${ctx.id}.bin`, 6 * 1024 * 1024), small = randomFile(`small-${ctx.id}.txt`, 1000);
+      await B.eval('(window.__failCreate = 1)');
+      await A.add([big]);
+      await B.waitRows((rows) => rows.length === 1 && rows[0].status === 'waiting', 15000, 'the failed transfer is reported');
+      await A.add([small]);
+      await B.waitRows((rows) => rows.find((r) => r.path === small.name)?.status === 'complete', 20000, 'the next file arrives');
+      await expectSha(B, small.name, small);
+      assert.equal(await B.eval('window.__failCreate'), 0, 'the injected failure was exercised');
+      assert.equal(await rowStatus(B, big.name), 'waiting');
+    },
+  },
+  {
+    name: 'peer-leaves-mid-fetch-row-updates',
+    kinds: [[CH, CH], [FF, FF]],
+    async run(ctx, kinds) {
+      // A disconnect moves B's request to `waiting` without any index or blob change: the row must
+      // follow, not keep saying `fetching`.
+      const [A, B] = await devices(ctx, kinds);
+      await waitPeers(A, 1);
+      const f = randomFile(`mid-${ctx.id}.bin`, 1024 * 1024);
+      await B.eval('(window.__holdClose = true)');                 // B's copy cannot be completed
+      await A.add([f]);
+      await B.waitRows((rows) => rows.length === 1 && rows[0].status === 'fetching', 20000, 'fetching');
+      await setOnline(A, false);
+      await B.waitRows((rows) => rows.length === 1 && rows[0].status === 'waiting', 10000, 'waiting after the peer left');
+      await setOnline(A, true);
+      await B.eval('window.__releaseCloses()');
+      await B.waitFiles(files(f), 30000);
+    },
+  },
+  {
+    name: 'existing-blob-kept-when-replacement-fails',
+    kinds: [[CH], [FF]],
+    async run(ctx, kinds) {
+      const [A] = await devices(ctx, kinds);
+      const f = randomFile(`keep-${ctx.id}.bin`, 5000), g = randomFile(`dmg-${ctx.id}.bin`, 5000);
+      await A.add([f, g]); await A.waitFiles(files(f, g));
+      // 1. Intact copy + re-adding the same content while move() fails: the intact copy stays, no error.
+      await A.eval('(window.__failMove = 1)');
+      await A.add([f]);
+      await sleep(1500);
+      assert.equal(await A.eval('window.__failMove'), 1, 'no move was needed');
+      assert.equal(await blobSize(A, f.sha), f.bytes.length, 'the intact copy is still there');
+      assert.equal(await A.eval(`document.querySelectorAll('#messages .msg.error').length`), 0);
+      await expectSha(A, f.name, f);
+      // 2. Damaged copy + the replacing move() fails: the add is refused, and the old file is not deleted.
+      await A.eval(`navigator.storage.getDirectory().then((r) => r.getDirectoryHandle('blobs')).then((d) => d.getFileHandle(${JSON.stringify(g.sha)})).then(async (h) => { const w = await h.createWritable(); await w.write(new Uint8Array([1, 2, 3])); await w.close(); return true; })`);
+      await A.add([g]);
+      await A.waitFor(`[...document.querySelectorAll('#messages .msg.error')].some((m) => m.textContent.includes(${JSON.stringify(g.name)}))`, 10000, 'add refused');
+      assert.equal(await blobSize(A, g.sha), 3, 'the old file was not deleted before the failed move');
+      await A.add([g]);                                             // no fault now: replaced
+      await A.waitFor(`navigator.storage.getDirectory().then((r) => r.getDirectoryHandle('blobs')).then((d) => d.getFileHandle(${JSON.stringify(g.sha)})).then((h) => h.getFile()).then((x) => x.size === ${g.bytes.length})`, 10000, 'replaced');
+      await expectSha(A, g.name, g);
+    },
+  },
+  {
+    name: 'relay-parameter-ignored',
+    kinds: [[CH], [FF]],
+    async run(ctx, kinds) {
+      // A crafted link naming another relay must not move this device's sync there.
+      const rogue = await startServer({ port: 0, root: '/nonexistent', admin: true, anyOrigin: true });
+      ctx.cleanup.push(() => rogue.close());
+      const A = await ctx.open(kinds[0], 'A', { extraQuery: `&relay=${encodeURIComponent(`ws://127.0.0.1:${rogue.port}/relay`)}` });
+      await sleep(1500);
+      const rs = await (await fetch(`${rogue.url}/admin/state`, { method: 'POST', body: '{}' })).json();
+      assert.equal(rs.upgrades, 0, 'no connection to the other relay');
+      const own = await (await fetch(`${ctx.server.url}/admin/state?room=${ctx.room}`)).json();
+      assert.ok(own.devices.some((d) => d.label === 'A'), 'connected to its own relay');
+    },
+  },
   {
     name: 'record-request-error-not-acknowledged',
     kinds: [[CH, CH], [FF, FF]],

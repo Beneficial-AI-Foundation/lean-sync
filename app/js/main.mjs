@@ -1,6 +1,6 @@
 // Boot: one tab owns the storage (Web Lock), then storage, engine, core, links, transport, UI.
 // URL parameters: device=<name> (this device's name, remembered), room=<relay room>,
-// relay=<ws url> (default: the /relay endpoint of the serving origin, i.e. dev/serve.mjs).
+// The transport is the /relay endpoint of the serving origin (dev/serve.mjs), never another one.
 import { createEngine } from './engine.mjs';
 import { openStorage } from './storage.mjs';
 import { createCore } from './core.mjs';
@@ -38,7 +38,10 @@ async function run() {
   const showPersist = (p) => { document.querySelector('#persist').textContent = p ? 'storage: persistent' : 'storage: may be evicted by the browser'; };
   navigator.storage.persisted().then((p) => { showPersist(p); if (!p) navigator.storage.persist().then(showPersist, () => {}); }, () => {});
 
-  const relayUrl = params.get('relay') || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/relay`;
+  // The transport is always the relay of the serving origin. There is deliberately no parameter to
+  // name another endpoint: the relay decides which peers this device syncs with, so a crafted link
+  // could otherwise send the user's files elsewhere.
+  const relayUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/relay`;
   const transport = createRelayTransport({ url: relayUrl, room: params.get('room') || '', label });
   let core = null;
   const ui = createUI({ storage, getCore: () => core, transport, label });

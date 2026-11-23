@@ -49,6 +49,7 @@ const replicaOf = (b) => { const v = new DataView(b.buffer, b.byteOffset, 16); r
  * @param o.log(msg)
  */
 export function createLinks(o) {
+  const stallMs = o.stallMs ?? 60000;
   let nextPeer = 1;
   let accepting = false;
   const conns = new Set();             // every live link
@@ -135,8 +136,23 @@ export function createLinks(o) {
     }
     s.data = data;
     push(s.conn, u8(T.START, s.hash, u32le(data.length), u32le(Math.floor(data.length / 2 ** 32))));
+    if (data.length === 0) { push(s.conn, u8(T.END, s.hash)); finishServing(); return; }   // no credit will come
+    armStall(s);
   }
-  function finishServing() { serving = null; queueMicrotask(nextServe); }
+  // The serving slot is single: whatever happens, it must be released. Paths: END sent; ABORT from
+  // the receiver; the link closes (discard); the blob cannot be read (ABORT + blobLost); and, if the
+  // receiver grants no credit for STALL_MS (a receiver that stopped writing), ABORT and move on.
+  function armStall(s) {
+    clearTimeout(s.stall);
+    s.stall = setTimeout(() => {
+      if (serving !== s) return;
+      o.log(`blob ${s.hx.slice(0, 8)}: no credit from the receiver for ${stallMs} ms; aborting the transfer`);
+      if (s.conn.alive) push(s.conn, u8(T.ABORT, s.hash));
+      finishServing();
+    }, stallMs);
+    s.stall?.unref?.();                                   // (Node unit tests) don't hold the process
+  }
+  function finishServing() { if (serving) clearTimeout(serving.stall); serving = null; queueMicrotask(nextServe); }
 
   // ------------------------------------------------------------ incoming
   function onFrame(c, f) {
@@ -185,7 +201,7 @@ export function createLinks(o) {
       }
       case T.CREDIT: {
         const hx = hex(f.subarray(1, 33));
-        if (serving && serving.conn === c && serving.hx === hx) { serving.credit += readU32(f, 33); pump(c); }
+        if (serving && serving.conn === c && serving.hx === hx) { serving.credit += readU32(f, 33); armStall(serving); pump(c); }
         return;
       }
       default: throw new Error(`unknown frame type ${t}`);
@@ -210,6 +226,14 @@ export function createLinks(o) {
     const s = { hash, size, received: 0, written: 0, granted: 0, sink: o.storage.beginIncoming(), chain: null, failed: false };
     s.chain = s.sink;
     c.recv.set(hx, s);
+    // If no file can be created for the stream, nothing would ever be written, so no more credit
+    // would be granted and the sender could never finish: fail the stream and tell the sender.
+    s.sink.catch((e) => {
+      if (c.recv.get(hx) !== s || s.failed) return;
+      o.onStorageError?.(e);
+      failStream(c, hash, `could not create a file for it (${e?.name ?? e})`);
+      if (c.alive) push(c, u8(T.ABORT, hash));
+    });
     grant(c, s);
   }
   function grant(c, s) {

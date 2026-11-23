@@ -87,10 +87,21 @@ export async function openStorage() {
     const h = await sha256(new Uint8Array(await file.arrayBuffer()));
     const hx = hex(h);
     if (expectedHex && hx !== expectedHex) { await removeIncoming(name); return { ok: false, hash: h, hex: hx }; }
-    // Publish the verified copy even if blobs/<hash> exists: the existing one may be damaged.
-    if (await hasBlob(hx)) await blobsDir.removeEntry(hx);
+    // If blobs/<hash> exists and is intact, keep it and drop the new copy. If it is damaged or
+    // unreadable, replace it with ONE move() onto the existing name (it overwrites in Chromium 154,
+    // Firefox 146 and ESR 140): the old file is never deleted first, so a failed move leaves it in
+    // place, and a tab closed mid-move leaves the old or the new file under that name (the browsers
+    // do not document crash atomicity for move; the temp copy left in incoming/ is deleted at
+    // start-up, and a still-damaged copy is caught when it is next served or downloaded).
+    if (await hasBlob(hx) && await existingIsIntact(hx)) { await removeIncoming(name); return { ok: true, hash: h, hex: hx, size: file.size }; }
     await fh.move(blobsDir, hx);
     return { ok: true, hash: h, hex: hx, size: file.size };
+  }
+  async function existingIsIntact(hx) {
+    try {
+      const f = await (await blobsDir.getFileHandle(hx)).getFile();
+      return f.size <= MAX_FILE_BYTES && hex(await sha256(new Uint8Array(await f.arrayBuffer()))) === hx;
+    } catch { return false; }
   }
   async function removeIncoming(name) { try { await incomingDir.removeEntry(name); } catch {} }
   async function hasBlob(hx) { try { await blobsDir.getFileHandle(hx); return true; } catch { return false; } }

@@ -145,6 +145,9 @@ export function createCore(o) {
       case 'opRejected': log(`operation rejected: ${e.why}`); break;
     }
     if (e.notice === 'peerStatus' || e.notice === 'peerLeft' || e.notice === 'peerClosed') ui.onPeers(peerList(e));
+    // Where each missing blob is requested changes with the peers (a disconnect moves requests to
+    // other peers or to `waiting`) without any index or blob change: re-query the pending list.
+    if (['peerStatus', 'peerLeft', 'peerClosed', 'pendingSummary'].includes(e.notice)) refresh('pending');
     ui.onNotice(e);
   }
 

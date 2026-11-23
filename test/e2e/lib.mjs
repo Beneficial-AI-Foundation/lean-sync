@@ -78,17 +78,32 @@ export const SLOW_STORE = `
   };
   window.__releaseCloses = () => { window.__holdClose = false; const h = window.__held; window.__held = []; for (const f of h) f(); return h.length; };`;
 
-const INIT_SCRIPTS = [DOWNLOADS, TRAP, IDB_FAULT, SLOW_STORE];
+// __failCreate = n: the next n creations of a temporary (non-hash-named) OPFS file reject, as a full
+// disk would. __failMove = n: the next n FileSystemFileHandle.move() calls reject.
+export const FS_FAULT = `
+  window.__failCreate = 0; window.__failMove = 0;
+  const __gfh = FileSystemDirectoryHandle.prototype.getFileHandle;
+  FileSystemDirectoryHandle.prototype.getFileHandle = function (name, opts) {
+    if (window.__failCreate > 0 && opts && opts.create && !/^[0-9a-f]{64}$/.test(name)) { window.__failCreate--; return Promise.reject(new DOMException('injected', 'QuotaExceededError')); }
+    return __gfh.call(this, name, opts);
+  };
+  const __mv = FileSystemFileHandle.prototype.move;
+  FileSystemFileHandle.prototype.move = function (...a) {
+    if (window.__failMove > 0) { window.__failMove--; return Promise.reject(new DOMException('injected', 'InvalidModificationError')); }
+    return __mv.apply(this, a);
+  };`;
+
+const INIT_SCRIPTS = [DOWNLOADS, TRAP, IDB_FAULT, SLOW_STORE, FS_FAULT];
 
 export const versions = {};
 export function versionOf(kind) { return (versions[kind] ??= browserVersion(kind)); }
 
 /** Open (or reopen, with `profile`) a device: a browser process + the app page. */
-export async function openDevice(server, kind, label, { room, prefs, profile, waitRunning = true } = {}) {
+export async function openDevice(server, kind, label, { room, prefs, profile, waitRunning = true, extraQuery = '' } = {}) {
   const dir = profile ?? tempDir(`lsync-${label}-`);
   const browser = await launch(kind, { profile: dir, prefs });
   try {
-    const url = `${server.url}/?device=${encodeURIComponent(label)}&room=${encodeURIComponent(room)}`;
+    const url = `${server.url}/?device=${encodeURIComponent(label)}&room=${encodeURIComponent(room)}${extraQuery}`;
     const page = await browser.newPage(url, { initScripts: INIT_SCRIPTS.map((src) => `(() => {${src}\n})();`) });
     const d = makeDevice({ browser, page, kind, label, profile: dir, url, server, room, prefs });
     if (waitRunning) await d.waitFor(`window.leansync && window.leansync.phase === 'running'`, 30000, 'app running');
