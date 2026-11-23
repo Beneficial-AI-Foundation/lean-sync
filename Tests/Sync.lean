@@ -6,7 +6,7 @@ import Std.Data.HashSet
 # Native tests for the sync protocol and wire format
 
 Usage: `sync-tests [unit | codec | sim [seed] [count] | sim-lenient [seed] [count] | mutation |
-scale [n] | control [n] | deep [n] | debug seed | all]`.
+scale [n] | control [n] | deep [n] | debug seed | trace seed count file | all]`.
 
 * `unit`      hand-written flows: handshake, state exchange, persist-before-send, stale events,
               protocol errors, blob re-planning, the `noBlob` → `have` chain, rollback mode,
@@ -166,6 +166,10 @@ structure World where
   keepLog : Bool := false
   work : Array (Nat × Event) := #[]
   stats : Stats := {}
+  /-- `trace` subcommand: record every event each device processed, with the native output of
+  `process` on its encoding, for replay through the wasm build (`test/wasm-replay.mjs`). -/
+  keepTrace : Bool := false
+  trace : ByteArray := .empty
 
 abbrev WM := StateT World IO
 
@@ -307,12 +311,25 @@ def runEffect (d : Nat) (e : Effect) : WM Unit := do
     let _ ← pushItem p.val.toNat d it
   | .notify _ | .reply _ => pure ()
 
+/-- Append one trace record: `kind:u8 device:u32le len:u32le event len:u32le effects`
+(kind 0 = event and native output, 1 = the device's machine was reset (crash), 2 = new world). -/
+def traceRec (kind : UInt8) (d : Nat) (ev out : ByteArray) : WM Unit := do
+  if (← get).keepTrace then
+    let u32 (acc : ByteArray) (n : Nat) : ByteArray :=
+      ((((acc.push (n % 256).toUInt8).push (n / 256 % 256).toUInt8).push (n / 65536 % 256).toUInt8).push
+        (n / 16777216 % 256).toUInt8)
+    modify fun w =>
+      { w with trace := (u32 (u32 (u32 (w.trace.push kind) d) ev.size ++ ev) out.size) ++ out }
+
 /-- Process one event at device `d`: step (directly or through the byte boundary), check every
 effect against the host view, carry the effects out, check the node. -/
 def processEvent (d : Nat) (ev : Event) : WM Unit := do
   modStats fun s => { s with events := s.events + 1 }
   let dev ← getDev d
   let w ← get
+  if w.keepTrace then
+    let input := encodeEvent ev
+    traceRec 0 d input (process dev.m input).2
   let viaBytes ← if w.useProcess then (do return (← rand 4) == 0) else pure false
   let (m', effs) ← if viaBytes then do
       modStats fun s => { s with viaProcess := s.viaProcess + 1 }
@@ -464,6 +481,7 @@ def crash (d : Nat) : WM Unit := do
     | some (_, b) => if completes then some b else dev.record
     | none => dev.record
   setDev d { dev with m := .uninit, view := {}, pending := none, record, inc := dev.inc + 1 }
+  traceRec 1 d .empty .empty
   let ids := (← get).conns.filter (fun c => c.a == d || c.b == d) |>.map (·.id)
   for id in ids do
     if let some c ← dropConnRaw id then
@@ -1479,6 +1497,23 @@ def main (args : List String) : IO UInt32 := do
     let count := (rest[1]? >>= String.toNat?).getD 200
     simTests { c with label := "sim-lenient" } seed count (ackFirst := true)
   | ["mutation"] => mutationTests { c with label := "mutation" }
+  | ["trace", seed, count, file] =>
+    -- Simulator runs (4 devices, 400 random steps + quiescence per seed) recorded for wasm replay.
+    let s0 := seed.toNat?.getD 1
+    let mut out : ByteArray := .empty
+    let mut nev := 0
+    for s in [s0:s0 + count.toNat?.getD 1] do
+      let act : WM Unit := do
+        traceRec 2 0 .empty .empty
+        for d in [0:4] do boot d
+        for _ in [0:400] do randomStep
+        quiesce s
+      let ((), w) ← act.run { newWorld 4 s with keepTrace := true }
+      check c s!"trace seed {s}" w.violations.isEmpty (fun _ => s!"{w.violations.toList.take 2}")
+      out := out ++ w.trace
+      nev := nev + w.stats.events
+    IO.FS.writeBinFile file out
+    IO.println s!"trace: {nev} events, {out.size} bytes -> {file}"
   | ["debug", seed] =>
     let sd := seed.toNat?.getD 1
     let act : WM Unit := do
@@ -1514,7 +1549,7 @@ def main (args : List String) : IO UInt32 := do
     codecTests { c with label := "codec" }
     simTests { c with label := "sim" } 1 200
     mutationTests { c with label := "mutation" }
-  | _ => IO.eprintln "usage: sync-tests [unit | codec | sim [seed] [count] | sim-lenient [seed] [count] | mutation | scale [n] | control [n] | deep [n] | debug seed | all]"; return 2
+  | _ => IO.eprintln "usage: sync-tests [unit | codec | sim [seed] [count] | sim-lenient [seed] [count] | mutation | scale [n] | control [n] | deep [n] | debug seed | trace seed count file | all]"; return 2
   let n ← failures.get
   IO.println s!"{← checks.get} checks run"
   if n == 0 then IO.println "all tests passed"; return 0
