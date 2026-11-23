@@ -3,7 +3,7 @@ import LeanCrdt.State
 /-!
 # Native tests for the CRDT core
 
-Usage: `crdt-tests [unit | sim [seed] [count] | scale [n] | control [n] | deep [n] | bench [n] | all]` (default: `all`).
+Usage: `crdt-tests [unit | sim [seed] [count] | scale [n] | control [n] | deep [n] | bench [n] | delbench [n] [fast] | all]` (default: `all`).
 
 * `unit`    semantic unit tests (decisions 2 and 3, resolve, delete, putMany, queries);
 * `sim`     seeded randomized simulation: replicas doing random operations and merging in random
@@ -115,6 +115,30 @@ def unitTests (c : Ctx) : IO Unit := do
   check c "snapshot = paths.map versions"
     (big.snapshot == big.paths.map (fun q => (q, big.versions q)))
   check c "paths sorted" (big.paths == ["a", "b", "c", "docs/a.txt"])
+  -- deleteMany / deletePaths
+  let d0 := (State.empty.putMany A [⟨"f/1", hs "1", []⟩, ⟨"f/2", hs "2", []⟩, ⟨"g", hs "g", []⟩])
+  let dB := (State.empty.merge d0).resolve B "f/1" (hs "1b")  -- B edits f/1 concurrently
+  -- a third replica (its own id: reusing B here would break the host rule) adds a sibling to f/2
+  let dA := d0.merge (State.empty.merge d0 |>.put (rid 3) "f/2" (hs "2s") [])
+  check c "deleteMany: f/2 has siblings" (dA.versions "f/2" == [hs "2", hs "2s"])
+  let dupItems : List DeleteItem :=
+    [⟨"f/2", some [hs "2"]⟩, ⟨"nope", none⟩, ⟨"f/2", some [hs "2s"]⟩, ⟨"g", some [hs "other"]⟩]
+  check c "deleteMany = deleteSeq (duplicates, absent path)"
+    ((dA.deleteMany dupItems).beq (dA.deleteSeq dupItems))
+  check c "deleteMany: both siblings removed by two items for the same path"
+    ((dA.deleteMany dupItems).versions "f/2" == [])
+  check c "deleteMany: unlisted hash kept" ((dA.deleteMany dupItems).versions "g" == [hs "g"])
+  check c "deleteMany: absent path is a no-op" ((dA.deleteMany [⟨"nope", none⟩]).beq dA)
+  check c "deleteMany: partial delete keeps the other sibling"
+    ((dA.deleteMany [⟨"f/2", some [hs "2"]⟩]).versions "f/2" == [hs "2s"])
+  let folder := dA.deletePaths ["f/1", "f/2"]
+  check c "deletePaths removes all siblings" (folder.paths == ["g"])
+  check c "deletePaths = sequential deletes of everything seen"
+    (folder.beq (["f/1", "f/2"].foldl (fun s p => s.delete p (s.versions p)) dA))
+  check c "deleteMany edit wins: concurrent edit survives a folder delete"
+    ((folder.merge dB).versions "f/1" == [hs "1b"] && (dB.merge folder).versions "f/1" == [hs "1b"])
+  check c "deleteMany: the not-edited file stays deleted" ((folder.merge dB).versions "f/2" == [])
+  check c "deleteMany: empty batch is a no-op" ((dA.deleteMany []).beq dA)
   -- non-ASCII paths are ordered by UTF-8 bytes (= code points)
   let u := (State.empty.put A "é" (hs "1") []).put A "z" (hs "2") [] |>.put A "Z" (hs "3") []
   check c "unicode order" (u.paths == ["Z", "z", "é"])
@@ -240,6 +264,19 @@ def simOnce (c : Ctx) (steps nrep : Nat) : SimM Unit := do
       let s' := s.putMany me items
       check c "putMany = putSeq" (s'.beq (s.putSeq me items))
       reps := reps.set! i s'
+    else if op < 64 then
+      let n ← rand 5
+      let mut items : List DeleteItem := []
+      for _ in [0:n] do
+        let p ← pick ("absent" :: paths0)
+        let sup ← if (← rand 3) == 0 then pure none
+          else if (← rand 2) == 0 then pure (some (← subset (s.versions p)))
+          else pure (some (← subset hashes0))
+        items := items ++ [⟨p, sup⟩]
+      let s' := s.deleteMany items
+      check c "deleteMany = deleteSeq" (s'.beq (s.deleteSeq items))
+      check c "inflation (deleteMany)" ((s.merge s').beq s')
+      reps := reps.set! i s'
     else
       let j ← rand nrep
       let k ← rand nrep
@@ -291,6 +328,10 @@ def scaleTests (c : Ctx) (n : Nat) : IO Unit := do
   let dels := (List.range n).filter (· % 7 == 0)
   let b2 := dels.foldl
     (fun s i => let p := s!"dir{i % 97}/file{i}.txt"; s.delete p (s.versions p)) b1
+  let delPaths := dels.map (fun i => s!"dir{i % 97}/file{i}.txt")
+  check c "scale: deletePaths = single deletes" ((b1.deletePaths delPaths).beq b2)
+  check c "scale: deleteMany = single deletes"
+    ((b1.deleteMany (delPaths.map (fun p => ⟨p, some (b1.versions p)⟩))).beq b2)
   let aItems := (List.range n).filter (· % 3 == 0) |>.map
     (fun i => (⟨s!"dir{i % 97}/file{i}.txt", hs s!"a'{i}", [hs s!"a{i}"]⟩ : PutItem))
   let a2 := a.putMany A aItems
@@ -359,6 +400,65 @@ def benchTest (n : Nat) : IO Unit := do
   let t3 ← IO.monoNanosNow
   IO.println s!"bench n={n}: put+merge {(t1 - t0) / 1000 / iters} us/iter, put+snapshot {(t2 - t1) / 1000 / iters} us/iter, putMany of {n} items onto {n} paths {(t3 - t2) / 1000 / iters} us/iter ({acc}, {acc2}, {acc3})"
 
+/-- Time `op` applied to the state held in `input`, excluding setup and result consumption.
+The input is read from an `IO.Ref` *after* the start time is taken, so the computation cannot be
+hoisted before it; the result's head is inspected in an `IO` branch *before* the stop time is
+taken, so it cannot be deferred past it (Lean is strict: the returned list is fully built). -/
+@[noinline] def timeOp (input : IO.Ref State) (op : State → State) : IO (State × Nat) := do
+  let t0 ← IO.monoNanosNow
+  let s ← input.get
+  let r := op s
+  if r.entries.isEmpty then IO.print ""
+  let t1 ← IO.monoNanosNow
+  return (r, t1 - t0)
+
+/-- Median of a non-empty list of durations (ns). -/
+def median (l : List Nat) : Nat :=
+  let a := (l.toArray.qsort (· < ·))
+  a[a.size / 2]!
+
+/-- Before/after timing of deleting every 7th of `n` paths: single `delete`s versus
+`deletePaths` and `deleteMany` with the hashes actually stored. Inputs and batches are prepared
+before timing; the three results must agree (same survivors) or the check fails. Each figure is
+the median (with min–max) of `runs` runs; the single-delete variant uses `singleRuns` runs. -/
+def delBench (c : Ctx) (n : Nat) (withSingle : Bool) : IO Unit := do
+  let A := rid 1
+  let a := State.empty.putMany A (scalePaths n "a")
+  let idx := (List.range n).filter (· % 7 == 0)
+  let ps := idx.map (fun i => s!"dir{i % 97}/file{i}.txt")
+  let items : List DeleteItem := idx.map (fun i => ⟨s!"dir{i % 97}/file{i}.txt", some [hs s!"a{i}"]⟩)
+  let input ← IO.mkRef a
+  let runs := 11
+  let singleRuns := 3
+  let fmt (l : List Nat) : String :=
+    let ms (x : Nat) := s!"{x / 1000000}.{(x / 10000) % 100 / 10}{(x / 10000) % 10}"
+    s!"median {ms (median l)} ms (min {ms (l.foldl min l.head!)}, max {ms (l.foldl max 0)}, {l.length} runs)"
+  let mut tP := []
+  let mut rP := a
+  for _ in [0:runs] do
+    let (r, t) ← timeOp input (fun s => s.deletePaths ps)
+    tP := t :: tP; rP := r
+  let mut tM := []
+  let mut rM := a
+  for _ in [0:runs] do
+    let (r, t) ← timeOp input (fun s => s.deleteMany items)
+    tM := t :: tM; rM := r
+  let survP := rP.entries.length
+  let survM := rM.entries.length
+  check c "delbench: deletePaths and deleteMany agree" (rP.beq rM) (fun _ => s!"{survP} vs {survM}")
+  check c "delbench: every 7th path deleted" (survP == n - idx.length)
+  IO.println s!"delbench n={n}, deleting {idx.length} paths:"
+  if withSingle then
+    let mut tS := []
+    let mut rS := a
+    for _ in [0:singleRuns] do
+      let (r, t) ← timeOp input (fun s => ps.foldl (fun s p => s.delete p (s.versions p)) s)
+      tS := t :: tS; rS := r
+    check c "delbench: single deletes agree" (rS.beq rP) (fun _ => s!"{rS.entries.length} vs {survP}")
+    IO.println s!"  single deletes: {fmt tS}, survivors {rS.entries.length}"
+  IO.println s!"  deletePaths:    {fmt tP}, survivors {survP}"
+  IO.println s!"  deleteMany (explicit stored hashes): {fmt tM}, survivors {survM}"
+
 /-- Deliberately non-tail-recursive: the structural specification of the merge. -/
 def controlTest (n : Nat) : IO Unit := do
   let xs := (List.range n).map (fun i => s!"x{i + 1000000}")
@@ -387,6 +487,9 @@ def main (args : List String) : IO UInt32 := do
     simTests c seed count
   | "scale" :: rest => scaleTests { c with label := "scale" } ((rest[0]? >>= String.toNat?).getD 20000)
   | "bench" :: rest => benchTest ((rest[0]? >>= String.toNat?).getD 20000)
+  | "delbench" :: rest =>
+    delBench { c with label := "delbench" } ((rest[0]? >>= String.toNat?).getD 20000)
+      (rest[1]? != some "fast")
   | "deep" :: rest =>
     let n := (rest[0]? >>= String.toNat?).getD 13000
     IO.println s!"deep: non-tail recursion of depth {n} returned {deep n}"
@@ -395,7 +498,7 @@ def main (args : List String) : IO UInt32 := do
     unitTests c
     simTests c 1 40
     scaleTests { c with label := "scale" } 20000
-  | _ => IO.eprintln "usage: crdt-tests [unit | sim [seed] [count] | scale [n] | control [n] | deep [n] | bench [n] | all]"; return 2
+  | _ => IO.eprintln "usage: crdt-tests [unit | sim [seed] [count] | scale [n] | control [n] | deep [n] | bench [n] | delbench [n] [fast] | all]"; return 2
   let n ← failures.get
   IO.println s!"{← checks.get} checks run"
   if n == 0 then IO.println "all tests passed"; return 0

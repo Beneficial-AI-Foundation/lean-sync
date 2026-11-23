@@ -646,4 +646,94 @@ theorem putMany_eq_putSeq (s : State) (r : ReplicaId) (items : List PutItem) :
         · omega
   · rfl
 
+/-! ## 8. Batch delete -/
+
+theorem mem_deleteStep_entries (s : State) (it : DeleteItem) (z : Entry) :
+    z ∈ (deleteStep s it).entries ↔ z ∈ s.entries ∧ matchesD it z = false := by
+  simp only [deleteStep, delete, List.mem_filter, Bool.not_eq_eq_eq_not, Bool.not_true]
+  constructor
+  · rintro ⟨hz, hsup⟩
+    refine ⟨hz, ?_⟩
+    cases hS : it.supersedes with
+    | none =>
+      rw [hS] at hsup
+      simp only [Option.getD_none, superseded, Bool.and_eq_false_iff, beq_eq_false_iff_ne] at hsup
+      by_cases hp : z.path = it.path
+      · exfalso
+        have : z.hash ∈ s.versions it.path := (mem_versions _ _ _).2 ⟨z, hz, hp, rfl⟩
+        rcases hsup with h | h
+        · exact h hp
+        · simp at h; exact h this
+      · simp [matchesD, hp]
+    | some S =>
+      rw [hS] at hsup
+      simp only [Option.getD_some, superseded] at hsup
+      simpa [matchesD, hS] using hsup
+  · rintro ⟨hz, hm⟩
+    refine ⟨hz, ?_⟩
+    cases hS : it.supersedes with
+    | none =>
+      simp only [matchesD, hS, Bool.and_true, beq_eq_false_iff_ne] at hm
+      simp [superseded, hm]
+    | some S =>
+      simpa [matchesD, hS, superseded] using hm
+
+theorem deleteSeq_spec : ∀ (items : List DeleteItem) (s : State),
+    (∀ z, z ∈ (s.deleteSeq items).entries ↔ z ∈ s.entries ∧ items.any (matchesD · z) = false) ∧
+    (s.deleteSeq items).context = s.context
+  | [], s => ⟨fun z => by simp [deleteSeq], rfl⟩
+  | it :: items, s => by
+    have hstep : s.deleteSeq (it :: items) = (deleteStep s it).deleteSeq items := rfl
+    obtain ⟨ih1, ih2⟩ := deleteSeq_spec items (deleteStep s it)
+    rw [hstep]
+    refine ⟨fun z => ?_, by rw [ih2]; rfl⟩
+    rw [ih1, mem_deleteStep_entries, List.any_cons, Bool.or_eq_false_iff]
+    constructor
+    · rintro ⟨⟨h1, h2⟩, h3⟩; exact ⟨h1, h2, h3⟩
+    · rintro ⟨h1, h2, h3⟩; exact ⟨⟨h1, h2⟩, h3⟩
+
+/-- `deleteMany` is not a second semantics: it is literally the sequence of single `delete`s
+(`none` standing for "everything currently seen at the path"), with no side condition:
+repeated paths, absent paths and any order are allowed. -/
+theorem deleteMany_eq_deleteSeq (s : State) (items : List DeleteItem) :
+    s.deleteMany items = s.deleteSeq items := by
+  obtain ⟨hs1, hs2⟩ := deleteSeq_spec items s
+  apply ext
+  · apply entries_ext
+    intro z
+    rw [hs1]
+    simp only [deleteMany]
+    rw [pruneAllGo_eq _ _ _ (sorted_delItems _) (pathSorted_of_sorted s.sorted)]
+    simp only [List.reverseAux_nil, List.mem_filter, Bool.not_eq_eq_eq_not, Bool.not_true]
+    have : (items.mergeSort delItemLe).any (matchesD · z) = items.any (matchesD · z) := by
+      apply Bool.eq_iff_iff.2
+      simp only [List.any_eq_true, List.mem_mergeSort]
+    rw [this]
+  · rw [hs2]; rfl
+
+/-- The folder-delete convenience is the same semantics as single deletes of everything seen. -/
+theorem deletePaths_eq (s : State) (ps : List String) :
+    s.deletePaths ps = ps.foldl (fun s p => s.delete p (s.versions p)) s := by
+  rw [deletePaths, deleteMany_eq_deleteSeq, deleteSeq, List.foldl_map]
+  rfl
+
+theorem le_deleteMany (s : State) (items : List DeleteItem) : Le s (s.deleteMany items) := by
+  apply le_of
+  · intro r; exact Nat.le_refl _
+  · intro e he hns
+    rw [deleteMany_eq_deleteSeq, (deleteSeq_spec items s).1] at he
+    exact absurd he.1 hns
+
+theorem mem_versions_deletePaths (s : State) (ps : List String) (q : String) (x : Hash) :
+    x ∈ (s.deletePaths ps).versions q ↔ x ∈ s.versions q ∧ q ∉ ps := by
+  simp only [mem_versions]
+  rw [deletePaths, deleteMany_eq_deleteSeq]
+  simp only [(deleteSeq_spec _ s).1, List.any_map, List.any_eq_false, Function.comp_def,
+    matchesD, Bool.and_true, beq_eq_false_iff_ne, Bool.not_eq_true]
+  constructor
+  · rintro ⟨e, ⟨he, hall⟩, rfl, rfl⟩
+    exact ⟨⟨e, he, rfl, rfl⟩, fun hq => hall _ hq rfl⟩
+  · rintro ⟨⟨e, he, rfl, rfl⟩, hq⟩
+    exact ⟨e, ⟨he, fun p hp' hep => hq (hep ▸ hp')⟩, rfl, rfl⟩
+
 end LeanCrdt.State
