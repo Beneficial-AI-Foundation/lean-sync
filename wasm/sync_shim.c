@@ -48,6 +48,11 @@ EMSCRIPTEN_KEEPALIVE uint32_t ls_process(void) {
   if (g_result) { lean_dec(g_result); g_result = NULL; }
   lean_object *in = g_input ? g_input : lean_alloc_sarray(1, 0, 0);
   g_input = NULL;
+#ifdef LS_TEST_LEAK
+  // Test-only variant (scripts/wasm/build-leak-variant.sh): leak every input, so that the
+  // heap-growth check of test/wasm-replay.mjs can be shown to fail. Never in the shipped build.
+  lean_inc(in);
+#endif
   lean_object *res = lean_sync_process(in);  // consumes `in`
   if (!lean_io_result_is_ok(res)) {
     lean_io_result_show_error(res);

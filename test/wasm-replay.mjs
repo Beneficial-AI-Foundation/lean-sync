@@ -15,16 +15,24 @@ import { createEngine } from '../app/js/engine.mjs';
 import { decodeEffects, encodeEvent, bytesEqual, hex } from '../app/js/codec.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const file = process.argv[2] ?? join(root, 'build/vectors/sim.bin');
-const { default: createLeanSync } = await import(pathToFileURL(join(root, 'build/sync/lean_sync.mjs')));
+// usage: wasm-replay.mjs [--module <lean_sync.mjs>] [--leak-only] [<trace>]
+const args = process.argv.slice(2);
+const opt = (name) => { const i = args.indexOf(name); if (i < 0) return null; const v = args[i + 1]; args.splice(i, 2); return v; };
+const flag = (name) => { const i = args.indexOf(name); if (i < 0) return false; args.splice(i, 1); return true; };
+const modulePath = opt('--module') ?? join(root, 'build/sync/lean_sync.mjs');
+const leakOnly = flag('--leak-only');
+const file = args[0] ?? join(root, 'build/vectors/sim.bin');
+const { default: createLeanSync } = await import(pathToFileURL(modulePath));
 
+let mismatches = 0, decodeFailures = 0, events = 0;
+if (!leakOnly) {
 const buf = readFileSync(file);
 const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
 let pos = 0;
 const u32 = () => { const v = dv.getUint32(pos, true); pos += 4; return v; };
 
 const engines = new Map();
-let events = 0, mismatches = 0, decodeFailures = 0, instances = 0, worlds = 0, outBytes = 0;
+let instances = 0, worlds = 0, outBytes = 0;
 let wasmMs = 0;
 while (pos < buf.length) {
   const kind = buf[pos++]; const dev = u32();
@@ -46,6 +54,7 @@ while (pos < buf.length) {
 }
 console.log(`replay: ${worlds} worlds, ${events} events, ${instances} wasm instances, ${outBytes} output bytes, ` +
   `${wasmMs.toFixed(0)} ms inside wasm; byte mismatches ${mismatches}, JS decode failures ${decodeFailures}`);
+}
 
 // Leak check (carried-forward requirement 3).
 const BOUND = 1 << 20;
@@ -69,6 +78,6 @@ const after = eng.heapBytes();
 const growth = after - before;
 console.log(`heap: ${before} -> ${after} bytes after 3000 steady-state cycles (bound ${BOUND})`);
 
-const ok = mismatches === 0 && decodeFailures === 0 && events > 0 && growth <= BOUND;
+const ok = mismatches === 0 && decodeFailures === 0 && (leakOnly || events > 0) && growth <= BOUND;
 console.log(ok ? 'all passed' : 'FAILED');
 process.exit(ok ? 0 : 1);
