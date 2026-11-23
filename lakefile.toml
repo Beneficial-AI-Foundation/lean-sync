@@ -13,3 +13,8 @@ name = "WasmDemo"
 [[lean_exe]]
 name = "wasm-demo-native"
 root = "WasmDemo"
+
+# Native tests for the CRDT core (see Tests/Main.lean and scripts/test-stack.sh).
+[[lean_exe]]
+name = "crdt-tests"
+root = "Tests.Main"

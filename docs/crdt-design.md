@@ -1,131 +1,223 @@
-# CRDT core: design note (stage 1)
+# CRDT core: design and status
 
-Branch `crdt-core` · Lean 4.36.0 · core + `Init` only (no `Std` import at all).
-Lean sources: `LeanCrdt/Types.lean`, `LeanCrdt/VersionVector.lean`, `LeanCrdt/State.lean` (executable),
-`LeanCrdt/Laws.lean` (theorem statements). At this stage the operation bodies and all proofs are
-`sorry` placeholders, marked `STAGE-1 PLACEHOLDER`; the types, orders and their lawfulness proofs are real.
+Branch `crdt-core` · Lean 4.36.0 · Lean core (`Init`) only: no `Std`, no Mathlib, no Batteries.
+Status: implemented, every stated theorem proved (no `sorry`, no `axiom`, no `native_decide`, no
+`unsafe`/`implemented_by`), tested natively. Not yet built for wasm.
+
+| File | Contents | Runtime? |
+|---|---|---|
+| `LeanCrdt/Types.lean` | `ReplicaId`, `Hash`, `Dot`, `Entry`, their orders and lawfulness | yes |
+| `LeanCrdt/SortedList.lean` | generic tail-recursive sorted merge (`mergeWith`) and its correctness | yes |
+| `LeanCrdt/VersionVector.lean` | canonical version vectors, pointwise-max merge | yes |
+| `LeanCrdt/State.lean` | the state, merge, queries, local operations, `putMany` | yes |
+| `LeanCrdt/Laws.lean` | the user-facing theorems | proofs only |
+| `Tests/Main.lean`, `scripts/test-crdt.sh` | native tests, stack test | tests |
+
+## ⚠ HOST RULE: persist before you share, or use a fresh replica id
+
+**Before any state containing a new local edit is sent to another replica, that state must be
+durably persisted. If the host cannot guarantee that the state it loads at startup is the latest
+one it ever sent, for example after restoring a backup, a partial storage loss, or the same storage
+in two tabs, it must use a new replica id from then on.**
+
+The reason: each local edit by replica `r` is named by a dot `(r, n)`, where `n = context[r] + 1`.
+Correctness relies on a dot naming exactly one edit. If `r` restarts from an older state, it reissues
+dots that peers have already seen, now attached to different content. A peer that saw the old dot
+and then deleted or superseded it treats the new edit as "seen and removed" and **silently drops
+it**. That is exactly the lost update this design otherwise rules out.
+
+Lean cannot check this rule. The concurrency theorems state it as an explicit hypothesis,
+`b.context.get r ≤ a.context.get r` ("`b` has not seen what `r` is about to write"), and that
+hypothesis holds for every peer `b` precisely when the rule is followed. Two tabs on the same storage
+count as two replicas, so each needs its own id.
 
 ## Model: an OR-map of multi-value registers in "dot store + causal context" form
 
-The state is two canonical lists:
-
 ```lean
-structure Entry where path : String; dot : Dot; hash : Hash        -- one live version of one file
-structure Dot   where replica : ReplicaId; counter : Nat             -- one local edit event
-structure ReplicaId where hi : UInt64; lo : UInt64                   -- 128 bits, host-generated
-structure Hash  where bytes : ByteArray                              -- opaque content hash
-
+structure ReplicaId where hi : UInt64; lo : UInt64          -- 128 bits, host-generated
+structure Hash  where bytes : ByteArray                     -- opaque content hash
+structure Dot   where replica : ReplicaId; counter : Nat    -- one local edit event
+structure Entry where path : String; dot : Dot; hash : Hash -- one live version of one file
 structure VersionVector where
-  entries : List (ReplicaId × Nat)
-  sorted  : entries.Pairwise (fun a b => compare a.1 b.1 = .lt)
-  pos     : ∀ p ∈ entries, 0 < p.2                                   -- absent ↔ 0
-
+  entries : List (ReplicaId × Nat)           -- strictly sorted by replica, all counters > 0
+  sorted : KeySorted entries; pos : ∀ p ∈ entries, 0 < p.2
 structure State where
-  entries : List Entry                    -- strictly sorted by (path, dot, hash)
-  context : VersionVector                 -- every event this state has seen
+  entries : List Entry                       -- strictly sorted by (path, dot, hash)
+  context : VersionVector                    -- every event this state has seen
   sorted  : StrictlySorted entries
   covered : ∀ e ∈ entries, 0 < e.dot.counter ∧ e.dot.counter ≤ context.get e.dot.replica
 ```
 
-* **Dots rather than per-path version vectors.** Each `put` by replica `r` issues the dot
-  `(r, context.get r + 1)` and attaches it to the new entry. A single state-wide version vector
-  (`context`) records which dots have been seen. This is the standard optimized OR-map/MV-register
-  construction (Almeida, Shoker, Baquero, *Delta state replicated data types*, 2018). Compared with
-  per-path version vectors it stores one dot per version instead of one vector per path, and it
-  needs **no per-path tombstones**: "seen in `context` but absent from `entries`" *is* the deletion or
-  supersession record. With whole-state merges every context is downward-closed, so a version vector
-  represents it exactly (deltas would need dot sets; see risks).
+* **Dots and one causal context**, as in the standard optimized OR-map/MV-register (Almeida,
+  Shoker, Baquero, *Delta state replicated data types*, 2018). We use these rather than a version
+  vector per path:
+  - each version stores one dot rather than one vector;
+  - there are no per-path tombstones: "covered by `context` but absent from `entries`" is the
+    record of a deletion or supersession;
+  - with whole-state merges, every context is downward-closed, so a version vector represents it exactly.
 * **Merge.** `context` is the pointwise max. An entry survives iff it is in both states, or it is in
-  one and the other has not seen its dot. This gives, with no special cases: concurrent puts on a path
-  become siblings (decision 2), an edit concurrent with a delete survives because the deleter has not
-  seen its dot (decision 3), and a resolution, which is a `put` superseding all seen siblings, wins over
-  exactly the siblings it saw.
+  one and the other has not seen its dot. With no special cases, this gives:
+  - concurrent puts on one path become siblings (decision 2);
+  - an edit concurrent with a delete survives, because the deleter never saw its dot (decision 3);
+  - a resolution, which is a `put` superseding the siblings it saw, removes exactly those siblings.
 
-**Representation choice: canonical, with literal equality.** Both lists are kept strictly sorted
-(entries by `(path, dot, hash)`, vectors by replica, no zero counters), and the invariants are fields of
-the structures. Two states with the same contents are therefore equal Lean values, and the laws are
-literal `merge a b = merge b a`. The proof strategy is: (1) prove a membership characterization of each
-operation, (2) prove that it preserves sortedness, (3) use the extensionality lemma "two strictly sorted
-lists with the same members are equal". Commutativity, associativity and idempotence then reduce to
-propositional facts about membership and `max`. Why this and not a `HashMap` up to equivalence:
-* *Proof effort:* there is no quotient, no equivalence to prove congruent for every operation and query,
-  and `Std.HashMap` lemmas are not needed. The work is one generic sorted-merge lemma set plus ext.
-* *Runtime at 20k paths, few replicas, rare siblings:* merge is a single linear pass, O(n + m)
-  comparisons plus an O(#replicas) vector lookup for entries present on one side only. The hash map
-  would only win on point operations: `put`/`delete` here are O(position of the path) (they rebuild the
-  list prefix) and `versions p` is O(position). The host should use `snapshot` (one pass) rather than
-  calling `versions` per path. Memory is about 4 small objects per version.
-* *Wasm and imports:* only `Init` is imported (`String` and `ByteArray` orders are core externs
-  `lean_string_compare`/`lean_byte_array_compare`). `Std.Data.HashMap` and its lemma modules stay out.
-* *Encoding:* the canonical order is the natural deterministic encoding order. Equal states encode to
-  equal bytes, and the decoder only has to check sortedness to rebuild the invariants.
-* *Determinism:* every observable order is a byte/number order that is the same on native and wasm.
-  No `USize` or object hash ever enters the state.
+**Representation: canonical, with literal equality.** Both lists are strictly sorted and the
+invariants are fields of the structures, so equal contents means equal values. Every law is stated
+with Lean's `=`. No observational equivalence is involved.
+
+The proofs follow one pattern:
+1. characterise what each operation's result contains;
+2. prove the result stays sorted;
+3. apply "two strictly sorted lists with the same members are equal" (`eq_of_sorted_of_mem_iff`)
+   and its version-vector analogue (`VersionVector.ext`).
+
+Why this beats a hash map up to equivalence:
+- no quotient, and no congruence proofs for every operation and query;
+- no `Std` import, so no `HashMap` lemma modules are linked into the wasm (see the spike);
+- merge is a single linear pass;
+- every observable order is a byte or number order that is the same on native and wasm:
+  - `String` uses `lean_string_compare` (UTF-8 bytes, the same as code-point order);
+  - `ByteArray` uses `lean_byte_array_compare`;
+  - `UInt64` and `Nat` compare numerically.
+- No `USize` or object hash enters the state.
+
+For a future binary encoding, the canonical order is the natural one: equal states encode to equal
+bytes. A decoder must re-check sortedness, positivity and coverage to rebuild the invariants.
 
 ## Public API (`LeanCrdt.State`)
 
 | | |
 |---|---|
-| `empty : State` | |
-| `merge : State → State → State`, `mergeAll : List State → State` | join |
-| `put s self p h supersedes` | write version `h` of `p` and remove the local versions of `p` whose hash ∈ `supersedes`; new dot `(self, ctx(self)+1)` |
-| `delete s p supersedes` | remove the local versions of `p` whose hash ∈ `supersedes`; issues no dot |
-| `resolve s self p h` | `put s self p h (s.versions p)`: supersede every seen sibling (also the normal "edit") |
-| `paths s : List String` | existing paths, strictly sorted by UTF-8 bytes |
-| `versions s p : List Hash` | distinct current hashes of `p`, strictly sorted; `[]` = absent |
-| `isConflicted s p : Bool` | `(versions s p).length ≥ 2` |
-| `snapshot s : List (String × List Hash)` | `paths` with their `versions`, in one pass |
+| `empty`, `merge a b`, `mergeAll l` | join; `mergeAll` folds `merge` from `empty` |
+| `put s self p h supersedes` | write version `h` of `p` with dot `(self, ctx(self)+1)`; drop the local versions of `p` whose hash is in `supersedes` |
+| `putMany s self items` | batch put in one pass; **proved equal** to the `put`s one after the other (`putSeq`) |
+| `delete s p supersedes` | drop the local versions of `p` whose hash is in `supersedes`; issues no dot |
+| `resolve s self p h` | `put s self p h (s.versions p)`: supersede every seen version (also the normal "edit") |
+| `paths s` | existing paths, strictly sorted by UTF-8 bytes |
+| `versions s p` | distinct current hashes of `p`, strictly sorted; `[]` = absent |
+| `isConflicted s p` | `(versions s p).length ≥ 2` |
+| `snapshot s` | every path with its versions, in one pass |
+| `beq a b` | literal equality, computed with loops |
 
-Supersession is **by hash**, as the brief asks. A version that arrives by merge after the host looked is
-kept as a sibling unless it has the same hash as one the host saw; in that case removing it loses no
-content. `delete` with a partial list leaves the file alive with the remaining versions.
+`self` is passed explicitly: the state is shared data and carries no notion of which replica owns it.
 
-## Theorems (exact statements in `LeanCrdt/Laws.lean`)
+**Supersession is by hash.** A version that arrives by merge after the host looked is kept as a
+sibling, unless its hash equals one the host saw; in that case removing it loses no content.
+Two concurrent versions with the same hash are two entries but one element of `versions`, so they
+are not a conflict.
 
-Here `Supersedes b e := b.context.covers e.dot ∧ e ∉ b.entries` ("`b` saw the event that wrote `e` and no
-longer holds it"), and `Le a b := merge a b = b`.
-1. Semilattice: `merge_comm`, `merge_assoc`, `merge_idem`, `merge_empty`, `mergeAll_perm`
-   (`l.Perm l' → mergeAll l = mergeAll l'`). Inflation: `le_put`, `le_delete` (`Le s (s.put …)`), i.e.
-   merging with your own past never undoes a local op.
-2. Exact merge semantics: `context_merge` (`get = max`) and
-   `mem_merge : e ∈ (merge a b).entries ↔ (e ∈ a.entries ∧ ¬ b.Supersedes e) ∨ (e ∈ b.entries ∧ ¬ a.Supersedes e)`.
-3. **No lost update:** `no_lost_update : e ∈ a.entries → e.hash ∈ (merge a b).versions e.path ∨ b.Supersedes e`.
-4. Queries: `mem_versions`, `versions_sorted`, `mem_paths`, `paths_sorted`, `mem_paths_iff`, `snapshot_eq`, `isConflicted_iff`.
-5. Local ops: `mem_versions_put`, `context_put`, `mem_versions_delete`, `context_delete`, `versions_resolve` (`= [h]`).
-6. Concurrency: `put_survives_merge`, `edit_wins_over_concurrent_delete` (decision 3), `concurrent_puts_kept`
-   (decision 2: both kept, and `isConflicted` if they differ), `resolve_supersedes` (merged with anything
-   in the resolver's past, only the resolution remains). Their hypothesis `b.context.get r ≤ a.context.get r`
-   formalises "`b` has not seen the edit `r` is about to make".
+## Theorems (all in `LeanCrdt/Laws.lean`, all proved)
 
-**What is assumed, not proved.** A dot names one event globally: replica `r` alone issues `r`-dots, from a
-state that is never rolled back. Lean cannot check this; the theorems in group 6 carry it as the explicit
-hypothesis above. The laws in groups 1–5 hold for all states, with no assumption.
+Definitions used below:
+- `Supersedes b e := b.context.covers e.dot = true ∧ e ∉ b.entries`: `b` saw the event that wrote
+  `e` and no longer holds `e`.
+- `Le a b := merge a b = b`.
+
+1. **Semilattice:** `merge_comm`, `merge_assoc`, `merge_idem`, `merge_empty`, and
+   `mergeAll_perm : l.Perm l' → mergeAll l = mergeAll l'`.
+2. **Local operations only grow the state:** `le_put`, `le_delete`. Merging with your own past never
+   undoes a local operation.
+3. **Exact merge semantics:**
+   - `context_merge : (merge a b).context.get r = max (a.context.get r) (b.context.get r)`;
+   - `mem_merge : e ∈ (merge a b).entries ↔ (e ∈ a.entries ∧ ¬ b.Supersedes e) ∨ (e ∈ b.entries ∧ ¬ a.Supersedes e)`.
+4. **No lost update:**
+   `no_lost_update : e ∈ a.entries → e.hash ∈ (merge a b).versions e.path ∨ b.Supersedes e`.
+   This holds for every `a`, `b`, `e`, with no hypothesis.
+5. **Queries:**
+   - `mem_versions : h ∈ s.versions p ↔ ∃ e ∈ s.entries, e.path = p ∧ e.hash = h`;
+   - `versions_sorted`, `mem_paths`, `paths_sorted`, `mem_paths_iff`, `isConflicted_iff`;
+   - `snapshot_eq : s.snapshot = s.paths.map (fun p => (p, s.versions p))`.
+6. **Local operations:**
+   - `mem_versions_put : x ∈ (s.put r p h S).versions q ↔ (q = p ∧ x = h) ∨ (x ∈ s.versions q ∧ ¬(q = p ∧ x ∈ S))`;
+   - `context_put`, `mem_versions_delete`, `context_delete`;
+   - `versions_resolve : (s.resolve r p h).versions p = [h]`.
+7. **Concurrency.** Each theorem takes the host-rule hypothesis `b.context.get r ≤ a.context.get r`:
+   - `put_survives_merge`;
+   - `edit_wins_over_concurrent_delete` (decision 3);
+   - `concurrent_puts_kept` (decision 2): both versions are kept, and the path `isConflicted` if they differ;
+   - `resolve_supersedes : Le b a → (merge (a.resolve r p h) b).versions p = [h]`.
+8. **Batch:** `putMany_eq_putSeq : s.putMany r items = s.putSeq r items`. This holds unconditionally,
+   so every law above transfers to `putMany`. Dots are assigned in list order: item `i` gets
+   `ctx(self)+1+i`. When two items share a path, `putMany` falls back to `putSeq`.
+
+The 26 statements fixed in stage 1 are unchanged. A Lean file that restates each one verbatim and
+discharges it with the current theorem typechecks. The theorems added since stage 1 are
+`putSeq_spec`, `putMany_eq_putSeq` and helper lemmas.
+
+`#print axioms` on the headline theorems lists only `propext`, `Classical.choice` and
+`Quot.sound`: the standard axioms that core tactics such as `simp` and `grind` rely on.
 
 ## Deletes, tombstones and retained garbage
 
-There are no per-path tombstones. A deleted or superseded version disappears from `entries` immediately;
-its dot stays covered by `context`. **The only garbage kept forever is the version vector: one
-`(ReplicaId, Nat)` entry per replica id that has ever made an edit.** It grows by one entry per new
-device, reinstall or cleared browser storage (each gets a new id), and never shrinks. Pruning would need
-a coordination protocol, which is out of scope. Deleting files costs no space.
+There are no per-path tombstones. A deleted or superseded version leaves `entries` immediately,
+and its dot stays covered by `context`. **The only data kept forever is the version vector: one
+`(ReplicaId, Nat)` entry for every replica id that has ever made an edit.**
+- It grows by one entry for every new device, reinstall, cleared browser storage or fresh id taken
+  under the host rule.
+- It never shrinks. Pruning would need a coordination protocol, which is out of scope.
 
-## Risks
+Deleting files costs no space.
 
-1. **Dot reuse after rollback (data loss).** If a replica restarts from an older persisted state and
-   reuses its id, it reissues dots that others have already seen. The new edits can then be dropped as
-   "seen and deleted". Host rule: *persist the state before sending any of its dots to another replica*,
-   or take a fresh id whenever persistence is in doubt. This is the most important integration rule.
-2. **Bulk import is quadratic.** 20,000 `put`s on an empty state rebuild the list prefixes, about 2·10⁸
-   cons cells. A `putMany` (sort the batch, then one merge-like pass) would fix this (see question).
-3. **Paths are raw strings.** Unicode normalisation (NFC/NFD) and case-insensitive filesystems are the
-   host's job. Two spellings are two files to the CRDT.
-4. **Rename = delete + add.** A rename concurrent with an edit of the old path keeps both files: the
-   edited old path and the new path.
-5. **Deltas later.** Delta-state sync needs non-contiguous contexts (dot sets) or causal delivery of
-   deltas. The version-vector context is correct only for whole-state merges.
-6. **Stack.** All list walks will be self tail calls, which Lean compiles to loops. Library helpers with
-   non-tail compiled code (`List.foldr`, derived `DecidableEq`/`BEq` on lists) must be avoided in
-   executable paths. State equality for the host/tests gets a tail-recursive implementation.
-7. **Proof engineering.** Merges are well-founded recursion on two lists. They are proved through
-   `fun_induction` against a structural specification. This is the main stage-2 effort, and I do not
-   expect statements to need weakening.
+## Consequences accepted by the user
+
+* **Rename is delete + add.** A rename concurrent with an edit of the old path leaves both files: the
+  edited old path and the new path. A unit test checks this.
+* **Each new replica id adds a permanent version-vector entry** (see above).
+* **Paths are raw strings.** Unicode normalisation (NFC/NFD), case-insensitive filesystems and
+  path syntax are the host's job. Two spellings are two files.
+
+## Tests (native, `scripts/test-crdt.sh`)
+
+The script first builds the library, which checks every proof. It then greps `LeanCrdt/` for the
+forbidden constructs and runs the following tests:
+- **unit:** decisions 2 and 3, resolution, partial deletes, no resurrection, same-hash siblings,
+  rename, `putMany` with a repeated path, the snapshot, Unicode order;
+- **sim:** 40 seeds × 300 random operations on 4 replicas.
+  - Operations: `put`, `delete`, `resolve`, `putMany`, `merge`.
+  - After each merge it checks:
+    - commutativity, associativity, idempotence and the identity;
+    - `merge` against a naive quadratic reference merge;
+    - no lost update and the query specifications.
+  - After each `put` it checks that the edit survives merging with every peer, including a peer
+    that deleted the path.
+  - At the end it checks convergence under 5 random permutations, 5 random groupings and gossip.
+  - The seed is printed on failure. A deliberately broken merge was caught by 800+ failing checks.
+- **scale:** 20,000 paths built with `putMany`. Two replicas diverge with 10,000 and 6,667 edits and
+  2,858 deletes, then merge. The test checks the laws, the expected number of surviving paths
+  (18,095) and of conflicts (2,857), single operations on the large state, and a smaller test of
+  300 single `put`s against `putMany`.
+- **stack:** `main` runs on a thread whose stack is `LEAN_STACK_SIZE_KB`, plus a 128 KB buffer;
+  the default is 1 GB, so plain `ulimit -s` has no effect. With it set to 256 KB:
+  - a trivial non-tail recursion of depth 13,000 must crash. That is the spike's ~13k-frame
+    browser budget, and the measured native maximum here is about 12,100 frames;
+  - the non-tail *specification* `mergeSpec` must crash on the scale sizes, at about 4,850
+    elements per list;
+  - scale, unit and sim must pass.
+
+  The 20k scale test also passes at 64 KB (about 6,000 trivial frames), as does a 100k-path run.
+  Caveat: native and wasm frame sizes differ. The calibration is in frames of a trivial function.
+
+Measured on this machine with `crdt-tests bench [n]` (native, indicative):
+
+| Operation | 20k paths | 100k paths |
+|---|---|---|
+| `put` + `merge` (10k entries differ) | ≈ 1.2 ms | ≈ 8 ms |
+| `put` + `snapshot` | ≈ 1.4 ms | ≈ 18 ms |
+| `putMany` of 20k items onto a 20k-path state | ≈ 6.5 ms | |
+
+The whole 20k scale test takes about 0.6 s. Most of that is its 2,858 single deletes: each one is O(n).
+
+## Remaining risks and limitations
+
+1. **Host rule** (above). This is the one integration rule whose violation loses data.
+2. **Point operations are O(n).** `put`, `delete` and `versions` rebuild or scan the list. Deleting
+   k files one at a time is O(k·n): 2,858 deletes on 20k paths took 0.5 s natively, and 14k deletes
+   on 100k paths took 18 s. Use `putMany` for bulk writes and `snapshot` for bulk reads. A proved
+   `deleteMany`, along the lines of `putMany`, is the obvious next step if bulk deletes matter.
+3. **Not yet run under wasm.** The import closure is `Init` only, but startup time and size under
+   wasm are not yet measured.
+4. **Deltas later** need non-contiguous contexts (dot sets) or causal delivery. The version-vector
+   context is correct for whole-state merges only.
+5. **Stack.** Executable code uses only self tail calls and core functions that have tail-recursive
+   implementations. `Tests/` itself uses a `partial def` of logarithmic depth. The stack test guards
+   this; it is calibrated natively, not in a browser.
