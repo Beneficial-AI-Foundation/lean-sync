@@ -133,6 +133,11 @@ What `build.sh` does and costs, from scratch:
   intentionally platform-specific `numBits` line; heap size unchanged after 2000 calls).
 - `scripts/wasm/check-browsers.sh` → 6× `REPORT PASS` (Chromium 154, Firefox 146, Firefox ESR 140 × wasm32/wasm64).
   The page itself posts its output and the server compares it with the native binary.
+  Each browser/arch invocation carries its own run id and must produce exactly one PASS. A browser that crashes
+  or never reports counts as a failure. Both the Node and browser checks also assert that the platform line
+  matches the requested arch (`numBits=32`/`64`) before comparing the rest. Negative tests: a wasm32 artifact
+  copied into the wasm64 directory fails both checks; a page that never reports fails all 6 runs; a busy port
+  fails fast; malformed reports are logged as FAIL without killing the server.
 - wasm32 *without* the literal fix → reproducible crash (described above).
 - Probes: `panic!` prints the message and returns the default value, as on native. Exceeding the stack
   throws a JS `RangeError` out of `lw_process`.

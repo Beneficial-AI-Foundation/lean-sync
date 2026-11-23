@@ -11,6 +11,12 @@ import { loadLean } from './host.mjs';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const arch = process.argv[2] ?? 'wasm32';
 const native = join(root, '.lake/build/bin/wasm-demo-native');
+// What the platform line must say for the requested arch (guards against a mislabelled artifact).
+const EXPECTED_PLATFORM = {
+  wasm32: 'numBits=32 usizeMax=4294967295 ',
+  wasm64: 'numBits=64 usizeMax=18446744073709551615 ',
+};
+if (!EXPECTED_PLATFORM[arch]) { console.log(`unknown arch ${arch}`); process.exit(2); }
 
 const t0 = performance.now();
 const { default: createLeanDemo } = await import(pathToFileURL(join(root, 'build', arch, 'lean_demo.mjs')));
@@ -44,9 +50,13 @@ for (const [name, input] of inputs) {
   const f = join(tmp, name);
   writeFileSync(f, input);
   const want = new Uint8Array(execFileSync(native, [f], { maxBuffer: 1 << 26 }));
-  // The `numBits=… usizeMax=…` line legitimately differs on wasm32; compare everything else.
+  // The `numBits=… usizeMax=…` line legitimately differs on wasm32: first check it matches the
+  // requested arch, then compare everything else with native.
+  const platform = new TextDecoder('latin1').decode(got).split('\n').find((l) => l.startsWith('numBits=')) ?? '';
+  const platformOk = platform.startsWith(EXPECTED_PLATFORM[arch]);
+  if (!platformOk) console.log(`  platform line ${JSON.stringify(platform)} does not match ${arch}`);
   const a = dropPlatformLine(got), b = dropPlatformLine(want);
-  const ok = a.length === b.length && a.every((x, i) => x === b[i]);
+  const ok = platformOk && a.length === b.length && a.every((x, i) => x === b[i]);
   if (!ok) failures++;
   console.log(`${ok ? 'PASS' : 'FAIL'} ${name.padEnd(7)} in=${input.length} out=${got.length} ${ms.toFixed(1)}ms`);
   if (!ok) {

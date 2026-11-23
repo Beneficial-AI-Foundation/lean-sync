@@ -52,7 +52,7 @@ function report({ ok, status, input, out, error }) {
   const b64 = (u8) => btoa(Array.from(u8, (c) => String.fromCharCode(c)).join(''));
   const text = out ? new TextDecoder('latin1').decode(out) : '';
   fetch('/report', { method: 'POST', body: JSON.stringify({
-    ok, arch, status, error, userAgent: navigator.userAgent,
+    ok, arch, status, error, run: params.get('run'), userAgent: navigator.userAgent,
     platform: (text.match(/numBits=[^\n]*/) ?? [''])[0],
     inputB64: input ? b64(input) : '', outputB64: out ? b64(out) : '',
   }) });
@@ -63,7 +63,10 @@ function run() {
   const t = performance.now();
   const out = lean.process(input);
   const ms = performance.now() - t;
-  const report = new TextDecoder().decode(out.subarray(0, out.length - input.length));
+  // Normal results are a text report followed by the reversed input bytes; probe results
+  // (`!panic`, `!deep N`) are text only.
+  const isReport = new TextDecoder().decode(out.subarray(0, 6)) === 'bytes=';
+  const report = new TextDecoder().decode(isReport ? out.subarray(0, out.length - input.length) : out);
   $('out').textContent = `${report}\n[${out.length} bytes out, ${ms.toFixed(2)} ms]`;
   // Machine-readable marker for headless checks.
   document.title = `done:${arch}:${out.length}`;
