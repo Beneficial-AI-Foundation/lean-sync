@@ -22,3 +22,8 @@ root = "WasmDemo"
 [[lean_exe]]
 name = "crdt-tests"
 root = "Tests.Main"
+
+# Native tests for the sync protocol and wire format (see Tests/Sync.lean and scripts/test-sync.sh).
+[[lean_exe]]
+name = "sync-tests"
+root = "Tests.Sync"
