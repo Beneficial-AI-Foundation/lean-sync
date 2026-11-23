@@ -400,34 +400,64 @@ def benchTest (n : Nat) : IO Unit := do
   let t3 ← IO.monoNanosNow
   IO.println s!"bench n={n}: put+merge {(t1 - t0) / 1000 / iters} us/iter, put+snapshot {(t2 - t1) / 1000 / iters} us/iter, putMany of {n} items onto {n} paths {(t3 - t2) / 1000 / iters} us/iter ({acc}, {acc2}, {acc3})"
 
+/-- Time `op` applied to the state held in `input`, excluding setup and result consumption.
+The input is read from an `IO.Ref` *after* the start time is taken, so the computation cannot be
+hoisted before it; the result's head is inspected in an `IO` branch *before* the stop time is
+taken, so it cannot be deferred past it (Lean is strict: the returned list is fully built). -/
+@[noinline] def timeOp (input : IO.Ref State) (op : State → State) : IO (State × Nat) := do
+  let t0 ← IO.monoNanosNow
+  let s ← input.get
+  let r := op s
+  if r.entries.isEmpty then IO.print ""
+  let t1 ← IO.monoNanosNow
+  return (r, t1 - t0)
+
+/-- Median of a non-empty list of durations (ns). -/
+def median (l : List Nat) : Nat :=
+  let a := (l.toArray.qsort (· < ·))
+  a[a.size / 2]!
+
 /-- Before/after timing of deleting every 7th of `n` paths: single `delete`s versus
-`deletePaths`/`deleteMany`. One run of each, on states that differ per run so nothing is shared. -/
-def delBench (n : Nat) (withSingle : Bool) : IO Unit := do
+`deletePaths` and `deleteMany` with the hashes actually stored. Inputs and batches are prepared
+before timing; the three results must agree (same survivors) or the check fails. Each figure is
+the median (with min–max) of `runs` runs; the single-delete variant uses `singleRuns` runs. -/
+def delBench (c : Ctx) (n : Nat) (withSingle : Bool) : IO Unit := do
   let A := rid 1
   let a := State.empty.putMany A (scalePaths n "a")
-  let ps := (List.range n).filter (· % 7 == 0) |>.map (fun i => s!"dir{i % 97}/file{i}.txt")
-  let mut out := ""
+  let idx := (List.range n).filter (· % 7 == 0)
+  let ps := idx.map (fun i => s!"dir{i % 97}/file{i}.txt")
+  let items : List DeleteItem := idx.map (fun i => ⟨s!"dir{i % 97}/file{i}.txt", some [hs s!"a{i}"]⟩)
+  let input ← IO.mkRef a
+  let runs := 11
+  let singleRuns := 3
+  let fmt (l : List Nat) : String :=
+    let ms (x : Nat) := s!"{x / 1000000}.{(x / 10000) % 100 / 10}{(x / 10000) % 10}"
+    s!"median {ms (median l)} ms (min {ms (l.foldl min l.head!)}, max {ms (l.foldl max 0)}, {l.length} runs)"
+  let mut tP := []
+  let mut rP := a
+  for _ in [0:runs] do
+    let (r, t) ← timeOp input (fun s => s.deletePaths ps)
+    tP := t :: tP; rP := r
+  let mut tM := []
+  let mut rM := a
+  for _ in [0:runs] do
+    let (r, t) ← timeOp input (fun s => s.deleteMany items)
+    tM := t :: tM; rM := r
+  let survP := rP.entries.length
+  let survM := rM.entries.length
+  check c "delbench: deletePaths and deleteMany agree" (rP.beq rM) (fun _ => s!"{survP} vs {survM}")
+  check c "delbench: every 7th path deleted" (survP == n - idx.length)
+  IO.println s!"delbench n={n}, deleting {idx.length} paths:"
   if withSingle then
-    let t0 ← IO.monoNanosNow
-    let mut acc := 0
-    for i in [0:1] do
-      let ai := a.put A "zzz" (hs s!"{i}") []
-      acc := acc + (ps.foldl (fun s p => s.delete p (s.versions p)) ai).entries.length
-    let t1 ← IO.monoNanosNow
-    out := out ++ s!"{ps.length} single deletes {(t1 - t0) / 1000000} ms ({acc}); "
-  let t2 ← IO.monoNanosNow
-  let mut acc2 := 0
-  for i in [0:1] do
-    let ai := a.put A "zzz" (hs s!"{i}") []
-    acc2 := acc2 + (ai.deletePaths ps).entries.length
-  let t3 ← IO.monoNanosNow
-  let items : List DeleteItem := ps.map (fun p => ⟨p, some [hs "x", hs "y"]⟩)
-  let mut acc3 := 0
-  for i in [0:1] do
-    let ai := a.put A "zzz" (hs s!"{i}") []
-    acc3 := acc3 + (ai.deleteMany items).entries.length
-  let t4 ← IO.monoNanosNow
-  IO.println s!"delbench n={n}: {out}deletePaths {(t3 - t2) / 1000} us ({acc2}); deleteMany with explicit hashes {(t4 - t3) / 1000} us ({acc3})"
+    let mut tS := []
+    let mut rS := a
+    for _ in [0:singleRuns] do
+      let (r, t) ← timeOp input (fun s => ps.foldl (fun s p => s.delete p (s.versions p)) s)
+      tS := t :: tS; rS := r
+    check c "delbench: single deletes agree" (rS.beq rP) (fun _ => s!"{rS.entries.length} vs {survP}")
+    IO.println s!"  single deletes: {fmt tS}, survivors {rS.entries.length}"
+  IO.println s!"  deletePaths:    {fmt tP}, survivors {survP}"
+  IO.println s!"  deleteMany (explicit stored hashes): {fmt tM}, survivors {survM}"
 
 /-- Deliberately non-tail-recursive: the structural specification of the merge. -/
 def controlTest (n : Nat) : IO Unit := do
@@ -458,7 +488,8 @@ def main (args : List String) : IO UInt32 := do
   | "scale" :: rest => scaleTests { c with label := "scale" } ((rest[0]? >>= String.toNat?).getD 20000)
   | "bench" :: rest => benchTest ((rest[0]? >>= String.toNat?).getD 20000)
   | "delbench" :: rest =>
-    delBench ((rest[0]? >>= String.toNat?).getD 20000) (rest[1]? != some "fast")
+    delBench { c with label := "delbench" } ((rest[0]? >>= String.toNat?).getD 20000)
+      (rest[1]? != some "fast")
   | "deep" :: rest =>
     let n := (rest[0]? >>= String.toNat?).getD 13000
     IO.println s!"deep: non-tail recursion of depth {n} returned {deep n}"

@@ -227,15 +227,22 @@ Measured on this machine with `crdt-tests bench [n]` (native, indicative):
 | `put` + `snapshot` | ≈ 1.4 ms | ≈ 18 ms |
 | `putMany` of 20k items onto a 20k-path state | ≈ 6.5 ms | |
 
-Deleting every 7th path (`crdt-tests delbench [n]`, one run each, native):
+Deleting every 7th path (`crdt-tests delbench [n]`, native). Each figure is the median and range
+of 3 runs for single deletes and 11 runs for the batch operations. Only the delete itself is
+timed: the state and batches are prepared beforehand and the result is forced inside the timed
+region. All three variants must leave the same survivors, and the benchmark checks this.
 
 | | 20k paths (2,858 deletes) | 100k paths (14,286 deletes) |
 |---|---|---|
-| single `delete`s (before) | ≈ 0.74 s | ≈ 21 s |
-| `deletePaths` (after) | ≈ 1.6 ms | ≈ 9.8 ms |
-| `deleteMany` with explicit hashes (after) | ≈ 2.2 ms | ≈ 24 ms |
+| single `delete`s (before) | 646 ms (645–677) | 23.9 s (21.4–26.5) |
+| `deletePaths` (after) | 0.65 ms (0.60–1.08) | 4.2 ms (4.1–4.6) |
+| `deleteMany`, explicit stored hashes (after) | 0.72 ms (0.67–0.74) | 4.6 ms (4.4–5.5) |
+| survivors (all three variants) | 17,142 | 85,714 |
 
-The single-delete figures varied by about 30% between runs: an earlier run measured 0.5 s and 18 s.
+The table replaces an earlier one, which was wrong in two ways:
+- its `deleteMany` row deleted nothing, because the hashes did not match the stored ones;
+- its timings included setup.
+
 The 20k scale test still runs its 2,858 single deletes on purpose, as the reference for
 `deletePaths`/`deleteMany`; they take most of its roughly 1 s.
 
@@ -259,7 +266,7 @@ Costs count comparisons of paths, hashes and ids.
 | `paths` | O(n) | always |
 | `put` | O(n + r + k·\|S\|) | always, for small r and k |
 | `delete` | O(n + k·\|S\|) | always, for small k |
-| `deleteMany`, `deletePaths` | O(b log b + n), plus, per entry at a batch path, O(\|S\|) and the length of that path's run of repeated items | always |
+| `deleteMany`, `deletePaths` | O(b log b + n), plus, for each entry at a batch path p, O(dₚ + Lₚ): dₚ items name p, and Lₚ is the **sum** of their hash-list lengths. The scan stops at the first match, and a `none` item matches at once. So a path with k siblings, named by d items whose hash lists each have length L and all miss, costs Θ(k·d·L) | each path is named by few items with short lists (normally one item per path, or `none`, as in `deletePaths`) |
 | `putMany` | O(b log b + n + r), plus O(\|S\|) per entry at a batch path; repeated paths fall back to `putSeq`, which is O(b·n) | paths in a batch are distinct |
 | `VersionVector.merge` | O(r) | always |
 

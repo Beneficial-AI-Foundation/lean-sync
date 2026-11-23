@@ -500,8 +500,12 @@ theorem pruneAllGo_eq (ts : List DeleteItem) (es acc : List Entry) (hts : ItemsS
 
 /-- Batch delete in one pass: equal to `deleteSeq`, the single `delete`s one after the other
 (proved by `deleteMany_eq_deleteSeq`, with no side condition; repeated and absent paths are
-allowed). Cost: O(b log b) to sort the b items, plus one pass over the n entries, plus
-O(|S|) per entry at a batch path and the length of that path's run of repeated items. -/
+allowed). Cost: O(b log b) to sort the b items, plus one pass over the n entries, plus, for
+each entry at a batch path p, O(d_p + L_p), where d_p is the number of items naming p and L_p
+the SUM of their hash-list lengths (`runMatches` scans the run of items for p, stopping at the
+first match; a `none` item matches immediately). Hence k siblings and d non-matching items
+with lists of length L cost Θ(k·d·L). Effectively linear when each path is named by few items
+with short lists (e.g. one item per path, or `none` as in `deletePaths`). -/
 def deleteMany (s : State) (items : List DeleteItem) : State where
   entries := pruneAllGo (items.mergeSort delItemLe) s.entries []
   context := s.context
