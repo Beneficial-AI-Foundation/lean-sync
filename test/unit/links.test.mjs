@@ -61,7 +61,8 @@ test('messages are fragmented and reassembled exactly', () => {
 
 test('a message over the limit closes the link', async () => {
   const { events, link } = setup(); link.deliver(hello(OTHER));
-  link.deliver(new Uint8Array(2 + MAX_MESSAGE_BYTES + 1).fill(0).map((x, i) => (i === 0 ? 1 : i === 1 ? 1 : 0)));
+  const frag = new Uint8Array(2 + FRAME_PAYLOAD); frag[0] = 1; frag[1] = 1;      // well-formed continuations
+  for (let n = 0; n * FRAME_PAYLOAD <= MAX_MESSAGE_BYTES && !link.closed; n++) link.deliver(frag);
   await sleep(1);
   assert.equal(link.closed, true);
   assert.deepEqual(types(events), ['connected', 'disconnected']);
@@ -242,4 +243,38 @@ test('the slot is freed when the receiving link closes, when the receiver aborts
   await sleep(20);
   assert.deepEqual(t.b.sent.map((f) => f[0]), [5, 2, 2], 'z starts');
   assert.ok(t.events.some((e) => e.type === 'blobLost'));
+});
+
+test('a continuation fragment of the wrong size closes the link (fragment count is bounded)', async () => {
+  const { events, link } = setup(); link.deliver(hello(OTHER));
+  link.deliver(Uint8Array.of(1, 1, 7, 7, 7));          // more=1 but not a full fragment
+  await sleep(1);
+  assert.equal(link.closed, true); assert.deepEqual(types(events), ['connected', 'disconnected']);
+  const b = setup(); b.link.deliver(hello(OTHER));
+  for (let i = 0; i < 1000 && !b.link.closed; i++) b.link.deliver(Uint8Array.of(1, 1));   // empty continuations
+  await sleep(1);
+  assert.equal(b.link.closed, true);
+});
+
+test('a storage write error stops the transfer: blobFailed, ABORT, no more credit, temp file removed', async () => {
+  const { events, link, links, storage } = setup(); link.deliver(hello(OTHER));
+  let writes = 0, aborted = 0;
+  storage.beginIncoming = async () => ({
+    async write() { if (++writes >= 2) throw new Error('disk full'); },
+    async finish() { throw new Error('should not finish'); },
+    async abort() { aborted++; },
+  });
+  const h = new Uint8Array(32).fill(8);
+  links.expect(1, [h]);
+  link.deliver(start(h, 10 * 1024 * 1024));
+  await sleep(5);
+  link.sent.length = 0;
+  for (let i = 0; i < 8; i++) link.deliver(data(h, new Uint8Array(16384)));
+  await sleep(20);
+  assert.deepEqual(types(events), ['connected', 'blobFailed']);
+  assert.ok(link.sent.some((f) => f[0] === 5), 'ABORT sent');
+  const kinds = link.sent.map((f) => f[0]);
+  assert.ok(kinds.lastIndexOf(6) < kinds.indexOf(5), 'no credit after the failure');
+  assert.ok(kinds.filter((k) => k === 6).length <= 1, 'at most the one grant earned by the successful write');
+  assert.equal(aborted, 1, 'the partial file is discarded');
 });

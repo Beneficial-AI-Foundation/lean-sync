@@ -282,6 +282,7 @@ export function createCore(o) {
     async addFiles(files) {
       if (!canEdit()) throw new Error('editing is not possible right now');
       const seen = files.map((f) => f.supersedes ?? versionsOf(f.name));     // before the first await
+      const ep = st.epoch;                                                    // the machine the user acted on
       const items = [], errors = [];
       for (let i = 0; i < files.length; i++) {
         const { name, blob } = files[i];
@@ -291,6 +292,14 @@ export function createCore(o) {
         } catch (e) { errors.push({ name, error: e.message ?? String(e) }); log(`could not add ${name}: ${e.message}`); }
       }
       if (items.length) {
+        // The engine restarted while the files were being stored: the versions the user saw belong to
+        // the old machine, so the edit is not applied. The stored blobs are durable: report them.
+        if (st.epoch !== ep) {
+          if (st.phase === 'running') emit({ type: 'blobsStored', hashes: items.map((it) => it.hash) });
+          log('an add was dropped: the engine restarted while its files were being stored');
+          errors.push(...items.map((it) => ({ name: it.path, error: 'the sync engine restarted meanwhile; please add it again' })));
+          return { added: 0, errors };
+        }
         if (!canEdit()) { errors.push(...items.map((it) => ({ name: it.path, error: 'editing was blocked meanwhile' }))); return { added: 0, errors }; }
         emit({ type: 'putMany', items });
       }

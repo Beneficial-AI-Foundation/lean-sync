@@ -79,9 +79,15 @@ export const SLOW_STORE = `
   window.__releaseCloses = () => { window.__holdClose = false; const h = window.__held; window.__held = []; for (const f of h) f(); return h.length; };`;
 
 // __failCreate = n: the next n creations of a temporary (non-hash-named) OPFS file reject, as a full
-// disk would. __failMove = n: the next n FileSystemFileHandle.move() calls reject.
+// disk would. __failMove = n: the next n FileSystemFileHandle.move() calls reject. __failWrite = n: the
+// next n writes to an OPFS writable reject.
 export const FS_FAULT = `
-  window.__failCreate = 0; window.__failMove = 0;
+  window.__failCreate = 0; window.__failMove = 0; window.__failWrite = 0;
+  const __wr = FileSystemWritableFileStream.prototype.write;
+  FileSystemWritableFileStream.prototype.write = function (...a) {
+    if (window.__failWrite > 0) { window.__failWrite--; return Promise.reject(new DOMException('injected', 'QuotaExceededError')); }
+    return __wr.apply(this, a);
+  };
   const __gfh = FileSystemDirectoryHandle.prototype.getFileHandle;
   FileSystemDirectoryHandle.prototype.getFileHandle = function (name, opts) {
     if (window.__failCreate > 0 && opts && opts.create && !/^[0-9a-f]{64}$/.test(name)) { window.__failCreate--; return Promise.reject(new DOMException('injected', 'QuotaExceededError')); }

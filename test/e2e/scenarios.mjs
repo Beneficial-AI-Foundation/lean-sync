@@ -41,6 +41,57 @@ const rowStatus = async (dev, path) => (await dev.rows()).find((r) => r.path ===
 
 export const scenarios = [
   {
+    name: 'cold-load-many-files',
+    kinds: [[CH], [FF]],
+    async run(ctx, kinds) {
+      // A cold load of N files must render the table a bounded number of times (it used to render
+      // once per file while loading sizes: quadratic).
+      const N = Number(process.env.COLD_LOAD_N ?? 3000);   // COLD_LOAD_N=20000 for the larger measurement
+      const [A] = await devices(ctx, kinds);
+      const fs = Array.from({ length: N }, (_, i) => randomFile(`f${String(i).padStart(5, '0')}-${ctx.id}.txt`, 16));
+      const t0 = Date.now();
+      await A.add(fs);
+      await A.waitRows((rows) => rows.length === N && rows.every((r) => r.status === 'complete'), 300000, `${N} files added`);
+      const tAdd = Date.now() - t0;
+      await A.waitFor(`document.querySelector('#saving').dataset.state === 'saved'`, 30000);
+      const t1 = Date.now();
+      await A.page.reload();
+      await A.waitFor(`window.leansync && window.leansync.phase === 'running' && document.querySelectorAll('#files tr').length === ${N}`, 120000, 'all rows');
+      const tRows = Date.now() - t1;
+      await A.waitFor(`[...document.querySelectorAll('#files td.size')].every((c) => c.textContent !== '')`, 120000, 'all sizes');
+      const tLoad = Date.now() - t1;
+      const renders = await A.eval('window.leansync.renders');
+      ctx.note(`${N} files: adding took ${(tAdd / 1000).toFixed(1)} s; reload to all rows shown ${(tRows / 1000).toFixed(1)} s, to every size shown ${(tLoad / 1000).toFixed(1)} s, ${renders} table renders`);
+      assert.ok(renders <= 30, `table rendered ${renders} times for ${N} files`);
+    },
+  },
+  {
+    name: 'incoming-write-or-publish-failure',
+    kinds: [[CH, CH], [FF, FF]],
+    async run(ctx, kinds) {
+      const [A, B] = await devices(ctx, kinds);
+      await waitPeers(A, 1);
+      // 1. A write error on B stops the transfer early: reported, sender told, no more credit.
+      const big = randomFile(`w-${ctx.id}.bin`, 12 * 1024 * 1024);
+      await B.eval('(window.__failWrite = 1)');
+      await A.add([big]);
+      await B.waitRows((rows) => rows.length === 1 && rows[0].status === 'waiting', 20000, 'write failure reported');
+      await sleep(1000);
+      const st = await (await fetch(`${ctx.server.url}/admin/state?room=${ctx.room}`)).json();
+      const bytes = st.links.reduce((n, l) => n + l.bytes, 0);
+      ctx.note(`bytes relayed for a 12 MiB file whose first write failed: ${bytes}`);
+      assert.ok(bytes < 6 * 1024 * 1024, `the sender stopped early (${bytes} bytes relayed)`);
+      await waitFor(async () => (await incomingCount(B)) === 0, 10000, 'temp file removed after the write failure');
+      // 2. Publishing fails (move) after the stream completed: the temp file is removed too.
+      const small = randomFile(`p-${ctx.id}.txt`, 2000);
+      await B.eval('(window.__failMove = 1)');
+      await A.add([small]);
+      await B.waitRows((rows) => rows.find((r) => r.path === small.name)?.status === 'waiting', 20000, 'publish failure reported');
+      assert.equal(await B.eval('window.__failMove'), 0, 'the injected move failure was exercised');
+      await waitFor(async () => (await incomingCount(B)) === 0, 10000, 'temp file removed after the publish failure');
+    },
+  },
+  {
     name: 'empty-file-then-normal-file',
     kinds: [[CH, CH], [FF, FF], [CH, FF]],
     async run(ctx, kinds) {

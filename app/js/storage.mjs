@@ -151,12 +151,18 @@ export async function openStorage() {
       const w = await fh.createWritable();
       let chain = Promise.resolve(); let failed = null; let done = false;
       return {
-        write(chunk) { chain = chain.then(() => w.write(chunk)).catch((e) => { failed ??= e; }); return chain; },
+        /** Rejects if this or an earlier write failed (the caller then stops the transfer). */
+        write(chunk) {
+          const p = chain.then(() => { if (failed) throw failed; return w.write(chunk); });
+          chain = p.catch((e) => { failed ??= e; });
+          return p.catch((e) => { throw new StorageError(`write failed: ${(failed ?? e).name ?? e}`, failed ?? e); });
+        },
         async finish(expectedHex) {
           await chain; done = true;
           if (failed) { try { await w.abort(); } catch {} await removeIncoming(name); throw new StorageError(`write failed: ${failed.name ?? failed}`, failed); }
           try { await w.close(); } catch (e) { await removeIncoming(name); throw new StorageError(`write failed: ${e.name ?? e}`, e); }
-          return publish(name, fh, expectedHex);
+          try { return await publish(name, fh, expectedHex); }
+          catch (e) { await removeIncoming(name); throw e instanceof StorageError ? e : new StorageError(`could not store the file: ${e.name ?? e}`, e); }
         },
         async abort() { if (done) return; done = true; await chain; try { await w.abort(); } catch {} await removeIncoming(name); },
       };

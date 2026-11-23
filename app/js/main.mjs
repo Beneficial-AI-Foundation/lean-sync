@@ -61,6 +61,7 @@ async function run() {
     get instances() { return core.st.instances; }, get traps() { return core.st.traps.length; },
     get replica() { const r = core.replica(); return r ? `${r.hi.toString(16)}:${r.lo.toString(16)}` : null; },
     get heapBytes() { return core.st.engine?.heapBytes() ?? null; }, get log() { return core.st.log.slice(); },
+    get renders() { return ui.state.renders; },
     label,
   };
   await core.start();

@@ -133,7 +133,7 @@ never reach the new machine (its tags restart at 0).
 ## 4. Host obligations
 
 Audited by mutation (`node test/mutations.mjs`): for each row the mechanism was removed or broken
-in the app's source and the named test was run (e2e in Chromium); **36 of 36 mutants were caught**.
+in the app's source and the named test was run (e2e in Chromium); **43 of 43 mutants were caught** (the final run is reported in the branch's last hand-back).
 "Mutant" names the break that was tried.
 
 | Obligation (sync-design §8, decision 7) | Mechanism | Test (fails when the mechanism is broken) | Mutant |
@@ -161,6 +161,11 @@ in the app's source and the named test was run (e2e in Chromium); **36 of 36 mut
 | A blob is replaced only by a verified copy, never deleted first | an intact existing copy is kept; a damaged one is overwritten by one `move()` | e2e `existing-blob-kept-when-replacement-fails` | delete, then move |
 | Row statuses follow request planning | `pending` re-queried on peer changes and on `pendingSummary` | e2e `peer-leaves-mid-fetch-row-updates` | refresh removed |
 | Transport only to the serving origin | no URL parameter selects the relay | e2e `relay-parameter-ignored` (a second relay that accepts any origin sees no connection) | `?relay=` honoured |
+| A storage failure on receive stops the transfer | the first failed write rejects; no more credit; `blobFailed` + ABORT; the temp file is removed (also after a failed publish) | unit `links`; e2e `incoming-write-or-publish-failure` (a 12 MiB transfer stops after ~1 MiB) | write errors swallowed (storage or links); temp kept |
+| Bounded reassembly | a continuation fragment must be exactly 16 KiB (our framing), so fragments are bounded by the message limit | unit `links` | size unchecked |
+| Paths round-trip byte for byte | `TextDecoder(fatal, ignoreBOM)`; vectors include a leading U+FEFF | unit `codec` | BOM stripped |
+| An edit is applied only to the machine the user saw | the add captures the epoch; across a restart it is dropped (blobs still reported as `blobsStored`) | unit `core` | epoch not checked |
+| The UI scales with the file count | sizes loaded in batches, one render per batch | e2e `cold-load-many-files` (≤ 30 renders for 3,000 files) | one render per file |
 | Re-instantiate after a trap; no loop | §8 | e2e `trap-mid-sync…`, `trap-at-startup…`; unit `core` | no restart; start-up trap retried; restart stays `running` |
 | Refuse a peer with our own replica id | host HELLO check before Lean | unit `links`; e2e `same-replica-id-refused` | check removed |
 | Nothing else persisted | IDB holds the record, `rotateId`, the label | review only (not mutation-tested) | — |
@@ -234,6 +239,7 @@ transfer that never ends blocks every later file for every peer. Every way out, 
 | receiver aborts for another reason (bad size, over credit, unexpected) | sender releases on ABORT | unit `links` |
 | receiving link closes mid-transfer (or ABORT lost with it) | link close releases the slot | unit `links` |
 | blob gone or unreadable on the sender | ABORT + `blobLost`, release | unit `links`; e2e `damaged-or-missing-blob-recovers` |
+| receiver cannot write (disk full, I/O error) | receiver: `blobFailed` + ABORT at the first failed write, no more credit | unit `links`; e2e `incoming-write-or-publish-failure` *(review)* |
 | receiver stops granting credit without saying why | sender aborts after 60 s without credit | unit `links` (short timeout) |
 
 A lost ABORT on a live link cannot happen (links are reliable and ordered); if a link breaks, its
@@ -261,18 +267,24 @@ conflicts list their versions with Keep / Download, and Keep both for two versio
 becomes `name (2).ext`). Adding under an existing name supersedes the versions shown; Delete
 supersedes the versions shown. Flat names only: folder drops are refused with a message; a name
 containing `/` that arrives from another device is shown in full with the part up to the last `/`
-dimmed, and downloads under its last component (nothing below the UI restricts paths). Files over
+dimmed, and downloads under its last component (nothing below the UI restricts paths). Paths are
+used byte for byte as Lean stores them: the decoder keeps a leading U+FEFF and rejects invalid
+UTF-8 (Lean strings are always valid). Names *added here* are NFC-normalised, so adding a file whose
+name matches an existing path only up to Unicode normalisation (e.g. an NFD name from another
+device) creates a second path rather than replacing it. Files over
 256 MiB are refused with a message giving the reason.
 
 ## 10. Tests and results
 
-Unit (`node --test test/unit/*.test.mjs`): 39 tests — codec vs Lean (5), links (19), core with the
-real engine (10), relay access (2), view (3), plus the mutation audit of §4. Engine checks: §0.
-End-to-end (`node test/e2e/run.mjs`): 25 scenarios, 62 runs; browsers per run in the table below (Chromium 154.0.8037.92, Firefox 146.0, Firefox ESR
+Unit (`node --test test/unit/*.test.mjs`): 43 tests — codec vs Lean (6), links (21), core with the
+real engine (11), relay access (2), view (3), plus the mutation audit of §4. Engine checks: §0.
+End-to-end (`node test/e2e/run.mjs`): 27 scenarios, 66 runs; browsers per run in the table below (Chromium 154.0.8037.92, Firefox 146.0, Firefox ESR
 140.16.0esr, all headless, each device its own browser process and profile).
 
 | Scenario | Configurations (device A + B [+ C]) |
 |---|---|
+| `cold-load-many-files` | Chromium 154; Firefox 146 |
+| `incoming-write-or-publish-failure` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146 |
 | `empty-file-then-normal-file` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146; Chromium 154 + Firefox 146 |
 | `incoming-file-creation-fails-then-next-file` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146 |
 | `peer-leaves-mid-fetch-row-updates` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146 |
@@ -300,6 +312,13 @@ End-to-end (`node test/e2e/run.mjs`): 25 scenarios, 62 runs; browsers per run in
 | `file-size-limit-and-folder-drop` | Chromium 154; Firefox 146 |
 
 `same-replica-id-refused` runs two profiles of one browser, the second a copy of the first.
+
+**Scale in the browser** (`COLD_LOAD_N=20000 node test/e2e/run.mjs --only cold-load-many-files`,
+measured once; the suite itself uses 3,000): 20,000 files of 16 bytes added in one batch took
+30 s in Chromium 154 and 181 s in Firefox 146. After a reload, all 20,000 rows were shown after
+3.6 s in both, and every size cell after 8.4 s (Chromium) and 34.8 s (Firefox), with 7 table
+renders. The sizes come from one OPFS lookup per file, done one after the other; Firefox is slow
+there. With 3,000 files: rows and sizes in 1.2 s (Chromium) and 1.6 s (Firefox), 7 renders.
 App bugs found by these tests and fixed: start-up hung in Firefox on `storage.persist()` (permission
 prompt); a host-driven write-retry loop while saves failed (§3); a restart lost the pending file-list
 refresh (§3); on `rollbackDetected` the Add button stayed enabled until the next status reply (a

@@ -19,7 +19,7 @@ const fmtSize = (n) => n == null ? '' : n < 1024 ? `${n} B` : n < 1048576 ? `${(
 
 export function createUI({ storage, getCore, transport, label }) {
   const state = { files: [], pending: [], status: null, peers: [], summary: null, sizes: new Map(),
-    saveFailed: false, rollback: false, restarts: 0, refused: [], messages: [], phase: 'idle', phaseInfo: null };
+    saveFailed: false, rollback: false, restarts: 0, refused: [], messages: [], phase: 'idle', phaseInfo: null, renders: 0 };
 
   function message(text, kind = 'info') {
     state.messages.push({ text, kind, at: Date.now() });
@@ -47,14 +47,25 @@ export function createUI({ storage, getCore, transport, label }) {
     onLog(line) { const pre = $('#log'); if (pre) { pre.textContent += line + '\n'; if (pre.textContent.length > 60000) pre.textContent = pre.textContent.slice(-40000); } },
   };
 
+  // Sizes come from OPFS, one lookup per present version. They are collected first and the table is
+  // rendered once per batch (not once per file: that was quadratic on a cold load of many files).
+  let sizesLoading = false;
   async function loadSizes() {
-    for (const f of state.files) for (const v of f.versions) {
-      const hx = Array.from(v.hash, (x) => x.toString(16).padStart(2, '0')).join('');
-      if (v.present && !state.sizes.has(hx)) {
-        try { state.sizes.set(hx, (await storage.blobFile(hx)).size); } catch { state.sizes.set(hx, null); }
+    if (sizesLoading) return;
+    sizesLoading = true;
+    try {
+      for (;;) {
+        const todo = [];
+        for (const f of state.files) for (const v of f.versions) {
+          if (!v.present) continue;
+          const hx = Array.from(v.hash, (x) => x.toString(16).padStart(2, '0')).join('');
+          if (!state.sizes.has(hx)) todo.push(hx);
+        }
+        if (!todo.length) return;
+        for (const hx of todo) { try { state.sizes.set(hx, (await storage.blobFile(hx)).size); } catch { state.sizes.set(hx, null); } }
         renderFiles();
       }
-    }
+    } finally { sizesLoading = false; }
   }
 
   // ------------------------------------------------------------ rendering
@@ -116,6 +127,7 @@ export function createUI({ storage, getCore, transport, label }) {
   }
 
   function renderFiles() {
+    state.renders++;
     const tbody = $('#files'); tbody.replaceChildren();
     const rows = buildRows(state.files, state.pending);
     const editable = getCore()?.canEdit() ?? false;

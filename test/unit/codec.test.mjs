@@ -95,3 +95,15 @@ test('encoder rejects malformed JS values', () => {
   assert.throws(() => C.decodeEffects(Uint8Array.from([1, 4, 1, 7, 0])), /sendAgain/);
   assert.throws(() => C.decodeEffects(Uint8Array.from([1, 4, 1, 2, 0x80, 0x00, 0])), /non-canonical/);
 });
+
+test('paths round-trip byte for byte: leading U+FEFF kept, invalid UTF-8 rejected', () => {
+  const bom = '\uFEFFnotes.txt';
+  const ev = C.encodeEvent({ type: 'resolve', path: bom, hash: new Uint8Array(32) });
+  assert.deepEqual([...ev.subarray(5, 8)], [0xef, 0xbb, 0xbf], 'BOM encoded');
+  // a snapshot reply carrying that path: 01 04 | 1 effect | 6 reply | 0 snapshot | 1 file | path | 0 versions
+  const pb = new TextEncoder().encode(bom);
+  const env = Uint8Array.from([1, 4, 1, 6, 0, 1, pb.length, ...pb, 0]);
+  assert.equal(C.decodeEffects(env)[0].files[0].path, bom);
+  const bad = Uint8Array.from([1, 4, 1, 6, 0, 1, 2, 0xc3, 0x28, 0]);   // invalid UTF-8
+  assert.throws(() => C.decodeEffects(bad), C.CodecError);
+});

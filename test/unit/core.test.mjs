@@ -160,3 +160,20 @@ test('supersession uses the versions captured when the user acted, not those pre
   // 8 supersedes only 7 (what was shown when the user acted): 9 survives, as a conflict.
   assert.equal(t.core.st.lastSnapshot.find((f) => f.path === 'p').versions.length, 2);
 });
+
+test('an add that spans an engine restart is not applied to the new machine; its blobs are still reported', async () => {
+  const t = setup();
+  await t.core.start(); await sleep(150);
+  let release; const slow = new Promise((r) => { release = r; });
+  const orig = t.storage.storeLocal; t.storage.storeLocal = async (b) => { await slow; return orig(b); };
+  const pending = t.core.addFiles([{ name: 'q', blob: new Blob([new Uint8Array([4])]) }]);
+  t.trap.next = 1; t.core.emit({ type: 'query', q: 'status' });
+  await sleep(150);
+  assert.equal(t.core.st.instances, 2);
+  const n = t.seen.length;
+  release(); const r = await pending; await sleep(150);
+  assert.equal(r.added, 0); assert.match(r.errors[0].error, /restarted/);
+  assert.ok(!t.seen.slice(n).includes(5), 'no localOp reached the new machine');
+  assert.ok(t.seen.slice(n).includes(12), 'the stored blob was reported (blobsStored)');
+  assert.ok(!t.core.st.lastSnapshot.some((f) => f.path === 'q'));
+});

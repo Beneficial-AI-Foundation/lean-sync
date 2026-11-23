@@ -1533,7 +1533,7 @@ def sampleEvents (st : State) : List Event :=
     .received ⟨300⟩ (encodeMessage (.hello 1 big (mkDigest (ByteArray.mk (Array.replicate 32 9))))), .received ⟨1⟩ ByteArray.empty,
     .localOp (.putMany []), .localOp (.putMany [{ path := "日本/ファイル \"q\" \\ x", hash := h32 4, supersedes := [h32 5, h32 6] }, { path := "", hash := h32 7, supersedes := [] }]),
     .localOp (.deleteMany []), .localOp (.deleteMany [{ path := "a", supersedes := none }, { path := "b/c", supersedes := some [] }, { path := "d", supersedes := some [h32 8] }]),
-    .localOp (.resolve "x y" (h32 9)),
+    .localOp (.resolve "x y" (h32 9)), .localOp (.resolve "\uFEFFbom-first.txt" (h32 9)),
     .persisted 0 (mkDigest (ByteArray.mk (Array.replicate 32 0xAB))), .persisted 1099511627776 (mkDigest (ByteArray.mk (Array.replicate 32 1))),
     .persistFailed 0, .persistFailed 16384,
     .blobStored (h32 10) none, .blobStored (h32 11) (some p),
@@ -1558,7 +1558,7 @@ def sampleEffectLists (st : State) : List (List Effect) :=
      .notify .alreadyInitialized, .notify (.pendingSummary 0 0 0), .notify (.pendingSummary 32 1 4096), .notify .saveFailed],
     reasons.map (fun r => .notify (.peerClosed p r (r == .incompatible))),
     errs.map (fun e => .notify (.peerError p e)) ++ errs.map (fun e => .notify (.badEvent e)) ++ errs.map (fun e => .notify (.startupFailed e)),
-    [.reply (.snapshot []), .reply (.snapshot [("a", [⟨h32 1, true⟩, ⟨h32 2, false⟩]), ("b/ü", []), ("c", [⟨h32 3, false⟩])]),
+    [.reply (.snapshot []), .reply (.snapshot [("a", [⟨h32 1, true⟩, ⟨h32 2, false⟩]), ("b/ü", []), ("c", [⟨h32 3, false⟩]), ("\uFEFFbom", [⟨h32 4, true⟩])]),
      .reply (.pending []), .reply (.pending [(h32 3, .waiting), (h32 4, .requested p), (h32 5, .queued)]),
      .reply (.status false false false []), .reply (.status true true true [(p, .handshaking), (⟨78⟩, .syncing), (⟨79⟩, .inSync)])] ]
 

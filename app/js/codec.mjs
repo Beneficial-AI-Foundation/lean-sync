@@ -138,7 +138,10 @@ export function encodeEvent(ev) {
 
 // ---------------------------------------------------------------- reader
 
-const utf8d = new TextDecoder('utf-8', { fatal: true });
+// ignoreBOM: a path may legitimately start with U+FEFF; the default decoder would strip it and the
+// UI would then name a different path than the one Lean stores. fatal: Lean's strings are always
+// valid UTF-8 (a String invariant), so invalid bytes mean a broken envelope and are rejected.
+const utf8d = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 class Reader {
   constructor(b) { this.b = b; this.pos = 0; }

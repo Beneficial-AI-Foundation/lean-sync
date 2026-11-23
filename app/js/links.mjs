@@ -179,6 +179,9 @@ export function createLinks(o) {
     switch (t) {
       case T.MSG: {
         const more = f[1] === 1; const part = f.subarray(2);
+        // Our framing sends every fragment but the last at exactly FRAME_PAYLOAD bytes; anything else
+        // (e.g. a stream of empty continuations) would let a peer grow inParts without bound.
+        if (more && part.length !== FRAME_PAYLOAD) { o.log(`peer ${c.peer}: malformed message fragment (${part.length} bytes); closing`); kill(c); return; }
         c.inSize += part.length;
         if (c.inSize > MAX_MESSAGE_BYTES) { o.log(`peer ${c.peer}: message over ${MAX_MESSAGE_BYTES} bytes; closing`); kill(c); return; }
         c.inParts.push(part.slice());
@@ -248,10 +251,17 @@ export function createLinks(o) {
     s.received += bytes.length;
     const chunk = bytes.slice();
     s.chain = s.chain.then(async (sink) => {
-      await sink.write(chunk);
+      await sink.write(chunk);                          // rejects on a storage error
       s.written += chunk.length;
       if (c.alive && !s.failed) grant(c, s);
       return sink;
+    });
+    // On the first storage error: no more credit, report the failure, tell the sender to stop.
+    s.chain.catch((e) => {
+      if (c.recv.get(hx) !== s || s.failed) return;
+      o.onStorageError?.(e);
+      failStream(c, s.hash, `could not write it (${e?.message ?? e})`);
+      if (c.alive) push(c, u8(T.ABORT, s.hash));
     });
   }
   function onEnd(c, h) {
@@ -273,13 +283,13 @@ export function createLinks(o) {
     const hx = hex(hash), s = c.recv.get(hx);
     o.log(`peer ${c.peer}: blob ${hx.slice(0, 8)} failed: ${why}`);
     c.recv.delete(hx); c.expected.delete(hx);
-    if (s) { s.failed = true; s.chain.then((sink) => sink.abort(), () => {}); }
+    if (s) { s.failed = true; s.sink.then((sink) => sink.abort(), () => {}); }
     o.emit({ type: 'blobFailed', peer: c.peer, hash }, c.epoch);
   }
 
   // ------------------------------------------------------------ teardown
   function discard(c) {
-    for (const s of c.recv.values()) { s.failed = true; s.chain.then((sink) => sink.abort(), () => {}); }
+    for (const s of c.recv.values()) { s.failed = true; s.sink.then((sink) => sink.abort(), () => {}); }
     c.recv.clear(); c.expected.clear(); c.q = [];
     if (serving && serving.conn === c) finishServing();
   }
