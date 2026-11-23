@@ -1102,4 +1102,653 @@ theorem step_plans_blobs' (n : Node) (ev : Event) (h : n.Inv) (n' : Node)
     · exact .inl h1
     · exact .inr (Nat.le_antisymm (hcap _ (List.mem_map_of_mem hy)) h2)
 
+/-! ## What a step emits -/
+
+/-- The effects `handle` may emit: no persist, no state, no hello/digest, no fetch. -/
+def HandleEff : Effect → Prop
+  | .send _ (.bye _) => True
+  | .send _ (.have _) => True
+  | .send _ (.noBlob _) => True
+  | .close _ _ => True
+  | .serveBlob _ _ => True
+  | .notify _ => True
+  | .reply _ => True
+  | _ => False
+
+theorem gotBlob_effs (n : Node) (hb : Hash) : ∀ e ∈ (gotBlob n hb).2,
+    ∃ s ∈ n.sessions, hb ∈ s.toldNo ∧ e = .send s.peer (.have [hb]) := by
+  unfold gotBlob
+  split
+  · simp
+  · intro e he
+    simp only [List.mem_filterMap] at he
+    obtain ⟨s, hs, hse⟩ := he
+    split at hse
+    · next hm => simp only [Option.some.injEq] at hse; exact ⟨s, hs, hm, hse.symm⟩
+    · cases hse
+
+theorem gotBlobs_effs_handle (n : Node) (hs : List Hash) : ∀ e ∈ (gotBlobs n hs).2, HandleEff e := by
+  unfold gotBlobs
+  suffices ∀ (l : List Hash) (acc : Node × List Effect), (∀ e ∈ acc.2, HandleEff e) →
+      ∀ e ∈ (l.foldl (fun (acc : Node × List Effect) h => ((gotBlob acc.1 h).1, acc.2 ++ (gotBlob acc.1 h).2)) acc).2,
+        HandleEff e by
+    exact this hs (n, []) (by simp)
+  intro l
+  induction l with
+  | nil => intro acc h; exact h
+  | cons x xs ih =>
+    intro acc h
+    apply ih
+    intro e he
+    simp only [List.mem_append] at he
+    rcases he with he | he
+    · exact h e he
+    · obtain ⟨s, -, -, rfl⟩ := gotBlob_effs acc.1 x e he; trivial
+
+theorem heff_ite_notify (c : Bool) (x : Notice) :
+    ∀ e ∈ (if c = true then [Effect.notify x] else []), HandleEff e := by
+  intro e he; split at he <;> simp at he; subst he; trivial
+
+theorem onMessage_effs (n : Node) (s : Session) (msg : Message) :
+    ∀ e ∈ (onMessage n s msg).2, HandleEff e := by
+  unfold onMessage closeWith
+  split
+  · split
+    · split
+      · simp [HandleEff]
+      · split
+        · simp [HandleEff]
+        · simp
+    · simp [HandleEff]
+  · cases msg with
+    | hello => simp [HandleEff]
+    | digest d => simp
+    | state d st =>
+      simp only
+      intro e he
+      split at he
+      · split at he
+        · split at he <;> exact heff_ite_notify _ _ e he
+        · split at he <;>
+          · simp only [List.mem_append, List.mem_singleton] at he
+            rcases he with he | rfl
+            · exact heff_ite_notify _ _ e he
+            · trivial
+      · split at he <;>
+        · simp only [List.mem_append, List.mem_cons, List.mem_singleton, List.not_mem_nil, or_false] at he
+          rcases he with ((rfl | rfl) | he) | rfl
+          · trivial
+          · trivial
+          · exact heff_ite_notify _ _ e he
+          · trivial
+    | want hs =>
+      simp only
+      split
+      · intro e he; simp only [List.mem_map] at he; obtain ⟨_, _, rfl⟩ := he; trivial
+      · intro e he
+        simp only [List.mem_append, List.mem_map, List.mem_singleton] at he
+        rcases he with ⟨_, _, rfl⟩ | rfl <;> trivial
+    | noBlob hs => simp [HandleEff]
+    | «have» hs => simp [HandleEff]
+    | bye r => simp [HandleEff]
+
+theorem handle_effs (n : Node) (ev : Event) : ∀ e ∈ (handle n ev).2, HandleEff e := by
+  cases ev with
+  | received p b =>
+    simp only [handle]
+    split
+    · simp
+    · split
+      · simp [closeWith, HandleEff]
+      · exact onMessage_effs _ _ _
+  | localOp op =>
+    simp only [handle]
+    split
+    · simp [HandleEff]
+    · split
+      · intro e he
+        simp only [List.mem_cons] at he
+        rcases he with rfl | he
+        · trivial
+        · exact gotBlobs_effs_handle _ _ e he
+      · simp [HandleEff]
+  | blobStored hb src =>
+    simp only [handle]
+    split
+    · simp
+    · intro e he
+      simp only [List.mem_cons] at he
+      rcases he with rfl | he
+      · trivial
+      · exact gotBlobs_effs_handle _ _ e he
+  | connected p => simp only [handle]; split; simp; split <;> simp [HandleEff]
+  | disconnected p => simp only [handle]; split <;> simp [HandleEff]
+  | persisted t d => simp only [handle]; split; split <;> simp; simp
+  | persistFailed t => simp only [handle]; split; split <;> simp; simp
+  | blobFailed p hb => simp only [handle]; split; split <;> simp [HandleEff]; simp
+  | blobLost hb => simp only [handle]; split <;> simp [HandleEff]
+  | init => simp [handle, HandleEff]
+  | initFresh => simp [handle, HandleEff]
+  | query q => simp [handle, HandleEff]
+
+/-- `handle` leaves the persistence bookkeeping alone, except when the host answers the persist in
+flight. -/
+def Answers (t : Nat) (ev : Event) : Prop := (∃ d, ev = .persisted t d) ∨ ev = .persistFailed t
+
+theorem onMessage_pframe (n : Node) (s : Session) (msg : Message) :
+    let n' := (onMessage n s msg).1
+    n'.inflight = n.inflight ∧ n'.published = n.published ∧ n'.nextTag = n.nextTag := by
+  unfold onMessage closeWith
+  split
+  · split
+    · split
+      · exact ⟨rfl, rfl, rfl⟩
+      · split <;> exact ⟨rfl, rfl, rfl⟩
+    · exact ⟨rfl, rfl, rfl⟩
+  · cases msg with
+    | state d st =>
+      simp only
+      split
+      · split
+        · split <;> exact ⟨rfl, rfl, rfl⟩
+        · split <;> exact ⟨rfl, rfl, rfl⟩
+      · split <;> exact ⟨rfl, rfl, rfl⟩
+    | want hs => simp only; split <;> exact ⟨rfl, rfl, rfl⟩
+    | _ => exact ⟨rfl, rfl, rfl⟩
+
+theorem handle_persistence (n : Node) (ev : Event) :
+    let n' := (handle n ev).1
+    n'.nextTag = n.nextTag ∧
+    ((n'.inflight = n.inflight ∧ n'.published = n.published) ∨
+     (∃ t s, n.inflight = some (t, s) ∧ Answers t ev ∧ n'.inflight = none ∧
+       (n'.published = n.published ∨ ∃ d, ev = .persisted t d ∧ n'.published = some ⟨s, d⟩))) := by
+  cases ev with
+  | received p b =>
+    simp only [handle]
+    split
+    · exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+    · split
+      · exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+      · obtain ⟨h1, h2, h3⟩ := onMessage_pframe n _ _
+        exact ⟨h3, .inl ⟨h1, h2⟩⟩
+  | localOp op =>
+    simp only [handle]
+    split
+    · exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+    · split
+      · obtain ⟨-, -, h3, h4, h5, -, -⟩ := gotBlobs_frame (n.withCurrent (applyOp n.current n.self op)) (opHashes op)
+        exact ⟨h5, .inl ⟨h4, h3⟩⟩
+      · exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+  | blobStored hb src =>
+    obtain ⟨-, -, h3, h4, h5, -, -⟩ := gotBlobs_frame n [hb]
+    exact ⟨h5, .inl ⟨h4, h3⟩⟩
+  | persisted t d =>
+    simp only [handle]
+    split
+    · next t' s hi =>
+      split
+      · next ht => subst ht; exact ⟨rfl, .inr ⟨t', s, hi, .inl ⟨d, rfl⟩, rfl, .inr ⟨d, rfl, rfl⟩⟩⟩
+      · exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+    · exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+  | persistFailed t =>
+    simp only [handle]
+    split
+    · next t' s hi =>
+      split
+      · next ht => subst ht; exact ⟨rfl, .inr ⟨t', s, hi, .inr rfl, rfl, .inl rfl⟩⟩
+      · exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+    · exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+  | connected p => simp only [handle]; split; exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩; split <;> exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+  | disconnected p => simp only [handle]; split <;> exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+  | blobFailed p hb =>
+    simp only [handle]; split; split <;> exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩; exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+  | blobLost hb => simp only [handle]; split <;> exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+  | init => exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+  | initFresh => exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+  | query q => exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+
+/-- An unanswered persist stays in flight through `handle`. -/
+theorem handle_keeps_inflight {n : Node} {ev : Event} {t : Nat} {s : State}
+    (hi : n.inflight = some (t, s)) (hna : ¬ Answers t ev) : (handle n ev).1.inflight = some (t, s) := by
+  rcases (handle_persistence n ev).2 with ⟨h1, -⟩ | ⟨t', s', hi', ha, -, -⟩
+  · rw [h1, hi]
+  · rw [hi] at hi'; simp only [Option.some.injEq, Prod.mk.injEq] at hi'; obtain ⟨rfl, rfl⟩ := hi'
+    exact absurd ha hna
+
+/-! ### The passes after `persistPass` -/
+
+def LateEff (n : Node) : Effect → Prop
+  | .send p (.hello _ _ _) => ∃ x ∈ n.sessions, x.peer = p
+  | .send p (.digest _) => ∃ x ∈ n.sessions, x.peer = p
+  | .send p (.state d s) => (∃ x ∈ n.sessions, x.peer = p) ∧ ∃ P, n.published = some P ∧ d = P.digest ∧ s = P.state
+  | .fetch p c => FetchOk n.missing n.sessions (.fetch p c)
+  | .notify _ => True
+  | _ => False
+
+theorem reconcileSession_effs (self : ReplicaId) (rb : Bool) (P : Published) (s : Session) :
+    ∀ e ∈ (reconcileSession self rb P s).2,
+      e = .send s.peer (.hello 1 self P.digest) ∨ e = .send s.peer (.state P.digest P.state) ∨
+      e = .send s.peer (.digest P.digest) := by
+  have hp : ∀ e ∈ (helloPart self P s).2, e = .send s.peer (.hello 1 self P.digest) := by
+    unfold helloPart; split <;> simp
+  have hpeer : (helloPart self P s).1.peer = s.peer := by unfold helloPart; split <;> rfl
+  unfold reconcileSession
+  simp only
+  split
+  · split
+    · intro e he; simp only [List.mem_append, List.mem_singleton] at he
+      rcases he with he | rfl
+      · exact .inl (hp e he)
+      · exact .inr (.inl (by rw [hpeer]))
+    · split
+      · intro e he; simp only [List.mem_append, List.mem_singleton] at he
+        rcases he with he | rfl
+        · exact .inl (hp e he)
+        · exact .inr (.inr (by rw [hpeer]))
+      · intro e he; exact .inl (hp e he)
+  · intro e he; exact .inl (hp e he)
+
+theorem reconcilePass_effs (n : Node) : ∀ e ∈ (reconcilePass n).2, LateEff n e := by
+  unfold reconcilePass
+  split
+  · simp
+  · next P hP =>
+    intro e he
+    simp only [List.mem_flatMap] at he
+    obtain ⟨s, hs, he⟩ := he
+    rcases reconcileSession_effs n.self n.rollback P s e he with rfl | rfl | rfl
+    · exact ⟨s, hs, rfl⟩
+    · exact ⟨⟨s, hs, rfl⟩, P, hP, rfl, rfl⟩
+    · exact ⟨s, hs, rfl⟩
+
+theorem planPass_effs {n : Node} (h : n.Inv) : ∀ e ∈ (planPass n).2, LateEff n e := by
+  obtain ⟨l', -, -, hes, -⟩ := planPass_spec h
+  intro e he
+  obtain ⟨x, hx, c, rfl, rest⟩ := hes e he
+  exact ⟨x, hx, c, rfl, rest⟩
+
+theorem reportPass_effs (n : Node) : ∀ e ∈ (reportPass n).2, LateEff n e := by
+  unfold reportPass
+  simp only
+  have : ∀ e ∈ n.sessions.filterMap (fun s =>
+      if (sessionStatus n s == s.reported) = true then none
+      else some (Effect.notify (.peerStatus s.peer (sessionStatus n s) s.peerReplica))), LateEff n e := by
+    intro e he
+    simp only [List.mem_filterMap] at he
+    obtain ⟨s, -, hse⟩ := he
+    split at hse
+    · cases hse
+    · simp only [Option.some.injEq] at hse; subst hse; trivial
+  split
+  · exact this
+  · intro e he; simp only [List.mem_append, List.mem_singleton] at he
+    rcases he with he | rfl
+    · exact this e he
+    · trivial
+
+theorem late_frame_reconcile (n : Node) :
+    (reconcilePass n).1.inflight = n.inflight ∧ (reconcilePass n).1.nextTag = n.nextTag := by
+  unfold reconcilePass; split <;> exact ⟨rfl, rfl⟩
+
+theorem late_frame_plan (n : Node) :
+    (planPass n).1.inflight = n.inflight ∧ (planPass n).1.nextTag = n.nextTag := ⟨rfl, rfl⟩
+
+theorem late_frame_report (n : Node) :
+    (reportPass n).1.inflight = n.inflight ∧ (reportPass n).1.nextTag = n.nextTag := by
+  unfold reportPass; simp only; split <;> exact ⟨rfl, rfl⟩
+
+/-! ### `finish` and persistence -/
+
+theorem lateEff_not_persist {n : Node} {e : Effect} (h : LateEff n e) : ∀ t s, e ≠ .persist t s := by
+  intro t s he; subst he; exact h
+
+theorem lateEff_state {n : Node} {p : PeerId} {d : Digest} {s : State} (h : LateEff n (.send p (.state d s))) :
+    ∃ P, n.published = some P ∧ d = P.digest ∧ s = P.state := h.2
+
+/-- The effects of `finish` after the persist pass, as `LateEff` of the node they were computed on. -/
+theorem finish_mem {n : Node} (h : n.Inv) {e : Effect} (he : e ∈ (finish n).2) :
+    e ∈ (persistPass n).2 ∨ ∃ m : Node, Core (persistPass n).1 m ∧ LateEff m e := by
+  unfold finish at he
+  simp only [List.mem_append] at he
+  have hi1 := persistPass_inv h
+  have hi2 := reconcilePass_inv hi1
+  have hi3 := planPass_inv hi2
+  rcases he with ((he | he) | he) | he
+  · exact .inl he
+  · exact .inr ⟨_, ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, reconcilePass_effs _ e he⟩
+  · exact .inr ⟨_, reconcilePass_core _, planPass_effs hi2 e he⟩
+  · exact .inr ⟨_, (reconcilePass_core _).trans (planPass_core _), reportPass_effs _ e he⟩
+
+theorem finish_frame (n : Node) :
+    (finish n).1.inflight = (persistPass n).1.inflight ∧ (finish n).1.nextTag = (persistPass n).1.nextTag := by
+  unfold finish
+  simp only
+  rw [(late_frame_report _).1, (late_frame_report _).2, (late_frame_plan _).1, (late_frame_plan _).2,
+    (late_frame_reconcile _).1, (late_frame_reconcile _).2]
+  exact ⟨rfl, rfl⟩
+
+theorem finish_persist {n : Node} (h : n.Inv) {t : Nat} {s : State} (he : .persist t s ∈ (finish n).2) :
+    n.inflight = none ∧ t = n.nextTag ∧ s = n.current ∧ (finish n).1.inflight = some (t, s) ∧
+      (finish n).1.nextTag = t + 1 := by
+  rcases finish_mem h he with he | ⟨m, -, hl⟩
+  · unfold persistPass at he
+    split at he
+    · next hc =>
+      simp only [List.mem_singleton, Effect.persist.injEq] at he
+      obtain ⟨rfl, rfl⟩ := he
+      simp only [Bool.and_eq_true, Option.isNone_iff_eq_none] at hc
+      obtain ⟨hf1, hf2⟩ := finish_frame n
+      unfold persistPass at hf1 hf2
+      simp only [hc.1, hc.2, Option.isNone_none, Bool.and_self, ite_true] at hf1 hf2
+      exact ⟨hc.1, rfl, rfl, hf1, hf2⟩
+    · simp at he
+  · exact absurd rfl (lateEff_not_persist hl t s)
+
+theorem finish_keeps {n : Node} (h : n.Inv) {x : Nat × State} (hi : n.inflight = some x) :
+    (finish n).1.inflight = some x ∧ (finish n).1.nextTag = n.nextTag ∧
+      ∀ t s, .persist t s ∉ (finish n).2 := by
+  refine ⟨?_, ?_, fun t s he => ?_⟩
+  · rw [(finish_frame n).1]; unfold persistPass; simp [hi]
+  · rw [(finish_frame n).2]; unfold persistPass; simp [hi]
+  · have := (finish_persist h he).1; rw [hi] at this; cases this
+
+theorem finish_inflight_cases {n : Node} (h : n.Inv) {t : Nat} {s : State}
+    (hi : (finish n).1.inflight = some (t, s)) : .persist t s ∈ (finish n).2 ∨ n.inflight = some (t, s) := by
+  rw [(finish_frame n).1] at hi
+  unfold persistPass at hi
+  split at hi
+  · next hc =>
+    left
+    simp only [Option.some.injEq, Prod.mk.injEq] at hi
+    obtain ⟨rfl, rfl⟩ := hi
+    unfold finish
+    simp only [List.mem_append]
+    left; left; left
+    unfold persistPass; simp [hc]
+  · exact .inr hi
+
+theorem finish_nextTag_le (n : Node) : n.nextTag ≤ (finish n).1.nextTag := by
+  rw [(finish_frame n).2]; unfold persistPass; split <;> simp
+
+theorem finish_state {n : Node} (h : n.Inv) {p : PeerId} {d : Digest} {s : State}
+    (he : .send p (.state d s) ∈ (finish n).2) : ∃ P, n.published = some P ∧ d = P.digest ∧ s = P.state := by
+  rcases finish_mem h he with he | ⟨m, hc, hl⟩
+  · unfold persistPass at he; split at he <;> simp at he
+  · obtain ⟨P, hP, rfl, rfl⟩ := lateEff_state hl
+    exact ⟨P, by rw [← (persistPass_core n).published, ← hc.published]; exact hP, rfl, rfl⟩
+
+/-! ### `step` and persistence -/
+
+theorem step_running (n : Node) (ev : Event) :
+    step (.running n) ev = (.running (finish (handle n ev).1).1, (handle n ev).2 ++ (finish (handle n ev).1).2) := rfl
+
+theorem handle_no_persist (n : Node) (ev : Event) (t : Nat) (s : State) : .persist t s ∉ (handle n ev).2 :=
+  fun he => handle_effs n ev _ he
+
+theorem handle_no_state (n : Node) (ev : Event) (p : PeerId) (d : Digest) (s : State) :
+    .send p (.state d s) ∉ (handle n ev).2 :=
+  fun he => handle_effs n ev _ he
+
+/-! ### Start-up -/
+
+theorem startNode_facts (self : ReplicaId) {s : State} (hs : s.WireOk) (blobs : List Hash) :
+    let r := startNode self s blobs
+    r.1.published = none ∧ r.1.nextTag = 1 ∧ r.1.inflight = some (0, s) ∧
+      (∀ t s', .persist t s' ∈ r.2 → t = 0 ∧ s' = s) ∧ .persist 0 s ∈ r.2 ∧
+      (∀ p d s', .send p (.state d s') ∉ r.2) := by
+  let n0 : Node := { self, current := s, blobs := sortDedup blobs, missing := computeMissing s (sortDedup blobs), dirty := true }
+  have h0 : n0.Inv := {
+    currentOk := hs
+    publishedOk := fun _ hP => by simp [n0] at hP
+    publishedLe := fun _ hP => by simp [n0] at hP
+    inflightOk := fun _ _ hx => by simp [n0] at hx
+    inflightLe := fun _ _ hx => by simp [n0] at hx
+    tagFresh := fun _ _ hx => by simp [n0] at hx
+    blobsSorted := sorted_sortDedup _
+    missingSorted := sorted_computeMissing _ (sorted_sortDedup _)
+    missingSpec := fun z => by rw [mem_computeMissing _ (sorted_sortDedup _)]; rfl
+    sessionsSorted := List.Pairwise.nil
+    sessionCap := by simp [n0, maxSessions]
+    sessOk := fun _ hx => by simp [n0] at hx }
+  have hpers : .persist 0 s ∈ (finish n0).2 := by
+    unfold finish; simp only [List.mem_append]; left; left; left
+    unfold persistPass; simp [n0]
+  obtain ⟨-, -, -, hi, hn⟩ := finish_persist h0 hpers
+  refine ⟨?_, hn, hi, ?_, ?_, ?_⟩
+  · show (finish n0).1.published = none
+    rw [(finish_core n0).published]
+  · intro t s' he
+    simp only [startNode, List.mem_cons, reduceCtorEq, false_or] at he
+    obtain ⟨-, ht, hs', -⟩ := finish_persist h0 he
+    exact ⟨ht, hs'⟩
+  · simp only [startNode, List.mem_cons, reduceCtorEq, false_or]; exact hpers
+  · intro p d s' he
+    simp only [startNode, List.mem_cons, reduceCtorEq, false_or] at he
+    obtain ⟨P, hP, -⟩ := finish_state h0 he
+    simp [n0] at hP
+
+/-- What a step from the uninitialised machine can do. -/
+theorem step_uninit (ev : Event) :
+    ((step .uninit ev).1 = .uninit ∧ ∀ e ∈ (step .uninit ev).2, ∃ x, e = .notify x) ∨
+    ∃ self s blobs, s.WireOk ∧ step .uninit ev = (.running (startNode self s blobs).1, (startNode self s blobs).2) := by
+  cases ev with
+  | init self stored blobs =>
+    simp only [step]
+    split
+    · next s hdec => exact .inr ⟨self, s, blobs, wireOk_of_decodeState' hdec, rfl⟩
+    · exact .inl ⟨rfl, by simp⟩
+  | initFresh self blobs => exact .inr ⟨self, _, blobs, wireOk_empty, rfl⟩
+  | _ => exact .inl ⟨rfl, by simp [step]⟩
+
+/-! ## Traces -/
+
+def runF (acc : Machine × List (List Effect)) (ev : Event) : Machine × List (List Effect) :=
+  ((step acc.1 ev).1, (step acc.1 ev).2 :: acc.2)
+
+theorem run_eq (m : Machine) (evs : List Event) :
+    run m evs = ((evs.foldl runF (m, [])).1, (evs.foldl runF (m, [])).2.reverse) := rfl
+
+theorem foldl_runF_acc : ∀ (evs : List Event) (m : Machine) (acc : List (List Effect)),
+    evs.foldl runF (m, acc) = ((evs.foldl runF (m, [])).1, (evs.foldl runF (m, [])).2 ++ acc)
+  | [], m, acc => by simp
+  | e :: es, m, acc => by
+    simp only [List.foldl_cons, runF]
+    rw [foldl_runF_acc es _ ((step m e).2 :: acc), foldl_runF_acc es _ [(step m e).2]]
+    simp
+
+theorem run_append (m : Machine) (l1 l2 : List Event) :
+    run m (l1 ++ l2) = ((run (run m l1).1 l2).1, (run m l1).2 ++ (run (run m l1).1 l2).2) := by
+  simp only [run_eq, List.foldl_append]
+  rw [show l1.foldl runF (m, []) = ((l1.foldl runF (m, [])).1, (l1.foldl runF (m, [])).2) from rfl,
+    foldl_runF_acc l2]
+  simp
+
+theorem run_single (m : Machine) (e : Event) : run m [e] = ((step m e).1, [(step m e).2]) := by
+  simp [run_eq, runF]
+
+theorem run_length : ∀ (m : Machine) (evs : List Event), (run m evs).2.length = evs.length
+  | m, [] => by simp [run_eq]
+  | m, e :: es => by
+    rw [show e :: es = [e] ++ es from rfl, run_append, run_single]
+    simp [run_length _ es]
+
+/-- The machine before step `k`. -/
+def machineAt (evs : List Event) (k : Nat) : Machine := (run .uninit (evs.take k)).1
+
+/-- Effects of step `i` (0-based) of a run from the uninitialised machine. -/
+def effectsAt (evs : List Event) (i : Nat) : List Effect :=
+  ((run .uninit evs).2)[i]?.getD []
+
+theorem machineAt_zero (evs : List Event) : machineAt evs 0 = .uninit := by
+  simp [machineAt, run_eq]
+
+theorem take_succ_eq {evs : List Event} {k : Nat} (hk : k < evs.length) :
+    evs.take (k + 1) = evs.take k ++ [evs[k]] := by
+  rw [List.take_add_one, List.getElem?_eq_getElem hk]; rfl
+
+theorem machineAt_succ {evs : List Event} {k : Nat} (hk : k < evs.length) :
+    machineAt evs (k + 1) = (step (machineAt evs k) evs[k]).1 := by
+  unfold machineAt
+  rw [take_succ_eq hk, run_append, run_single]
+
+theorem effectsAt_eq {evs : List Event} {k : Nat} (hk : k < evs.length) :
+    effectsAt evs k = (step (machineAt evs k) evs[k]).2 := by
+  unfold effectsAt machineAt
+  have hsplit : evs = evs.take (k + 1) ++ evs.drop (k + 1) := (List.take_append_drop _ _).symm
+  conv => lhs; rw [hsplit]
+  rw [run_append, take_succ_eq hk, run_append, run_single]
+  have hl : (run .uninit (evs.take k)).2.length = k := by
+    rw [run_length, List.length_take]; omega
+  rw [List.append_assoc, List.getElem?_append_right (by omega), hl]
+  simp
+
+theorem effectsAt_ge {evs : List Event} {k : Nat} (hk : evs.length ≤ k) : effectsAt evs k = [] := by
+  unfold effectsAt
+  rw [List.getElem?_eq_none (by rw [run_length]; exact hk)]
+  rfl
+
+theorem machineAt_inv (evs : List Event) : ∀ k, (machineAt evs k).Inv
+  | 0 => by rw [machineAt_zero]; trivial
+  | k + 1 => by
+    by_cases hk : k < evs.length
+    · rw [machineAt_succ hk]; exact step_inv' _ _ (machineAt_inv evs k)
+    · unfold machineAt
+      rw [List.take_of_length_le (by omega)]
+      have := machineAt_inv evs evs.length
+      unfold machineAt at this
+      rwa [List.take_of_length_le (Nat.le_refl _)] at this
+
+/-- The host's answer to the persist with tag `t`. -/
+def AnswersAt (evs : List Event) (t k : Nat) : Prop :=
+  (∃ d, evs[k]? = some (.persisted t d)) ∨ evs[k]? = some (.persistFailed t)
+
+/-- What has happened to persists up to (not including) step `k`. -/
+structure TraceInv (evs : List Event) (k : Nat) : Prop where
+  uninitClean : machineAt evs k = .uninit → ∀ j < k, ∀ t s, .persist t s ∉ effectsAt evs j
+  published : ∀ n, machineAt evs k = .running n → ∀ P, n.published = some P →
+    ∃ j k' t d, j < k' ∧ k' < k ∧ .persist t P.state ∈ effectsAt evs j ∧ evs[k']? = some (.persisted t d)
+  inflight : ∀ n, machineAt evs k = .running n → ∀ t s, n.inflight = some (t, s) →
+    ∃ j < k, .persist t s ∈ effectsAt evs j
+  tagsBelow : ∀ n, machineAt evs k = .running n → ∀ j < k, ∀ t s, .persist t s ∈ effectsAt evs j →
+    t < n.nextTag
+  answered : ∀ n, machineAt evs k = .running n → ∀ j < k, ∀ t s, .persist t s ∈ effectsAt evs j →
+    (∃ k', j < k' ∧ k' < k ∧ AnswersAt evs t k') ∨ n.inflight = some (t, s)
+
+theorem answers_of {evs : List Event} {k t : Nat} (hk : k < evs.length) (h : Answers t evs[k]) :
+    AnswersAt evs t k := by
+  unfold AnswersAt
+  rw [List.getElem?_eq_getElem hk]
+  rcases h with ⟨d, hd⟩ | hd
+  · exact .inl ⟨d, by rw [hd]⟩
+  · exact .inr (by rw [hd])
+
+theorem traceInv (evs : List Event) : ∀ k, k ≤ evs.length → TraceInv evs k
+  | 0, _ => {
+      uninitClean := fun _ j hj => absurd hj (Nat.not_lt_zero _)
+      published := fun n hm => by rw [machineAt_zero] at hm; cases hm
+      inflight := fun n hm => by rw [machineAt_zero] at hm; cases hm
+      tagsBelow := fun n hm => by rw [machineAt_zero] at hm; cases hm
+      answered := fun n hm => by rw [machineAt_zero] at hm; cases hm }
+  | k + 1, hk1 => by
+    have hk : k < evs.length := by omega
+    have ih := traceInv evs k (by omega)
+    have hinv := machineAt_inv evs k
+    have hm' := machineAt_succ hk
+    have he := effectsAt_eq hk
+    -- persists emitted before step `k`, or at it
+    have hj : ∀ j, j < k + 1 → j < k ∨ j = k := fun j hj => by omega
+    cases hmk : machineAt evs k with
+    | uninit =>
+      rw [hmk] at hm' he
+      have hclean := ih.uninitClean hmk
+      rcases step_uninit evs[k] with ⟨hst, hnot⟩ | ⟨self, s, blobs, hs, hst⟩
+      · -- still uninitialised: no persist at step k either
+        rw [hst] at hm'
+        have hk0 : ∀ t s, .persist t s ∉ effectsAt evs k := by
+          intro t s hp; rw [he] at hp; obtain ⟨x, hx⟩ := hnot _ hp; cases hx
+        exact {
+          uninitClean := fun _ j hj' t s => by
+            rcases hj j hj' with hj' | rfl
+            · exact hclean j hj' t s
+            · exact hk0 t s
+          published := fun n hm => by rw [hm'] at hm; cases hm
+          inflight := fun n hm => by rw [hm'] at hm; cases hm
+          tagsBelow := fun n hm => by rw [hm'] at hm; cases hm
+          answered := fun n hm => by rw [hm'] at hm; cases hm }
+      · rw [hst] at hm' he
+        obtain ⟨hpub, hnext, hinfl, hpers, hpers0, -⟩ := startNode_facts self hs blobs
+        exact {
+          uninitClean := fun hm => by rw [hm'] at hm; cases hm
+          published := fun n hm P hP => by
+            rw [hm'] at hm; cases hm; rw [hpub] at hP; cases hP
+          inflight := fun n hm t s' hi => by
+            rw [hm'] at hm; cases hm; rw [hinfl] at hi
+            simp only [Option.some.injEq, Prod.mk.injEq] at hi; obtain ⟨rfl, rfl⟩ := hi
+            exact ⟨k, Nat.lt_succ_self _, by rw [he]; exact hpers0⟩
+          tagsBelow := fun n hm j hj' t s' hp => by
+            rw [hm'] at hm; cases hm
+            rcases hj j hj' with hj' | rfl
+            · exact absurd hp (hclean j hj' t s')
+            · rw [he] at hp; rw [(hpers t s' hp).1, hnext]; omega
+          answered := fun n hm j hj' t s' hp => by
+            rw [hm'] at hm; cases hm
+            rcases hj j hj' with hj' | rfl
+            · exact absurd hp (hclean j hj' t s')
+            · rw [he] at hp; obtain ⟨rfl, rfl⟩ := hpers t s' hp; exact .inr hinfl }
+    | running n =>
+      rw [hmk] at hm' he hinv
+      rw [step_running] at hm' he
+      simp only at hm' he
+      have hn : n.Inv := hinv
+      have hi1 : (handle n evs[k]).1.Inv := handle_inv hn _
+      obtain ⟨htag1, hpc⟩ := handle_persistence n evs[k]
+      exact {
+        uninitClean := fun hm => by rw [hm'] at hm; cases hm
+        published := fun n' hm P hP => by
+          rw [hm'] at hm; cases hm
+          rw [(finish_core _).published] at hP
+          rcases hpc with ⟨-, hp1⟩ | ⟨t, s, hi, -, -, hp1 | ⟨d, hev, hp1⟩⟩
+          · rw [hp1] at hP
+            obtain ⟨j, k', t, d, h1, h2, h3, h4⟩ := ih.published n hmk P hP
+            exact ⟨j, k', t, d, h1, by omega, h3, h4⟩
+          · rw [hp1] at hP
+            obtain ⟨j, k', t, d, h1, h2, h3, h4⟩ := ih.published n hmk P hP
+            exact ⟨j, k', t, d, h1, by omega, h3, h4⟩
+          · rw [hp1] at hP; simp only [Option.some.injEq] at hP; subst hP
+            obtain ⟨j, hj', hpj⟩ := ih.inflight n hmk t s hi
+            exact ⟨j, k, t, d, hj', Nat.lt_succ_self _, hpj, by rw [List.getElem?_eq_getElem hk, hev]⟩
+        inflight := fun n' hm t s hi => by
+          rw [hm'] at hm; cases hm
+          rcases finish_inflight_cases hi1 hi with hp | hp
+          · exact ⟨k, Nat.lt_succ_self _, by rw [he]; exact List.mem_append_right _ hp⟩
+          · rcases hpc with ⟨hf, -⟩ | ⟨t', s', -, -, hnone, -⟩
+            · rw [hf] at hp
+              obtain ⟨j, hj', hpj⟩ := ih.inflight n hmk t s hp
+              exact ⟨j, by omega, hpj⟩
+            · rw [hnone] at hp; cases hp
+        tagsBelow := fun n' hm j hj' t s hp => by
+          rw [hm'] at hm; cases hm
+          have hmono : n.nextTag ≤ (finish (handle n evs[k]).1).1.nextTag := by
+            have := finish_nextTag_le (handle n evs[k]).1; rw [htag1] at this; exact this
+          rcases hj j hj' with hj' | rfl
+          · exact Nat.lt_of_lt_of_le (ih.tagsBelow n hmk j hj' t s hp) hmono
+          · rw [he] at hp
+            simp only [List.mem_append] at hp
+            rcases hp with hp | hp
+            · exact absurd hp (handle_no_persist _ _ t s)
+            · obtain ⟨-, -, -, -, hnt⟩ := finish_persist hi1 hp; rw [hnt]; exact Nat.lt_succ_self t
+        answered := fun n' hm j hj' t s hp => by
+          rw [hm'] at hm; cases hm
+          rcases hj j hj' with hj' | rfl
+          · rcases ih.answered n hmk j hj' t s hp with ⟨k', h1, h2, h3⟩ | hfl
+            · exact .inl ⟨k', h1, by omega, h3⟩
+            · by_cases hans : Answers t evs[k]
+              · exact .inl ⟨k, hj', Nat.lt_succ_self _, answers_of hk hans⟩
+              · exact .inr (finish_keeps hi1 (handle_keeps_inflight hfl hans)).1
+          · rw [he] at hp
+            simp only [List.mem_append] at hp
+            rcases hp with hp | hp
+            · exact absurd hp (handle_no_persist _ _ t s)
+            · exact .inr (finish_persist hi1 hp).2.2.2.1 }
+
 end LeanSync
