@@ -66,6 +66,7 @@ expect_crash control 20000
 expect_pass scale 20000
 expect_pass unit
 expect_pass sim 1 40
+expect_pass delbench 100000 fast
 
 if [ $fail -eq 0 ]; then echo "ALL OK"; else echo "SOME CHECKS FAILED"; fi
 exit $fail

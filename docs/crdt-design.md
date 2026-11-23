@@ -93,6 +93,8 @@ bytes. A decoder must re-check sortedness, positivity and coverage to rebuild th
 | `put s self p h supersedes` | write version `h` of `p` with dot `(self, ctx(self)+1)`; drop the local versions of `p` whose hash is in `supersedes` |
 | `putMany s self items` | batch put: sort the batch, then one pass over the state; **proved equal** to the `put`s one after the other (`putSeq`) |
 | `delete s p supersedes` | drop the local versions of `p` whose hash is in `supersedes`; issues no dot |
+| `deleteMany s items` | batch delete in one pass; each `DeleteItem` is `{path, supersedes : Option (List Hash)}`, where `some S` means `delete s path S` and `none` means "everything currently seen at `path`"; **proved equal** to the `delete`s one after the other (`deleteSeq`) |
+| `deletePaths s ps` | folder delete: `deleteMany` with `none` for every path; proved equal to `ps.foldl (fun s p => s.delete p (s.versions p)) s` |
 | `resolve s self p h` | `put s self p h (s.versions p)`: supersede every seen version (also the normal "edit") |
 | `paths s` | existing paths, strictly sorted by UTF-8 bytes |
 | `versions s p` | distinct current hashes of `p`, strictly sorted; `[]` = absent |
@@ -140,10 +142,20 @@ Definitions used below:
 8. **Batch:** `putMany_eq_putSeq : s.putMany r items = s.putSeq r items`. This holds unconditionally,
    so every law above transfers to `putMany`. Dots are assigned in list order: item `i` gets
    `ctx(self)+1+i`. When two items share a path, `putMany` falls back to `putSeq`.
+9. **Batch delete:**
+   - `deleteMany_eq_deleteSeq : s.deleteMany items = s.deleteSeq items`. This holds with no side
+     condition: repeated paths, absent paths and any order are allowed, because deletes commute and
+     issue no dot. So the laws about `delete` transfer to `deleteMany`.
+   - `deletePaths_eq : s.deletePaths ps = ps.foldl (fun s p => s.delete p (s.versions p)) s`.
+   - `mem_versions_deletePaths : x ∈ (s.deletePaths ps).versions q ↔ x ∈ s.versions q ∧ q ∉ ps`.
+   - `le_deleteMany`: like every local operation, `deleteMany` only grows the state.
+   - Decision 3 still holds. `deleteMany` leaves the context unchanged, as `delete` does, so
+     `put_survives_merge` applies to a merge with `b.deleteMany items` exactly as it does to
+     `b.delete p S`. A unit test checks this case explicitly.
 
 The 26 statements fixed in stage 1 are unchanged. A Lean file that restates each one verbatim and
 discharges it with the current theorem typechecks. The theorems added since stage 1 are
-`putSeq_spec`, `putMany_eq_putSeq` and helper lemmas.
+`putSeq_spec`, `putMany_eq_putSeq`, the batch-delete theorems below, and helper lemmas.
 
 `#print axioms` on the headline theorems lists only `propext`, `Classical.choice` and
 `Quot.sound`: the standard axioms that core tactics such as `simp` and `grind` rely on.
@@ -172,9 +184,14 @@ Deleting files costs no space.
 The script first builds the library, which checks every proof. It then greps `LeanCrdt/` for the
 forbidden constructs and runs the following tests:
 - **unit:** decisions 2 and 3, resolution, partial deletes, no resurrection, same-hash siblings,
-  rename, `putMany` with a repeated path, the snapshot, Unicode order;
+  rename, `putMany` with a repeated path, the snapshot, Unicode order.
+  - For `deleteMany`/`deletePaths`: repeated paths, an absent path, a path with siblings (partial
+    and full), an empty batch, equality with the sequential deletes, and a folder delete concurrent
+    with an edit on another replica (the edit wins, the other file stays deleted);
 - **sim:** 40 seeds × 300 random operations on 4 replicas.
-  - Operations: `put`, `delete`, `resolve`, `putMany`, `merge`.
+  - Operations: `put`, `delete`, `resolve`, `putMany`, `deleteMany`, `merge`.
+  - Each `deleteMany` uses random items: repeated paths, an absent path, `none` or random hash
+    lists. The simulation checks it against `deleteSeq` and checks that it only grows the state.
   - After each merge it checks:
     - commutativity, associativity, idempotence and the identity;
     - `merge` against a naive quadratic reference merge;
@@ -186,14 +203,15 @@ forbidden constructs and runs the following tests:
 - **scale:** 20,000 paths built with `putMany`. Two replicas diverge with 10,000 and 6,667 edits and
   2,858 deletes, then merge. The test checks the laws, the expected number of surviving paths
   (18,095) and of conflicts (2,857), single operations on the large state, and a smaller test of
-  300 single `put`s against `putMany`.
+  300 single `put`s against `putMany`. The 2,858 single deletes are checked equal to `deletePaths`
+  and to `deleteMany`.
 - **stack:** `main` runs on a thread whose stack is `LEAN_STACK_SIZE_KB`, plus a 128 KB buffer;
   the default is 1 GB, so plain `ulimit -s` has no effect. With it set to 256 KB:
   - a trivial non-tail recursion of depth 13,000 must crash. That is the spike's ~13k-frame
     browser budget, and the measured native maximum here is about 12,100 frames;
   - the non-tail *specification* `mergeSpec` must crash on the scale sizes, at about 4,850
     elements per list;
-  - scale, unit and sim must pass.
+  - scale, unit, sim and `delbench 100000 fast` (`deletePaths`/`deleteMany` on 100k paths) must pass.
   - "Crash" means exit status 134 (SIGABRT) **and** the runtime's "Stack overflow detected"
     message. Any other failure counts as a test failure. A self-check confirms that a bogus
     subcommand, which exits 2, is not mistaken for an overflow.
@@ -209,7 +227,17 @@ Measured on this machine with `crdt-tests bench [n]` (native, indicative):
 | `put` + `snapshot` | ≈ 1.4 ms | ≈ 18 ms |
 | `putMany` of 20k items onto a 20k-path state | ≈ 6.5 ms | |
 
-The whole 20k scale test takes about 0.6 s. Most of that is its 2,858 single deletes: each one is O(n).
+Deleting every 7th path (`crdt-tests delbench [n]`, one run each, native):
+
+| | 20k paths (2,858 deletes) | 100k paths (14,286 deletes) |
+|---|---|---|
+| single `delete`s (before) | ≈ 0.74 s | ≈ 21 s |
+| `deletePaths` (after) | ≈ 1.6 ms | ≈ 9.8 ms |
+| `deleteMany` with explicit hashes (after) | ≈ 2.2 ms | ≈ 24 ms |
+
+The single-delete figures varied by about 30% between runs: an earlier run measured 0.5 s and 18 s.
+The 20k scale test still runs its 2,858 single deletes on purpose, as the reference for
+`deletePaths`/`deleteMany`; they take most of its roughly 1 s.
 
 ## Cost (true bounds)
 
@@ -231,6 +259,7 @@ Costs count comparisons of paths, hashes and ids.
 | `paths` | O(n) | always |
 | `put` | O(n + r + k·\|S\|) | always, for small r and k |
 | `delete` | O(n + k·\|S\|) | always, for small k |
+| `deleteMany`, `deletePaths` | O(b log b + n), plus, per entry at a batch path, O(\|S\|) and the length of that path's run of repeated items | always |
 | `putMany` | O(b log b + n + r), plus O(\|S\|) per entry at a batch path; repeated paths fall back to `putSeq`, which is O(b·n) | paths in a batch are distinct |
 | `VersionVector.merge` | O(r) | always |
 
@@ -242,10 +271,10 @@ limits below.
 ## Remaining risks and limitations
 
 1. **Host rule** (above). This is the one integration rule whose violation loses data.
-2. **Point operations are O(n).** `put`, `delete` and `versions` rebuild or scan the list. Deleting
-   k files one at a time is O(k·n): 2,858 deletes on 20k paths took 0.5 s natively, and 14k deletes
-   on 100k paths took 18 s. Use `putMany` for bulk writes and `snapshot` for bulk reads. A proved
-   `deleteMany`, along the lines of `putMany`, is the obvious next step if bulk deletes matter.
+2. **Point operations are O(n).** `put`, `delete` and `versions` rebuild or scan the list, so k
+   single operations cost O(k·n). Use `putMany` for bulk writes, `deleteMany`/`deletePaths` for bulk
+   deletes, and `snapshot` for bulk reads. The measured before/after numbers for deletes are in
+   "Cost".
 3. **Not yet run under wasm.** The import closure is `Init` only, but startup time and size under
    wasm are not yet measured.
 4. **Deltas later** need non-contiguous contexts (dot sets) or causal delivery. The version-vector
