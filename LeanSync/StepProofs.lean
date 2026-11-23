@@ -1894,4 +1894,523 @@ theorem persist_one_in_flight' (evs : List Event) {j j' t t' : Nat} {s s' : Stat
     · have ha := (step_persist_running hn h').2 t s hfl
       exact ⟨j', hlt, Nat.le_refl _, answers_of hl' ha⟩
 
+/-! ## Every effect can be carried out -/
+
+/-- The host view agrees with the node: open sessions are open connections, known blobs are
+stored, and the persist in flight is the one the host is executing. -/
+def HostRel (v : HostView) : Machine → Prop
+  | .uninit => v.pendingPersist = none
+  | .running n => (∀ x ∈ n.sessions, x.peer ∈ v.peers) ∧ (∀ h ∈ n.blobs, h ∈ v.blobs) ∧
+      v.pendingPersist = n.inflight.map (·.1)
+
+theorem execAll_append (v : HostView) (l1 l2 : List Effect) :
+    v.execAll (l1 ++ l2) = (v.execAll l1).bind (fun v' => v'.execAll l2) := by
+  induction l1 generalizing v with
+  | nil => rfl
+  | cons e es ih =>
+    simp only [List.cons_append, HostView.execAll]
+    cases v.exec e with
+    | none => rfl
+    | some v' => exact ih v'
+
+theorem execAll_benign (v : HostView) : ∀ (l : List Effect), (∀ e ∈ l, v.exec e = some v) → v.execAll l = some v
+  | [], _ => rfl
+  | e :: es, h => by
+    simp only [HostView.execAll, h e (.head _)]
+    exact execAll_benign v es (fun e he => h e (.tail _ he))
+
+theorem exec_send {v : HostView} {p : PeerId} {m : Message} (hp : p ∈ v.peers) (hm : m.WireOk) :
+    v.exec (.send p m) = some v := by
+  simp [HostView.exec, hp, size_encodeMessage_le m hm]
+
+theorem exec_fetch {v : HostView} {p : PeerId} {hs : List Hash} (hp : p ∈ v.peers) (hm : HashBatchOk hs) :
+    v.exec (.fetch p hs) = some v := by
+  simp [HostView.exec, hp, size_encodeMessage_le (.want hs) hm]
+
+theorem mem_addBlobs (v : HostView) (hs : List Hash) (z : Hash) : z ∈ (v.addBlobs hs).blobs ↔ z ∈ v.blobs ∨ z ∈ hs := by
+  unfold HostView.addBlobs
+  simp only
+  induction hs generalizing v with
+  | nil => simp
+  | cons x xs ih =>
+    simp only [List.foldl_cons]
+    have := ih { v with blobs := if x ∈ v.blobs then v.blobs else x :: v.blobs }
+    simp only at this
+    rw [this]
+    split <;> simp <;> grind
+
+theorem hashBatchOk_single {h : Hash} (hs : h.bytes.size = hashLen) : HashBatchOk [h] :=
+  ⟨List.pairwise_singleton _ _, by simp, by simp [maxBatch], by simp [hs]⟩
+
+/-! ### `finish` -/
+
+theorem finish_exec {n : Node} (hn : n.Inv) {v : HostView} (hpeers : ∀ x ∈ n.sessions, x.peer ∈ v.peers)
+    (hblobs : ∀ h ∈ n.blobs, h ∈ v.blobs) (hpend : v.pendingPersist = n.inflight.map (·.1)) :
+    ∃ v2, v.execAll (finish n).2 = some v2 ∧ HostRel v2 (.running (finish n).1) := by
+  let r1 := persistPass n
+  have hi1 : r1.1.Inv := persistPass_inv hn
+  have hi2 : (reconcilePass r1.1).1.Inv := reconcilePass_inv hi1
+  -- the view after the persist pass
+  have hstep1 : ∃ v1, v.execAll r1.2 = some v1 ∧ v1.peers = v.peers ∧ v1.blobs = v.blobs ∧
+      v1.pendingPersist = r1.1.inflight.map (·.1) := by
+    show ∃ v1, v.execAll (persistPass n).2 = some v1 ∧ v1.peers = v.peers ∧ v1.blobs = v.blobs ∧
+      v1.pendingPersist = (persistPass n).1.inflight.map (·.1)
+    unfold persistPass
+    split
+    · next hc =>
+      simp only [Bool.and_eq_true, Option.isNone_iff_eq_none] at hc
+      have hsz := hn.currentOk.2
+      refine ⟨{ v with pendingPersist := some n.nextTag }, ?_, rfl, rfl, rfl⟩
+      simp [HostView.execAll, HostView.exec, hpend, hc.1, hsz]
+    · exact ⟨v, rfl, rfl, rfl, hpend⟩
+  obtain ⟨v1, hv1, hp1, hb1, hpend1⟩ := hstep1
+  -- sessions keep their peers through the later passes
+  have hpeers1 : ∀ x ∈ r1.1.sessions, x.peer ∈ v1.peers := by
+    rw [hp1]; intro x hx
+    have : r1.1.sessions = n.sessions := by show (persistPass n).1.sessions = n.sessions; unfold persistPass; split <;> rfl
+    rw [this] at hx; exact hpeers x hx
+  have hpeers2 : ∀ x ∈ (reconcilePass r1.1).1.sessions, x.peer ∈ v1.peers := by
+    unfold reconcilePass
+    split
+    · exact hpeers1
+    · intro x hx
+      simp only [List.mem_map] at hx
+      obtain ⟨y, hy, rfl⟩ := hx
+      rw [(reconcileSession_fields _ _ _ y).1]; exact hpeers1 y hy
+  obtain ⟨l', heq, hrel, -, -⟩ := planPass_spec hi2
+  have hpeers3 : ∀ x ∈ (planPass (reconcilePass r1.1).1).1.sessions, x.peer ∈ v1.peers := by
+    rw [heq]; intro x hx
+    obtain ⟨y, hy, hyx⟩ := forall2_mem hrel x hx
+    rw [planRel_peer hyx]; exact hpeers2 y hy
+  have hpeers4 : ∀ x ∈ (finish n).1.sessions, x.peer ∈ v1.peers := by
+    show ∀ x ∈ (reportPass (planPass (reconcilePass r1.1).1).1).1.sessions, x.peer ∈ v1.peers
+    unfold reportPass; simp only
+    split <;> (intro x hx; simp only [List.mem_map] at hx; obtain ⟨y, hy, rfl⟩ := hx; exact hpeers3 y hy)
+  -- every later effect is benign in `v1`
+  have hlate : ∀ m : Node, m.Inv → Core r1.1 m → (∀ x ∈ m.sessions, x.peer ∈ v1.peers) →
+      ∀ e, LateEff m e → v1.exec e = some v1 := by
+    intro m hm hc hpm e he
+    cases e with
+    | send p msg =>
+      cases msg with
+      | hello => obtain ⟨x, hx, rfl⟩ := he; exact exec_send (hpm x hx) trivial
+      | digest => obtain ⟨x, hx, rfl⟩ := he; exact exec_send (hpm x hx) trivial
+      | state d s =>
+        obtain ⟨⟨x, hx, rfl⟩, P, hP, rfl, rfl⟩ := he
+        exact exec_send (hpm x hx) (hm.publishedOk P hP)
+      | _ => cases he
+    | fetch p c =>
+      obtain ⟨x, hx, c', he', hr, hs, h0, hcap, hmiss⟩ := he
+      simp only [Effect.fetch.injEq] at he'
+      obtain ⟨rfl, rfl⟩ := he'
+      refine exec_fetch (hpm x hx) ⟨hs, h0, Nat.le_trans hcap (by decide), fun h hh => ?_⟩
+      obtain ⟨⟨e, he, rfl⟩, -⟩ := (hm.missingSpec h).1 (hmiss h hh)
+      exact (hm.currentOk.1.1 e he).1
+    | notify => rfl
+    | _ => cases he
+  have hall : ∀ e ∈ (reconcilePass r1.1).2 ++ (planPass (reconcilePass r1.1).1).2 ++
+      (reportPass (planPass (reconcilePass r1.1).1).1).2, v1.exec e = some v1 := by
+    intro e he
+    simp only [List.mem_append] at he
+    rcases he with (he | he) | he
+    · exact hlate r1.1 hi1 ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩ hpeers1 e (reconcilePass_effs _ e he)
+    · exact hlate _ hi2 (reconcilePass_core _) hpeers2 e (planPass_effs hi2 e he)
+    · exact hlate _ (planPass_inv hi2) ((reconcilePass_core _).trans (planPass_core _)) hpeers3 e
+        (reportPass_effs _ e he)
+  refine ⟨v1, ?_, hpeers4, ?_, ?_⟩
+  · show v.execAll (r1.2 ++ (reconcilePass r1.1).2 ++ (planPass (reconcilePass r1.1).1).2 ++
+      (reportPass (planPass (reconcilePass r1.1).1).1).2) = some v1
+    rw [List.append_assoc, List.append_assoc, execAll_append, hv1]
+    simp only [Option.bind_some]
+    rw [← List.append_assoc]
+    exact execAll_benign v1 _ hall
+  · rw [hb1, (finish_core n).blobs]; exact hblobs
+  · rw [hpend1, (finish_frame n).1]
+
+/-! ### `handle` -/
+
+theorem gotBlob_exec {n : Node} (hn : n.Inv) (hb : Hash) (P : List PeerId) (hp : ∀ x ∈ n.sessions, x.peer ∈ P) :
+    (∀ x ∈ (gotBlob n hb).1.sessions, x.peer ∈ P) ∧ (∀ z ∈ (gotBlob n hb).1.blobs, z ∈ n.blobs ∨ z = hb) ∧
+    ∀ e ∈ (gotBlob n hb).2, ∃ p h, e = .send p (.have [h]) ∧ p ∈ P ∧ h.bytes.size = hashLen := by
+  refine ⟨?_, ?_, ?_⟩
+  · unfold gotBlob; split
+    · exact hp
+    · intro x hx; simp only [List.mem_map] at hx; obtain ⟨y, hy, rfl⟩ := hx; exact hp y hy
+  · unfold gotBlob; split
+    · intro z hz; exact .inl hz
+    · intro z hz; simp only at hz; rw [mem_insertH hn.blobsSorted] at hz
+      rcases hz with h | h
+      · exact .inr h
+      · exact .inl h
+  · intro e he
+    obtain ⟨y, hy, hyt, rfl⟩ := gotBlob_effs n hb e he
+    exact ⟨y.peer, hb, rfl, hp y hy, ((hn.sessOk y hy).toldNoOk hb hyt).1⟩
+
+theorem gotBlobs_exec {n : Node} (hn : n.Inv) (hs : List Hash) (P : List PeerId) (hp : ∀ x ∈ n.sessions, x.peer ∈ P) :
+    (∀ x ∈ (gotBlobs n hs).1.sessions, x.peer ∈ P) ∧ (∀ z ∈ (gotBlobs n hs).1.blobs, z ∈ n.blobs ∨ z ∈ hs) ∧
+    ∀ e ∈ (gotBlobs n hs).2, ∃ p h, e = .send p (.have [h]) ∧ p ∈ P ∧ h.bytes.size = hashLen := by
+  unfold gotBlobs
+  suffices ∀ (l : List Hash) (acc : Node × List Effect), acc.1.Inv → (∀ x ∈ acc.1.sessions, x.peer ∈ P) →
+      (∀ e ∈ acc.2, ∃ p h, e = .send p (.have [h]) ∧ p ∈ P ∧ h.bytes.size = hashLen) →
+      let r := l.foldl (fun (acc : Node × List Effect) h => ((gotBlob acc.1 h).1, acc.2 ++ (gotBlob acc.1 h).2)) acc
+      (∀ x ∈ r.1.sessions, x.peer ∈ P) ∧ (∀ z ∈ r.1.blobs, z ∈ acc.1.blobs ∨ z ∈ l) ∧
+      ∀ e ∈ r.2, ∃ p h, e = .send p (.have [h]) ∧ p ∈ P ∧ h.bytes.size = hashLen by
+    exact this hs (n, []) hn hp (by simp)
+  intro l
+  induction l with
+  | nil => intro acc _ hp he; exact ⟨hp, fun z hz => .inl hz, he⟩
+  | cons x xs ih =>
+    intro acc hi hp he
+    obtain ⟨g1, g2, g3⟩ := gotBlob_exec hi x P hp
+    obtain ⟨r1, r2, r3⟩ := ih ((gotBlob acc.1 x).1, acc.2 ++ (gotBlob acc.1 x).2) (inv_gotBlob hi x) g1
+      (fun e he' => by
+        simp only [List.mem_append] at he'
+        rcases he' with he' | he'
+        · exact he e he'
+        · exact g3 e he')
+    refine ⟨r1, fun z hz => ?_, r3⟩
+    rcases r2 z hz with h | h
+    · rcases g2 z h with h | rfl
+      · exact .inl h
+      · exact .inr (.head _)
+    · exact .inr (.tail _ h)
+
+/-- After `handle`, the node and the view agree except for the persist bookkeeping, which is
+settled by the event itself. -/
+def PreRel (v : HostView) (n : Node) : Prop :=
+  (∀ x ∈ n.sessions, x.peer ∈ v.peers) ∧ (∀ h ∈ n.blobs, h ∈ v.blobs) ∧ v.pendingPersist = n.inflight.map (·.1)
+
+theorem closeWith_exec {v : HostView} {n : Node} (hr : PreRel v n) {p : PeerId} (hp : p ∈ v.peers)
+    (r : CloseReason) (extra : List Effect) (hextra : ∀ e ∈ extra, ∃ x, e = .notify x) :
+    ∃ v', v.execAll (closeWith n p r extra).2 = some v' ∧ PreRel v' (closeWith n p r extra).1 := by
+  refine ⟨{ v with peers := v.peers.filter (· ≠ p) }, ?_, ?_⟩
+  · simp only [closeWith, List.cons_append, List.singleton_append, HostView.execAll]
+    rw [exec_send (m := .bye r) hp trivial]
+    simp only [HostView.exec, hp, ite_true, HostView.execAll]
+    rw [execAll_append, List.nil_append, execAll_benign _ extra (fun e he => by obtain ⟨x, rfl⟩ := hextra e he; rfl)]
+    rfl
+  · refine ⟨fun x hx => ?_, hr.2.1, hr.2.2⟩
+    obtain ⟨hx, hne⟩ := mem_dropSession hx
+    simp [hr.1 x hx, hne]
+
+theorem onMessage_exec {v : HostView} {n : Node} (hn : n.Inv) (hr : PreRel v n) {s : Session}
+    (hs : s ∈ n.sessions) {msg : Message} (hm : msg.WireOk) :
+    ∃ v', v.execAll (onMessage n s msg).2 = some v' ∧ PreRel v' (onMessage n s msg).1 := by
+  have hp : s.peer ∈ v.peers := hr.1 s hs
+  have hset : ∀ s' : Session, s'.peer = s.peer → PreRel v (n.setSession s') := fun s' _ =>
+    ⟨fun x hx => by
+      simp only [Node.setSession, List.mem_map] at hx
+      obtain ⟨y, hy, rfl⟩ := hx
+      split
+      · next he => simp only [beq_iff_eq] at he; rw [← he]; exact hr.1 y hy
+      · exact hr.1 y hy, hr.2.1, hr.2.2⟩
+  unfold onMessage
+  split
+  · split
+    · split
+      · exact closeWith_exec hr hp _ _ (by simp)
+      · split
+        · exact closeWith_exec hr hp _ _ (by simp)
+        · exact ⟨v, rfl, hset _ rfl⟩
+    · exact closeWith_exec hr hp _ _ (by simp)
+  · cases msg with
+    | hello => exact closeWith_exec hr hp _ _ (by simp)
+    | digest d => exact ⟨v, rfl, hset _ rfl⟩
+    | state d st =>
+      simp only
+      have hrb : ∀ (c : Bool), PreRel v (if c = true then { n.setSession { s with peerDigest := some d } with rollback := true }
+          else n.setSession { s with peerDigest := some d }) := by
+        intro c; split
+        · obtain ⟨a, b, c⟩ := hset { s with peerDigest := some d } rfl; exact ⟨a, b, c⟩
+        · exact hset _ rfl
+      have hnot : ∀ (c : Bool) (x : Notice), ∀ e ∈ (if c = true then [Effect.notify x] else []), ∃ y, e = .notify y := by
+        intro c x e he; split at he <;> simp at he; exact ⟨x, he⟩
+      split
+      · split
+        · refine ⟨v, execAll_benign v _ (fun e he => by obtain ⟨y, rfl⟩ := hnot _ _ e he; rfl), ?_⟩
+          obtain ⟨a, b, c⟩ := hrb (decide (n.current.context.get n.self < st.context.get n.self))
+          exact ⟨a, b, c⟩
+        · refine ⟨v, execAll_benign v _ (fun e he => ?_), ?_⟩
+          · simp only [List.mem_append, List.mem_singleton] at he
+            rcases he with he | rfl
+            · obtain ⟨y, rfl⟩ := hnot _ _ e he; rfl
+            · rfl
+          · obtain ⟨a, b, c⟩ := hrb (decide (n.current.context.get n.self < st.context.get n.self))
+            exact ⟨a, b, c⟩
+      · exact closeWith_exec (hrb _) hp _ _ (hnot _ _)
+    | want hs' =>
+      simp only
+      have hserve : ∀ e ∈ (hs'.filter (fun h => h ∈ n.blobs)).map (fun h => Effect.serveBlob s.peer h),
+          v.exec e = some v := by
+        intro e he
+        simp only [List.mem_map, List.mem_filter, decide_eq_true_eq] at he
+        obtain ⟨h, ⟨-, hb⟩, rfl⟩ := he
+        simp [HostView.exec, hp, hr.2.1 h hb]
+      split
+      · exact ⟨v, execAll_benign v _ hserve, hr⟩
+      · next hne =>
+        refine ⟨v, execAll_benign v _ (fun e he => ?_), hset _ rfl⟩
+        simp only [List.mem_append, List.mem_singleton] at he
+        rcases he with he | rfl
+        · exact hserve e he
+        · apply exec_send hp
+          obtain ⟨hsort, -, hmax, hsz⟩ := hm
+          refine ⟨hsort.filter _, ?_, Nat.le_trans (List.length_filter_le _ _) hmax,
+            fun h hh => hsz h (List.mem_filter.1 hh).1⟩
+          cases hl : hs'.filter (fun h => h ∉ n.blobs) with
+          | nil =>
+            simp at hne
+            obtain ⟨x, hx, hxn⟩ := hne
+            have : x ∈ hs'.filter (fun h => h ∉ n.blobs) := List.mem_filter.2 ⟨hx, by simpa using hxn⟩
+            rw [hl] at this; cases this
+          | cons _ _ => simp
+    | noBlob hs' => exact ⟨v, by rfl, hset _ rfl⟩
+    | «have» hs' => exact ⟨v, by rfl, hset _ rfl⟩
+    | bye r =>
+      refine ⟨{ v with peers := v.peers.filter (· ≠ s.peer) }, ?_, ?_⟩
+      · simp [HostView.execAll, HostView.exec, hp]
+      · refine ⟨fun x hx => ?_, hr.2.1, hr.2.2⟩
+        obtain ⟨hx, hne⟩ := mem_dropSession hx
+        simp [hr.1 x hx, hne]
+
+theorem preRel_mono {v v' : HostView} {n : Node} (h : PreRel v n) (hp : ∀ p ∈ v.peers, p ∈ v'.peers)
+    (hb : ∀ z ∈ v.blobs, z ∈ v'.blobs) (hpend : v'.pendingPersist = v.pendingPersist) : PreRel v' n :=
+  ⟨fun x hx => hp _ (h.1 x hx), fun z hz => hb _ (h.2.1 z hz), by rw [hpend]; exact h.2.2⟩
+
+theorem handle_exec {v : HostView} {n : Node} (hn : n.Inv) (hr : PreRel v n) (ev : Event) :
+    ∃ v', (v.onEvent ev).execAll (handle n ev).2 = some v' ∧ PreRel v' (handle n ev).1 := by
+  have hnotify : ∀ (w : HostView) (x : Notice), w.execAll [.notify x] = some w := fun _ _ => rfl
+  cases ev with
+  | init self st bs =>
+    refine ⟨_, hnotify _ _, preRel_mono hr (fun p hp => hp) (fun z hz => ?_) rfl⟩
+    simp only [HostView.onEvent]; rw [mem_addBlobs]; exact .inl hz
+  | initFresh self bs =>
+    refine ⟨_, hnotify _ _, preRel_mono hr (fun p hp => hp) (fun z hz => ?_) rfl⟩
+    simp only [HostView.onEvent]; rw [mem_addBlobs]; exact .inl hz
+  | connected p =>
+    have hv1 : ∀ q ∈ v.peers, q ∈ (v.onEvent (.connected p)).peers := by
+      intro q hq; simp only [HostView.onEvent]; split
+      · exact hq
+      · exact .tail _ hq
+    have hp1 : p ∈ (v.onEvent (.connected p)).peers := by
+      simp only [HostView.onEvent]; split
+      · assumption
+      · exact .head _
+    have hr1 : PreRel (v.onEvent (.connected p)) n :=
+      preRel_mono hr hv1 (fun z hz => by simp only [HostView.onEvent]; split <;> exact hz)
+        (by simp only [HostView.onEvent]; split <;> rfl)
+    simp only [handle]
+    split
+    · exact ⟨_, rfl, hr1⟩
+    · next hnone =>
+      have hn0 : n.findSession? p = none := by
+        cases hf : n.findSession? p
+        · rfl
+        · simp [hf] at hnone
+      split
+      · refine ⟨_, rfl, fun x hx => ?_, hr1.2.1, hr1.2.2⟩
+        rw [mem_insertSession] at hx
+        rcases hx with rfl | hx
+        · exact hp1
+        · exact hr1.1 x hx
+      · refine ⟨{ v.onEvent (.connected p) with peers := (v.onEvent (.connected p)).peers.filter (· ≠ p) },
+          by simp [HostView.execAll, HostView.exec, hp1], fun x hx => ?_, hr1.2.1, hr1.2.2⟩
+        simp [hr1.1 x hx, findSession_none hn0 x hx]
+  | disconnected p =>
+    simp only [handle]
+    split
+    · refine ⟨_, hnotify _ _, fun x hx => ?_, hr.2.1, hr.2.2⟩
+      obtain ⟨hx, hne⟩ := mem_dropSession hx
+      simp [HostView.onEvent, hr.1 x hx, hne]
+    · next hnone =>
+      have hn0 : n.findSession? p = none := by
+        cases hf : n.findSession? p
+        · rfl
+        · simp [hf] at hnone
+      refine ⟨_, rfl, fun x hx => ?_, hr.2.1, hr.2.2⟩
+      simp [HostView.onEvent, hr.1 x hx, findSession_none hn0 x hx]
+  | received p b =>
+    simp only [handle]
+    split
+    · exact ⟨_, rfl, hr⟩
+    · next s hs =>
+      obtain ⟨hsm, rfl⟩ := findSession_some hs
+      split
+      · exact closeWith_exec hr (hr.1 s hsm) _ _ (by simp)
+      · next msg hdec => exact onMessage_exec hn hr hsm (wireOk_of_decodeMessage' hdec)
+  | localOp op =>
+    have hops : ∀ z ∈ opHashes op, z ∈ (v.onEvent (.localOp op)).blobs := by
+      intro z hz
+      cases op with
+      | putMany items => simp only [HostView.onEvent]; rw [mem_addBlobs]; exact .inr hz
+      | deleteMany items => simp [opHashes] at hz
+      | resolve q h => simp only [HostView.onEvent]; rw [mem_addBlobs]; exact .inr hz
+    have hgrow : ∀ z ∈ v.blobs, z ∈ (v.onEvent (.localOp op)).blobs := by
+      intro z hz
+      cases op with
+      | putMany items => simp only [HostView.onEvent]; rw [mem_addBlobs]; exact .inl hz
+      | deleteMany items => exact hz
+      | resolve q h => simp only [HostView.onEvent]; rw [mem_addBlobs]; exact .inl hz
+    have hpend : (v.onEvent (.localOp op)).pendingPersist = v.pendingPersist := by
+      cases op <;> rfl
+    have hpeers : (v.onEvent (.localOp op)).peers = v.peers := by cases op <;> rfl
+    have hr1 : PreRel (v.onEvent (.localOp op)) n :=
+      preRel_mono hr (fun p hp => by rw [hpeers]; exact hp) hgrow hpend
+    simp only [handle]
+    split
+    · exact ⟨_, hnotify _ _, hr1⟩
+    · split
+      · next hw =>
+        have hi : (n.withCurrent (applyOp n.current n.self op)).Inv :=
+          Inv.withCurrent hn (checkWire_true hw) (State.le_applyOp _ _ _)
+        obtain ⟨g1, g2, g3⟩ := gotBlobs_exec hi (opHashes op) (v.onEvent (.localOp op)).peers hr1.1
+        refine ⟨_, ?_, g1, fun z hz => ?_, ?_⟩
+        · show (v.onEvent (.localOp op)).execAll (.notify .indexChanged :: _) = _
+          simp only [HostView.execAll, HostView.exec]
+          exact execAll_benign _ _ (fun e he => by
+            obtain ⟨q, h, rfl, hq, hh⟩ := g3 e he
+            exact exec_send hq (hashBatchOk_single hh))
+        · rcases g2 z hz with h | h
+          · exact hr1.2.1 z h
+          · exact hops z h
+        · rw [(gotBlobs_frame _ _).2.2.2.1]; exact hr1.2.2
+      · exact ⟨_, hnotify _ _, hr1⟩
+  | persisted t d =>
+    simp only [handle]
+    split
+    · next t' s hi =>
+      split
+      · next ht =>
+        subst ht
+        refine ⟨_, rfl, hr.1, hr.2.1, ?_⟩
+        simp [HostView.onEvent, hr.2.2, hi]
+      · next ht =>
+        refine ⟨_, rfl, hr.1, hr.2.1, ?_⟩
+        have : v.pendingPersist ≠ some t := by rw [hr.2.2, hi]; simp; exact ht
+        simp [HostView.onEvent, this, hr.2.2]
+    · next hi =>
+      refine ⟨_, rfl, hr.1, hr.2.1, ?_⟩
+      have : v.pendingPersist = none := by rw [hr.2.2]; cases h : n.inflight <;> simp_all
+      simp [HostView.onEvent, this, hr.2.2]
+  | persistFailed t =>
+    simp only [handle]
+    split
+    · next t' s hi =>
+      split
+      · next ht =>
+        subst ht
+        refine ⟨_, rfl, hr.1, hr.2.1, ?_⟩
+        simp [HostView.onEvent, hr.2.2, hi]
+      · next ht =>
+        refine ⟨_, rfl, hr.1, hr.2.1, ?_⟩
+        have : v.pendingPersist ≠ some t := by rw [hr.2.2, hi]; simp; exact ht
+        simp [HostView.onEvent, this, hr.2.2]
+    · next hi =>
+      refine ⟨_, rfl, hr.1, hr.2.1, ?_⟩
+      have : v.pendingPersist = none := by rw [hr.2.2]; cases h : n.inflight <;> simp_all
+      simp [HostView.onEvent, this, hr.2.2]
+  | blobStored h src =>
+    have hr1 : PreRel (v.onEvent (.blobStored h src)) n :=
+      preRel_mono hr (fun p hp => hp) (fun z hz => by simp only [HostView.onEvent]; rw [mem_addBlobs]; exact .inl hz) rfl
+    have hh1 : h ∈ (v.onEvent (.blobStored h src)).blobs := by
+      simp only [HostView.onEvent]; rw [mem_addBlobs]; exact .inr (.head _)
+    obtain ⟨g1, g2, g3⟩ := gotBlobs_exec hn [h] (v.onEvent (.blobStored h src)).peers hr1.1
+    have hben : ∀ e ∈ (gotBlobs n [h]).2, (v.onEvent (.blobStored h src)).exec e = some (v.onEvent (.blobStored h src)) := by
+      intro e he
+      obtain ⟨q, x, rfl, hq, hx⟩ := g3 e he
+      exact exec_send hq (hashBatchOk_single hx)
+    have hpre : PreRel (v.onEvent (.blobStored h src)) (gotBlobs n [h]).1 := by
+      refine ⟨g1, fun z hz => ?_, by rw [(gotBlobs_frame _ _).2.2.2.1]; exact hr1.2.2⟩
+      rcases g2 z hz with hz | hz
+      · exact hr1.2.1 z hz
+      · simp at hz; subst hz; exact hh1
+    simp only [handle]
+    split
+    · exact ⟨_, rfl, hpre⟩
+    · refine ⟨_, ?_, hpre⟩
+      simp only [HostView.execAll, HostView.exec]
+      exact execAll_benign _ _ hben
+  | blobFailed p h =>
+    simp only [handle]
+    split
+    · next s hs =>
+      split
+      · obtain ⟨hsm, rfl⟩ := findSession_some hs
+        refine ⟨_, hnotify _ _, fun x hx => ?_, hr.2.1, hr.2.2⟩
+        rcases mem_setSession hx with rfl | hx
+        · exact hr.1 s hsm
+        · exact hr.1 x hx
+      · exact ⟨_, rfl, hr⟩
+    · exact ⟨_, rfl, hr⟩
+  | blobLost h =>
+    simp only [handle]
+    split
+    · refine ⟨_, hnotify _ _, hr.1, fun z hz => ?_, hr.2.2⟩
+      rw [mem_eraseH] at hz
+      simp [HostView.onEvent, hr.2.1 z hz.1, hz.2]
+    · next hnot =>
+      refine ⟨_, rfl, hr.1, fun z hz => ?_, hr.2.2⟩
+      have : z ≠ h := fun e => by subst e; exact hnot hz
+      simp [HostView.onEvent, hr.2.1 z hz, this]
+  | query q => exact ⟨_, rfl, hr⟩
+
+theorem step_exec {v : HostView} {m : Machine} (hm : m.Inv) (hr : HostRel v m) (ev : Event) :
+    ∃ v2, (v.onEvent ev).execAll (step m ev).2 = some v2 ∧ HostRel v2 (step m ev).1 := by
+  cases m with
+  | uninit =>
+    have hpend : ∀ ev, (v.onEvent ev).pendingPersist = none := by
+      intro ev
+      cases ev <;> simp only [HostView.onEvent] <;> (try split) <;> (try cases ‹LocalOp›) <;>
+        simp_all [HostRel, HostView.onEvent, HostView.addBlobs]
+    -- starting a node: `finish` on the fresh node
+    have hstart : ∀ (self : ReplicaId) (s : State) (bs : List Hash), s.WireOk →
+        (∀ z ∈ bs, z ∈ (v.onEvent ev).blobs) →
+        ∃ v2, (v.onEvent ev).execAll (startNode self s bs).2 = some v2 ∧ HostRel v2 (.running (startNode self s bs).1) := by
+      intro self s bs hs hbs
+      let n0 : Node := { self, current := s, blobs := sortDedup bs, missing := computeMissing s (sortDedup bs), dirty := true }
+      have h0 : n0.Inv := {
+        currentOk := hs
+        publishedOk := fun _ hP => by simp [n0] at hP
+        publishedLe := fun _ hP => by simp [n0] at hP
+        inflightOk := fun _ _ hx => by simp [n0] at hx
+        inflightLe := fun _ _ hx => by simp [n0] at hx
+        tagFresh := fun _ _ hx => by simp [n0] at hx
+        blobsSorted := sorted_sortDedup _
+        missingSorted := sorted_computeMissing _ (sorted_sortDedup _)
+        missingSpec := fun z => by rw [mem_computeMissing _ (sorted_sortDedup _)]; rfl
+        sessionsSorted := List.Pairwise.nil
+        sessionCap := by simp [n0, maxSessions]
+        sessOk := fun _ hx => by simp [n0] at hx }
+      obtain ⟨v2, h1, h2⟩ := finish_exec h0 (v := v.onEvent ev) (by simp [n0])
+        (fun z hz => hbs z (mem_sortDedup.1 hz)) (by simp [n0, hpend])
+      exact ⟨v2, by simp only [startNode, HostView.execAll, HostView.exec]; exact h1, h2⟩
+    cases ev with
+    | init self stored bs =>
+      simp only [step]
+      split
+      · next s hdec =>
+        exact hstart self s bs (wireOk_of_decodeState' hdec)
+          (fun z hz => by simp only [HostView.onEvent]; rw [mem_addBlobs]; exact .inr hz)
+      · exact ⟨_, rfl, hpend _⟩
+    | initFresh self bs =>
+      exact hstart self _ bs wireOk_empty
+        (fun z hz => by simp only [HostView.onEvent]; rw [mem_addBlobs]; exact .inr hz)
+    | _ => exact ⟨_, rfl, hpend _⟩
+  | running n =>
+    obtain ⟨v1, h1, hr1⟩ := handle_exec hm hr ev
+    obtain ⟨v2, h2, hr2⟩ := finish_exec (handle_inv hm ev) hr1.1 hr1.2.1 hr1.2.2
+    refine ⟨v2, ?_, hr2⟩
+    rw [step_running]
+    simp only
+    rw [execAll_append, h1]
+    exact h2
+
+theorem effects_executable' : ∀ (evs : List Event) (v : HostView) (m : Machine), m.Inv → HostRel v m →
+    Executable step v m evs
+  | [], _, _, _, _ => trivial
+  | ev :: evs, v, m, hm, hr => by
+    obtain ⟨v2, h1, h2⟩ := step_exec hm hr ev
+    simp only [Executable, h1]
+    exact effects_executable' evs v2 _ (step_inv' m ev hm) h2
+
 end LeanSync
