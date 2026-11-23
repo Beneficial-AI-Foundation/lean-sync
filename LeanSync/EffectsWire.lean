@@ -340,7 +340,7 @@ def readNotice : Parser Notice := fun b pos =>
     else .error (.badTag t.toNat)
 
 /-- Read a tag byte `t` known to be at `pos`. -/
-theorem tag_at {b : ByteArray} {pos : Nat} {t : UInt8} {l rest : List UInt8} (hpos : pos ≤ b.size)
+theorem tag_at {b : ByteArray} {pos : Nat} {t : UInt8} {l rest : List UInt8} (_hpos : pos ≤ b.size)
     (h : bytesFrom b pos = t :: (l ++ rest)) :
     readByte b pos = .ok (t, pos + 1) ∧ bytesFrom b (pos + 1) = l ++ rest ∧ pos + 1 ≤ b.size := by
   obtain ⟨hlt, hx, hr⟩ := bytesFrom_cons h

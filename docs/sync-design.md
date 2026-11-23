@@ -16,11 +16,12 @@ headline theorems depend only on `propext`, `Classical.choice` and `Quot.sound`
 | `LeanSync/Wire.lean` | limits, `WireOk`, state and message codecs, round trip and canonicity | yes |
 | `LeanSync/Sets.lean` | sorted hash sets: sort+dedup, one-pass difference | yes |
 | `LeanSync/Step.lean` | the step function | yes |
-| `LeanSync/Envelope.lean` | event/effect envelopes, `process`, exported `processIO` | yes |
+| `LeanSync/EffectsWire.lean` | the effects envelope (Lean → host), with state payloads de-duplicated, and its proved round trip | yes |
+| `LeanSync/Envelope.lean` | the event envelope (host → Lean), `process`, exported `processIO` | yes |
 | `LeanSync/HostModel.lean` | what a host can carry out (`HostView`, `Executable`) | used by tests and a theorem |
 | `LeanSync/StepProofs.lean`, `LeanSync/Laws.lean` | proofs; `Laws.lean` states the stage-1 theorems | proofs only |
 | `Tests/Sync.lean`, `scripts/test-sync.sh` | unit, codec and fuzz, simulator, mutation check, scale, stack | tests |
-| `scripts/check-proofs.sh`, `scripts/Axioms.lean` | forbidden-construct grep and `#print axioms` | check |
+| `scripts/check-proofs.sh`, `scripts/check-forbidden.sh`, `scripts/Axioms.lean` | forbidden-construct check (comment-aware) and `#print axioms` allowlist | check |
 
 ## 1. Shape and the wasm boundary
 
@@ -35,7 +36,16 @@ initialize machineRef : IO.Ref Machine ← IO.mkRef .uninit
 
 The machine lives in an `IO.Ref` between calls. `IO.Ref` is part of `Init`, and the code does no
 other IO. A malformed input yields the effect list `[notify (badEvent e)]` and leaves the machine
-unchanged, so the output is always a well-formed effect list.
+unchanged.
+
+**Every output decodes (proved, `process_output_decodes`).** For a machine satisfying the
+invariant, whatever `process` returns is an effects envelope that `decodeEffects` decodes back to
+exactly the effects the step emitted. So the host can always decode and carry out every effect,
+and a session's `lastSent` is never advanced for a send the host could not receive. The size of
+one envelope is bounded by design, not by a cap: all state messages sent in one step carry the
+same published state, and the envelope writes it once (§6). A step's envelope therefore holds at
+most two copies of a state (the persist and the shared state message), plus small messages and
+any query reply.
 
 **C-shim change, for the host task.** Do not apply it here, since `wasm/` is not touched.
 Checked against the C that Lean 4.36 generates (`.lake/build/ir/LeanSync/Envelope.c`):
@@ -80,6 +90,7 @@ inductive Event where
   | localOp (op : LocalOp)                                              -- putMany | deleteMany | resolve
   | persisted (tag : Nat) (digest : Digest) | persistFailed (tag : Nat)
   | blobStored (h : Hash) (src : Option PeerId) | blobFailed (p : PeerId) (h : Hash) | blobLost (h : Hash)
+  | blobsStored (hs : List Hash)                                        -- a batch, e.g. the start-up inventory in chunks
   | query (q : Query)                                                   -- snapshot | pending | status
 
 inductive Effect where
@@ -108,20 +119,25 @@ A `Session` holds:
 Notices for the UI:
 - `indexChanged` and `blobsChanged`: re-query;
 - `peerStatus p (handshaking|syncing|inSync) replica`, `peerClosed`, `peerLeft`, `peerError`;
-- `pendingSummary fetching waiting`, which separates "being fetched" from "nobody reachable has
-  it" (§5);
+- `pendingSummary fetching queued waiting`, which separates "being fetched", "queued behind a
+  peer whose request slots are full", and "nobody reachable has it" (§5);
 - `rollbackDetected`, `opRejected`, `badEvent`, `startupFailed`, `notInitialized`,
   `alreadyInitialized`.
 
 Replies:
 - `snapshot`: each path with its versions, each marked present or not;
-- `pending`: each missing hash, `requested p` or `waiting`;
+- `pending`: each missing hash, `requested p`, `queued` or `waiting`;
 - `status`.
 
 Changes since stage 1:
 - `init` takes the stored bytes (no longer optional), and `initFresh` is new (user decision, §7);
 - `persistFailed` and the `fetch` effect were already introduced at the end of stage 1;
 - `startupFailed` replaces `corruptStore`, and `peerLeft` and `pendingSummary` are new.
+
+Changes made after the review of the stage-2 branch:
+- `blobsStored` is new: the start-up inventory can be reported in chunks (§7);
+- `PendingStatus.queued` is new, and `pendingSummary` has three counts instead of two (§5);
+- `Node.summary` is a triple.
 
 ## 3. Save-before-send, made structural
 
@@ -187,8 +203,9 @@ gets `state` unless it already announced that digest.
 **Cost (accepted for the demo).** One edit costs one whole-state send per connected peer. Each
 entry encodes to about 37 bytes plus its path, so 20k files with short paths come to about 1 MB
 per peer. Bursts are folded by the single in-flight persist.
-- A state sent to k peers in one step is encoded k times. Avoiding that would need the envelope
-  to share bytes between effects, which is not free in Lean, so it is left as is.
+- A state sent to k peers in one step appears **once** in the envelope; later sends of it are
+  encoded as `sendAgain` (§6). Spotting the repeat costs a `State.beq` comparison, not an
+  encoding. The host still transmits the bytes k times, once per connection.
 - Each received state is also encoded once, to check its size.
 
 **Rollback mode** (user decision). A received state with `s.context.get self >
@@ -233,9 +250,10 @@ simulation.
 
 ## 5. Blobs: presence, pending, who to ask
 
-- **Present blobs.** `blobs` is rebuilt at `init` from the host's listing, and updated by
-  `blobStored`, by local puts (the host stores the blob before reporting the op), and by
-  `blobLost`.
+- **Present blobs.** `blobs` is rebuilt at start-up from the host's listing (in `init`, and/or in
+  `blobsStored` chunks, §7), and updated by `blobStored`/`blobsStored`, by local puts (the host
+  stores the blob before reporting the op), and by `blobLost`. A batch is recorded in one sorted
+  pass.
 - **Missing blobs.** `missing` is the set of hashes referenced by `current` that are not present,
   every sibling version included. A file is complete when all its versions are present.
 - **Planning,** after every event. Each ready session **to which we have sent our hello**, in
@@ -251,10 +269,17 @@ simulation.
   - `toldNo` is capped at 4096 per session; past that, C retries on its next session with B.
 - `blobFailed p h` marks `h` as lacked at `p` for that session, so a peer serving corrupt data
   cannot cause a retry loop.
-- **"Pending, being fetched" versus "waiting, nobody reachable has it"** (user decision: no
-  clock, wait indefinitely).
-  - `pendingSummary fetching waiting` is emitted whenever the pair changes, and the `pending`
-    query lists each hash with `requested p` or `waiting`.
+- **Three kinds of pending blob** (user decision: no clock, wait indefinitely; the review asked
+  that a blob queued behind a busy peer not be reported as unreachable):
+  - **fetching**: requested from a peer now;
+  - **queued**: not requested yet, but some greeted ready peer has not said it lacks it, so it
+    will be requested as soon as that peer's 32 request slots free up (by `step_plans_blobs`, such
+    a peer is full);
+  - **waiting**: every greeted ready peer said it lacks it, or no peer is connected: nobody
+    reachable has it.
+  - `pendingSummary fetching queued waiting` is emitted whenever the triple changes, and the
+    `pending` query lists each hash with `requested p`, `queued` or `waiting`. A unit test checks
+    exactly the review's case: 33 missing blobs and one peer give (32, 1, 0).
   - A waiting hash is asked for again when a new session is greeted or a `have` arrives.
   - If the device that wrote it later superseded it, the next index sync removes the reference.
   - If that device is gone for good, the file stays pending until the user deletes or overwrites
@@ -262,7 +287,8 @@ simulation.
 
 ## 6. Wire format, version 1
 
-The format is defined in `Wire.lean` and `Envelope.lean`.
+The format is defined in `Wire.lean` (states, messages), `Envelope.lean` (events) and
+`EffectsWire.lean` (effects).
 - **Integers** are canonical unsigned LEB128: no overlong forms, at most 10 bytes, value below
   2^64.
 - **Replica ids** are two such varints, `hi` then `lo`. Stage 1 planned 16 fixed bytes; the
@@ -279,10 +305,22 @@ message := 01 02 tag ...  0 hello maxVersion:u8 hi lo digest:32 | 1 digest diges
                           2 state digest:32 <state without its 2-byte header>
                           3 want | 4 noBlob | 5 have   k∈[1,1024] {hash:32}^k (strictly increasing)
                           6 bye reason:u8
-event   := 01 03 tag ...  (layout in the header of LeanSync/Envelope.lean)
-effects := 01 04 k {effect}^k   send carries the encoded message; persist the encoded state record;
-                                fetch carries the hashes and the encoded `want` to send verbatim
+event   := 01 03 tag ...  (layout in the header of LeanSync/Envelope.lean; 12 = blobsStored)
+effects := 01 04 k:nat {effect}^k                    (layout in the header of LeanSync/EffectsWire.lean)
+           0 send peer msg:bytes | 1 close peer reason | 2 persist tag:nat state:bytes
+           3 fetch peer {hash} want:bytes | 4 serveBlob peer hash | 5 notify | 6 reply
+           7 sendAgain peer      -- the same state message as the last `send` of a state written in full
 ```
+
+- **The effects envelope** is Lean's own output and is decoded by the trusted host, so it has no
+  total size cap, and its integers and byte strings may be any length. The limits belong to the
+  untrusted inputs: events and peer messages. Every embedded peer message and persisted state is
+  `WireOk`, which includes its own size limit (`step_effects_ok`).
+- **One payload per state per step.** A `send` of a state message equal to the last one written in
+  full (same digest, `State.beq`) is encoded as `sendAgain peer`. A state sent to 32 peers in one
+  step is written once, not 32 times: in the regression test, a 1.01 MB state sent to 32 peers
+  plus its persist gives a 2.02 MB envelope. The equality check costs a comparison pass, not an
+  encoding, so the k-fold re-encoding is gone too.
 
 - **Digest preimage.** The persisted record and the digest preimage are both `encodeState`, header
   included.
@@ -291,7 +329,8 @@ effects := 01 04 k {effect}^k   send carries the encoded message; persist the en
   what was decoded.
 - **Versioning.** `hello` stays decodable in v1 and advertises `maxVersion`.
 - **Limits.**
-  - State ≤ 64 MiB (about 500k entries); message ≤ state + 64 B; event ≤ 128 MiB.
+  - State ≤ 64 MiB (about 500k entries); message ≤ state + 64 B; event ≤ 128 MiB. The effects
+    envelope has no cap (see above).
   - Path ≤ 4096 bytes; batch ≤ 1024 hashes; ≤ 32 sessions; ≤ 32 requests in flight per peer;
     `toldNo` ≤ 4096.
   - A local op that would break a limit is rejected with `opRejected`, including a hash that is
@@ -308,6 +347,20 @@ effects := 01 04 k {effect}^k   send carries the encoded message; persist the en
 **Restore.** `init self storedBytes blobs`. If the bytes decode, the node starts from them and
 immediately emits `persist 0 state`; the host may skip the identical write but must answer with the
 digest. Until that acknowledgement, no hello is sent.
+
+**Blob inventory in chunks.** `init` and `initFresh` may carry the whole list of stored blob
+hashes, part of it, or none. The rest is reported with `blobsStored` batches (chunks of, say, 10k
+hashes), each its own event of at most 128 MiB. The host must send all of them **before**
+connecting any peer.
+
+If a peer connects before the inventory is complete, the protocol stays correct but does
+unnecessary work. Lean believes the unreported blobs are missing, so:
+- it may request them from the peer; the host stores the incoming copy again, which is
+  idempotent;
+- it answers `noBlob` to a peer's request for them.
+
+When the batch that reports a blob arrives, Lean sends `have` to every peer it told `noBlob`, and
+those peers ask again. A unit test covers this case.
 
 **Start-up error** (user decision: never reset silently). If the stored bytes do not decode, Lean
 emits `startupFailed e` and stays uninitialised. The host may retry `init`, for example after
@@ -340,12 +393,22 @@ synced; blobs on disk are kept. The same event is used for a first start on empt
   - If the record is trustworthy: `init id bytes hashes`.
   - If you cannot vouch that the record is the latest one written (backup restore, lost
     storage, previous `rollbackDetected`): `init newId bytes hashes`, with a fresh id.
+- `hashes` may be a prefix of the inventory, or empty. Report the rest with `blobsStored`
+  batches, keeping each event under 128 MiB (10k hashes per batch is plenty), and **before
+  connecting any peer** (§7 says what happens otherwise).
 - On `startupFailed`: show the error, and offer a reset, which is `initFresh newId hashes` after
   the user confirms.
 
+**Decoding the effects envelope.**
+- Read it with no total size cap.
+- Integers are LEB128 of any length.
+- Keep the bytes of the last `send` whose message is a state. A `sendAgain p` means: send those
+  same bytes to `p`.
+- `process_output_decodes` guarantees that every envelope decodes.
+
 **What each effect requires** (Lean guarantees the preconditions; `effects_executable`):
-- `send p bytes`: queue `bytes` on connection `p`, in order. If `p` is already closed, drop it
-  silently: Lean will receive `disconnected p`.
+- `send p bytes` (or `sendAgain p`): queue `bytes` on connection `p`, in order. If `p` is already
+  closed, drop it silently: Lean will receive `disconnected p`.
 - `close p reason`: close `p` after the bytes already queued for it.
 - `persist tag bytes`: as in 1 above.
 - `fetch p hashes bytes`: send `bytes` to `p`, then accept blob streams from `p` for exactly those
@@ -363,7 +426,7 @@ synced; blobs on disk are kept. The same event is used for a first start on empt
 - `received p bytes`: one complete Lean message, in order, of at most `maxMessageBytes`. The
   host reassembles its own fragments, and closes a connection that exceeds the limit.
 - `persisted` and `persistFailed`: only for a `persist` the host was given.
-- `blobStored`: the blob is durably stored and verified.
+- `blobStored` and `blobsStored`: the blobs are durably stored and verified.
 - `blobLost`: a blob previously reported present is gone.
 
 **Framing.** On a data channel the host multiplexes fragments of Lean messages and blob-stream
@@ -371,7 +434,8 @@ frames. That framing belongs to the host and is invisible to Lean.
 
 ## 9. Theorems
 
-All of these are proved in `LeanSync/Laws.lean`, with lemmas in `StepProofs.lean` and `Wire.lean`.
+All of these are proved in `LeanSync/Laws.lean`, with lemmas in `StepProofs.lean`, `Wire.lean` and
+`EffectsWire.lean`.
 
 | Group | Theorem | Statement |
 |---|---|---|
@@ -382,7 +446,9 @@ All of these are proved in `LeanSync/Laws.lean`, with lemmas in `StepProofs.lean
 | Wire | four message counterparts | `decodeMessage_encodeMessage`, `encodeMessage_of_decodeMessage`, `wireOk_of_decodeMessage`, `decodeMessage_tooLarge` |
 | Trace | `sent_state_acked`, `save_before_send` | §3 |
 | Trace | `persist_tag_unique`, `persist_one_in_flight` | §3 |
-| Host | `effects_executable` | every effect of every step of every event sequence is executable by `HostView`, which models the host from the events and effects so far |
+| Host | `effects_executable` | every effect of every step of every event sequence is executable by `HostView`, which models the host from the events and effects so far; this includes that every sent message, fetch batch and persisted state is `WireOk` |
+| Envelope | `decodeEffects_encodeEffects` | every effect list whose sends, fetches and persists are well formed decodes back to itself, with state payloads de-duplicated |
+| Envelope | `step_effects_ok`, `process_output_decodes` | every effect a step emits is well formed, so whatever `process` outputs decodes back to exactly the emitted effects |
 | Step | `step_inv` | the node invariant holds after every step: sortedness, caps, `missing` = refs(current) \ blobs, published/in-flight ≤ current, owed-`have` bookkeeping, `WireOk` states |
 | Step | `step_current_grows` | the state only grows and the replica id never changes |
 | Step | `step_received_state`, `step_putMany` | exact merge and `putMany` semantics |
@@ -407,10 +473,20 @@ All of these are proved in `LeanSync/Laws.lean`, with lemmas in `StepProofs.lean
   size bound (`fieldsOk_of_wireOk`), not added as assumptions.
 - `rollback_no_state` and `rollback_rejects_local` are new.
 
-**Re-run the no-placeholder claim:** `scripts/check-proofs.sh`. It greps the libraries for
-`sorry`, `axiom`, `native_decide`, `implemented_by`, `unsafe` and `partial`, and runs
-`#print axioms` on 23 headline theorems. Each must list exactly
-`[propext, Classical.choice, Quot.sound]`.
+**After the review (no theorem statement changed):**
+- `HostView.exec` now requires every sent message, every fetch batch and every persisted state
+  to be `WireOk` (decided by `checkMessage`, `checkBatch` and `checkWire`). Before, it required
+  only that they fit the size limits. This makes `effects_executable` stronger.
+- `decodeEffects_encodeEffects`, `step_effects_ok` and `process_output_decodes` are new.
+
+**Re-run the no-placeholder claim:** `scripts/check-proofs.sh`.
+- **Forbidden constructs.** `scripts/check-forbidden.sh` looks for `sorry`, `axiom`,
+  `native_decide`, `implemented_by`, `unsafe` and `partial` as whole words anywhere outside
+  comments and string literals. It therefore catches `private partial def`, `@[inline] unsafe def`
+  and `protected axiom`. The script first self-tests on four planted constructs.
+- **Axioms.** It runs `#print axioms` on every theorem listed in `scripts/Axioms.lean` (26). Each
+  must report, and the only axioms allowed are `propext`, `Classical.choice` and `Quot.sound`.
+  Fewer, or none, is accepted.
 
 **What is proved, argued, and only simulated:**
 - **Proved:** everything in the table above.
@@ -420,7 +496,7 @@ All of these are proved in `LeanSync/Laws.lean`, with lemmas in `StepProofs.lean
     connected device holds reaches every device. This follows from `step_plans_blobs`, the
     `have` mechanism and transitivity.
 - **Tested only:**
-  - the event and effect envelope round trips;
+  - the event envelope round trip (the effects envelope round trip is now proved);
   - linear decoding time;
   - stack depth.
 
@@ -429,7 +505,7 @@ All of these are proved in `LeanSync/Laws.lean`, with lemmas in `StepProofs.lean
 All of these passed in the final run, both with the default stack and with
 `LEAN_STACK_SIZE_KB=256`.
 
-**`unit`** (47 checks) covers every flow of §4 to §7:
+**`unit`** (53 checks) covers every flow of §4 to §7:
 - the persist-before-send ordering;
 - stale and duplicate acknowledgements;
 - protocol errors: before hello, bad version, own id;
@@ -438,11 +514,19 @@ All of these passed in the final run, both with the default stack and with
 - `blobFailed`;
 - rollback mode;
 - `startupFailed`, then `initFresh`;
-- the pending summary and the queries.
+- the pending summary and the queries;
+- **queued versus waiting:** 33 missing blobs and one peer give summary (32, 1, 0), and the
+  `pending` reply lists 32 requested, 1 queued, 0 waiting;
+- **late inventory:** a restart with an empty `init` inventory and a peer connecting early. The
+  blob shows as waiting, then a `blobsStored` batch makes Lean send `have`, and the devices
+  converge.
 
 **`codec`**:
 - **Round trips:** 200 random `WireOk` states, and 300 each of random messages, events and effect
-  lists, compared at byte level.
+  lists, compared at byte level. The effect lists include repeated state sends, encoded as
+  `sendAgain`.
+- **P1 regression:** a 20,000-entry state (1,010,391 bytes) sent to 32 peers, plus its persist,
+  gives a 2,020,890-byte envelope that decodes back to the 33 effects.
 - **Truncation:** every proper prefix of six encodings (6,937 prefixes) must be rejected. The six
   are a state with 28 entries and 3 replicas, a state message, a 20-hash `want`, a `hello`, an
   `init` event and an effect list.
@@ -456,12 +540,13 @@ All of these passed in the final run, both with the default stack and with
 
 **`sim 1 200`**: 200 seeds × 4 devices × 400 random steps, then quiescence.
 - **Faults injected over the 200 seeds:**
-  - 2,111 connection drops at arbitrary points and 783 crash/restarts from the persisted record;
-  - 553 persist failures and delayed acknowledgements;
-  - 97 blob-transfer failures and 414 blob losses (only when another copy exists);
-  - 370 garbage, 192 truncated and 186 duplicated messages.
-- **Volume:** 81,894 events, of which 20,580 went through `process` and the byte envelopes, and
-  15,451 state sends.
+  - 2,116 connection drops at arbitrary points and 798 crash/restarts from the persisted record;
+    half of all start-ups report the blob inventory in `blobsStored` chunks;
+  - 589 persist failures and delayed acknowledgements;
+  - 99 blob-transfer failures and 443 blob losses (only when another copy exists);
+  - 365 garbage, 187 truncated and 189 duplicated messages.
+- **Volume:** 84,427 events, of which 21,092 went through `process` and the byte envelopes, and
+  15,708 state sends.
 - **Checked after every event:**
   - save-before-send, through a global **dot registry**: no dot is ever seen on the wire with two
     different contents;
@@ -476,12 +561,17 @@ All of these passed in the final run, both with the default stack and with
 - **Not injected:** bit corruption that still decodes. The transport has integrity, and the trust
   model excludes it.
 
-**`mutation`** runs broken step functions through the strict simulator, 30 seeds each:
+**`mutation`** runs broken step functions, 30 seeds each. Each seed runs the strict simulator
+plus a **directed chain scenario**:
+- A holds the blobs. B learns the index from A, but A's blob streams are held back.
+- C connects to B only, learns the index from B, and asks B, which answers `noBlob`.
+- Everything is then delivered **without reconnecting**, so C can obtain the blobs only through
+  B's `have`.
 
 | Mutant | Caught on |
 |---|---|
 | state sends carry `current` instead of `published` | 30/30 |
-| no `have` sent | 8/30 |
+| no `have` sent | 30/30 (was 8/30 with the random simulator alone, whose quiescence phase reconnects and so retries) |
 | received states ignored | 30/30 |
 | a send after disconnect | 30/30 |
 
@@ -490,24 +580,27 @@ want-before-hello bug on 83 of 200 seeds.
 
 **`scale 20000`**: 20,000 files on one device, then a full sync of two fresh devices: the index
 plus 40,000 blobs, 79,962 events.
-- `putMany` of the 20k files plus their persist: 0.7 s.
-- The whole sync: about 33 s native, of which about 19 s is inside `step`.
+- `putMany` of the 20k files plus their persist: 0.5 s.
+- The whole sync: about 19.5 s native, of which 10.8 s is inside `step`.
 - It passes under the 256 KB stack.
 
 **`stepbench n`** gives compiled per-event costs. At 20k entries:
-- merging the 20k-entry state and persisting it: about 27 ms;
-- `blobStored`: about 120 µs;
-- an event that changes nothing: about 85 µs;
-- a 32-hash `want`: about 110 µs.
+- merging the 20k-entry state and persisting it: about 10 ms;
+- `blobStored`: about 56 µs;
+- an event that changes nothing: about 43 µs;
+- a 32-hash `want`: about 66 µs.
+
+These timings are noisy between runs on this machine, by up to 2×.
 
 ## 11. Costs and limits (accepted), with the fix I would make
 
 | Limit | Fix |
 |---|---|
 | One edit during a session costs a whole-state send per peer (§4) | a `sendPublished` effect that rebuilds the message from the stored record, or index deltas: both declined for the demo |
-| O(n) blob bookkeeping per event: sorted-list membership, the `missing` cache, the summary length; at 20k files about 0.1 ms per event native, so a full initial sync of 20k blobs costs about 19 s of `step` time over the transfer | balanced-tree or array-indexed sets; a cached missing count |
+| O(n) blob bookkeeping per event: sorted-list membership, the `missing` cache, the summary length; at 20k files about 0.05–0.1 ms per event native, so a full initial sync of 20k blobs costs about 10–19 s of `step` time over the transfer | balanced-tree or array-indexed sets; a cached missing count |
 | Index ≤ 64 MiB, about 500k entries; a merge past the limit closes the session | raise the limit (a version bump), or chunked state messages |
-| A state sent to k peers in one step is encoded k times | share the encoded bytes between effects |
+| One envelope holds the persisted state, the shared state message, small messages and any query reply. A `snapshot` reply is about the size of the index | page the snapshot reply if a UI needs less |
+| A state that grows by merging can reach the 64 MiB limit | the merge closes the session with `stateTooLarge` (§6) |
 | Merge is O((n+m)·r) (CRDT note, risk 5) | as in the CRDT note |
 
 ## 12. Future work and open points
