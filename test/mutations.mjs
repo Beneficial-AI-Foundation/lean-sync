@@ -36,7 +36,7 @@ const M = [
   { id: 'store-failure-blames-peer (e2e)', row: 'blob store failure: not the peer\'s fault', file: 'app/js/links.mjs',
     from: "o.emit(local ? { type: 'blobStoreFailed', hash } : { type: 'blobFailed', peer: c.peer, hash }, c.epoch);", to: "o.emit({ type: 'blobFailed', peer: c.peer, hash }, c.epoch);", check: e2e('incoming-file-creation-fails-then-next-file') },
   { id: 'publish-failure-blames-peer', row: 'blob store failure: not the peer\'s fault', file: 'app/js/links.mjs',
-    from: "o.emit({ type: 'blobStoreFailed', hash: s.hash }, ep);        // not the peer's fault", to: "o.emit({ type: 'blobFailed', peer, hash: s.hash }, ep);", check: unit('links') },
+    from: "if (c.alive) o.emit({ type: 'blobStoreFailed', hash: s.hash }, ep);", to: "if (c.alive) o.emit({ type: 'blobFailed', peer, hash: s.hash }, ep);", check: unit('links') },
   { id: 'late-store-failure-after-close', row: 'blob store failure: not the peer\'s fault', file: 'app/js/links.mjs',
     from: "if (c.alive) o.emit({ type: 'blobStoreFailed', hash: s.hash }, ep);", to: "o.emit({ type: 'blobStoreFailed', hash: s.hash }, ep);", check: unit('links') },
   { id: 'no-retry-now-for-store-failures', row: 'blob store failure: shown as such', file: 'app/js/ui.mjs',
