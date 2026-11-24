@@ -279,7 +279,9 @@ export function createLinks(o) {
       s.sink.then((sink) => sink.abort(), () => {});
       o.log(`peer ${peer}: could not store blob ${hx.slice(0, 8)}: ${e.message}`);
       o.onStorageError?.(e);
-      o.emit({ type: 'blobStoreFailed', hash: s.hash }, ep);        // not the peer's fault
+      // Not the peer's fault. If the connection is gone, Lean has already re-planned the hash
+      // (possibly to another peer, whose transfer the peerless event would cancel): say nothing.
+      if (c.alive) o.emit({ type: 'blobStoreFailed', hash: s.hash }, ep);
     });
   }
   /** A stream that will not end in a stored blob. `local`: the bytes were fine but this device

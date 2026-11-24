@@ -298,3 +298,26 @@ test('a write still pending at END that then fails: blobStoreFailed once, and th
   assert.deepEqual(types(events), ['connected', 'blobStoreFailed']);
   assert.equal(aborted, 1, 'writer and temp file discarded');
 });
+
+test('a store that fails after the link closed (END already received): no failure event, sink aborted; a late success is still reported', async () => {
+  const { events, link, links, storage } = setup(); link.deliver(hello(OTHER));
+  let aborted = 0; const pending = [];
+  storage.beginIncoming = async () => ({
+    write() { return new Promise((res, rej) => pending.push({ res, rej })); },   // writes stay pending
+    async finish() { return { ok: true, hash: h2, hex: hex(h2), size: 100 }; },
+    async abort() { aborted++; },
+  });
+  const h = new Uint8Array(32).fill(10), h2 = await sha256(new Uint8Array(100).fill(3));
+  links.expect(1, [h, h2]);
+  link.deliver(start(h, 100)); link.deliver(start(h2, 100)); await sleep(5);
+  link.deliver(data(h, new Uint8Array(100))); link.deliver(end(h));
+  link.deliver(data(h2, new Uint8Array(100).fill(3))); link.deliver(end(h2));
+  await sleep(5);
+  link.drop(); await sleep(5);                  // the peer leaves; Lean may re-plan both hashes elsewhere
+  pending[0].rej(new Error('disk full'));       // h: the store fails late
+  pending[1].res();                             // h2: the store succeeds late
+  await sleep(20);
+  assert.deepEqual(types(events), ['connected', 'disconnected', 'blobStored'], 'no peerless blobStoreFailed for a gone connection');
+  assert.deepEqual(events.at(-1), { type: 'blobStored', hash: h2, peer: 1 });
+  assert.equal(aborted, 1, 'the failed sink is still discarded');
+});

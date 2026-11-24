@@ -93,8 +93,16 @@ export const scenarios = [
       await waitFor(async () => (await incomingCount(B)) === 0, 10000, 'temp file removed after the write failure');
       // Space comes back: the next automatic retry fetches the file again, from the same peer, with
       // no reconnect (the peer was never marked as lacking it).
+      // The index is saved, so no "not saved" banner; but the user who frees space can retry now
+      // instead of waiting for the back-off (up to 60 s).
+      await B.waitFor(`!!document.querySelector('#retry-store')`, 10000, 'Retry now for contents that could not be stored');
+      assert.ok(!(await B.eval(`!!document.querySelector('#banner-save')`)), 'no unsaved-changes banner: the index is saved');
       await B.eval('(window.__failWrite = 0)');
+      const retriesBefore = (await B.eval('window.leansync.log')).filter((l) => /retrying storage/.test(l)).length;
+      await B.click('#retry-store');
+      await B.waitFor(`window.leansync.log.filter((l) => /retrying storage/.test(l)).length > ${retriesBefore}`, 500, 'retrySave sent at once by Retry now');
       await B.waitFiles(files(big), 30000);
+      assert.ok(!(await B.eval(`!!document.querySelector('#retry-store')`)), 'the action goes away once stored');
       await expectSha(B, big.name, big);
       const st2 = await (await fetch(`${ctx.server.url}/admin/state?room=${ctx.room}`)).json();
       assert.equal(st2.links.length, 1, 'same session, no reconnect');
