@@ -237,10 +237,9 @@ def handle (n : Node) : Event → Node × List Effect
   | .blobStoreFailed h =>
     -- the bytes arrived but could not be stored here: do not blame the peer (no `lacks` entry),
     -- stop requesting the blob anywhere until `retrySave`
-    if h ∈ n.missing then
-      ({ n with sessions := n.sessions.map (fun s => { s with inflight := eraseH h s.inflight }),
-                parked := insertH h n.parked }, [.notify .blobsChanged])
-    else (n, [])
+    -- (a blob no longer referenced is only taken out of flight)
+    ({ n with sessions := n.sessions.map (fun s => { s with inflight := eraseH h s.inflight }),
+              parked := if h ∈ n.missing then insertH h n.parked else n.parked }, [.notify .blobsChanged])
 
 /-! ## The end-of-step pass -/
 

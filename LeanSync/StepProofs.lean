@@ -522,17 +522,19 @@ theorem handle_inv {n : Node} (h : n.Inv) (ev : Event) : (handle n ev).1.Inv := 
   | retrySave => exact { h with parkedSorted := List.Pairwise.nil }
   | blobStoreFailed hb =>
     simp only [handle]
-    split
-    · exact { h with
-        sessionsSorted := sessSorted_map _ (fun _ => rfl) h.sessionsSorted
-        sessionCap := by simpa using h.sessionCap
-        sessOk := fun x hx => by
-          simp only [List.mem_map] at hx
-          obtain ⟨y, hy, rfl⟩ := hx
-          have ho := h.sessOk y hy
-          exact { ho with inflightCap := Nat.le_trans (length_eraseH_le _ _) ho.inflightCap }
-        parkedSorted := sorted_insertH h.parkedSorted }
-    · exact h
+    exact { h with
+      sessionsSorted := sessSorted_map _ (fun _ => rfl) h.sessionsSorted
+      sessionCap := by simpa using h.sessionCap
+      sessOk := fun x hx => by
+        simp only [List.mem_map] at hx
+        obtain ⟨y, hy, rfl⟩ := hx
+        have ho := h.sessOk y hy
+        exact { ho with inflightCap := Nat.le_trans (length_eraseH_le _ _) ho.inflightCap }
+      parkedSorted := by
+        dsimp only
+        split
+        · exact sorted_insertH h.parkedSorted
+        · exact h.parkedSorted }
 
 /-! ### The end-of-step passes -/
 
@@ -960,7 +962,7 @@ theorem handle_grows (n : Node) (ev : Event) :
   | initFresh => exact ⟨rfl, State.le_refl' _⟩
   | query q => exact ⟨rfl, State.le_refl' _⟩
   | retrySave => exact ⟨rfl, State.le_refl' _⟩
-  | blobStoreFailed hb => simp only [handle]; split <;> exact ⟨rfl, State.le_refl' _⟩
+  | blobStoreFailed hb => exact ⟨rfl, State.le_refl' _⟩
 
 theorem step_current_grows' (n : Node) (ev : Event) :
     ∃ n', (step (.running n) ev).1 = .running n' ∧ n'.self = n.self ∧ State.Le n.current n'.current := by
@@ -1288,7 +1290,7 @@ theorem handle_effs (n : Node) (ev : Event) : ∀ e ∈ (handle n ev).2, HandleE
   | initFresh => simp [handle, HandleEff]
   | query q => simp [handle, HandleEff]
   | retrySave => simp only [handle]; split <;> simp [HandleEff]
-  | blobStoreFailed hb => simp only [handle]; split <;> simp [HandleEff]
+  | blobStoreFailed hb => simp [handle, HandleEff]
 
 /-- `handle` leaves the persistence bookkeeping alone, except when the host answers the persist in
 flight. -/
@@ -1372,7 +1374,7 @@ theorem handle_persistence (n : Node) (ev : Event) :
   | initFresh => exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
   | query q => exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
   | retrySave => exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
-  | blobStoreFailed hb => simp only [handle]; split <;> exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+  | blobStoreFailed hb => exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
 
 /-- An unanswered persist stays in flight through `handle`. -/
 theorem handle_keeps_inflight {n : Node} {ev : Event} {t : Nat} {s : State}
@@ -2447,13 +2449,10 @@ theorem handle_exec {v : HostView} {n : Node} (hn : n.Inv) (hr : PreRel v n) (ev
     · exact ⟨_, rfl, hr.1, hr.2.1, hr.2.2⟩
     · exact ⟨_, hnotify _ _, hr.1, hr.2.1, hr.2.2⟩
   | blobStoreFailed h =>
-    simp only [handle]
-    split
-    · refine ⟨_, hnotify _ _, fun x hx => ?_, hr.2.1, hr.2.2⟩
-      simp only [List.mem_map] at hx
-      obtain ⟨y, hy, rfl⟩ := hx
-      exact hr.1 y hy
-    · exact ⟨_, rfl, hr⟩
+    refine ⟨_, hnotify _ _, fun x hx => ?_, hr.2.1, hr.2.2⟩
+    simp only [handle, List.mem_map] at hx
+    obtain ⟨y, hy, rfl⟩ := hx
+    exact hr.1 y hy
 
 theorem step_exec {v : HostView} {m : Machine} (hm : m.Inv) (hr : HostRel v m) (ev : Event) :
     ∃ v2, (v.onEvent ev).execAll (step m ev).2 = some v2 ∧ HostRel v2 (step m ev).1 := by
@@ -2562,7 +2561,7 @@ theorem handle_rollback_mono (n : Node) (ev : Event) (h : n.rollback = true) :
   | initFresh => exact h
   | query q => exact h
   | retrySave => exact h
-  | blobStoreFailed hb => simp only [handle]; split <;> exact h
+  | blobStoreFailed hb => exact h
 
 theorem reconcileSession_no_state (self : ReplicaId) (P : Published) (s : Session) (p : PeerId)
     (d : Digest) (st : State) : .send p (.state d st) ∉ (reconcileSession self true P s).2 := by
@@ -2782,7 +2781,7 @@ theorem handle_hold (n : Node) (ev : Event) (hev : ev ≠ .retrySave) (h : n.hol
   | initFresh => exact h
   | query q => exact h
   | retrySave => exact absurd rfl hev
-  | blobStoreFailed hb => simp only [handle]; split <;> exact h
+  | blobStoreFailed hb => exact h
 
 /-- The end-of-step passes keep the hold, the parked set and `dirty` as the persist pass left them. -/
 theorem finish_hold_parked (n : Node) :
@@ -3000,7 +2999,7 @@ theorem blobStoreFailed_parks' (n : Node) (h : n.Inv) (hb : Hash) (hm : n.Missin
   have hh : handle n (.blobStoreFailed hb) =
       ({ n with sessions := n.sessions.map (fun s => { s with inflight := eraseH hb s.inflight }),
                 parked := insertH hb n.parked }, [.notify .blobsChanged]) := by
-    simp [handle, hmiss]
+    simp only [handle, hmiss, ite_true]
   have hi1 := handle_inv h (.blobStoreFailed hb)
   rw [hh] at hi1
   refine ⟨_, rfl, ?_, ?_, ?_⟩
