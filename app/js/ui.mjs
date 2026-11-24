@@ -55,13 +55,13 @@ export function createUI({ storage, getCore, transport, label }) {
     sizesLoading = true;
     try {
       for (;;) {
-        const todo = [];
+        const todo = new Set();                   // per hash, not per path
         for (const f of state.files) for (const v of f.versions) {
           if (!v.present) continue;
           const hx = Array.from(v.hash, (x) => x.toString(16).padStart(2, '0')).join('');
-          if (!state.sizes.has(hx)) todo.push(hx);
+          if (!state.sizes.has(hx)) todo.add(hx);
         }
-        if (!todo.length) return;
+        if (!todo.size) return;
         for (const hx of todo) { try { state.sizes.set(hx, (await storage.blobFile(hx)).size); } catch { state.sizes.set(hx, null); } }
         renderFiles();
       }

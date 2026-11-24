@@ -274,6 +274,9 @@ export function createLinks(o) {
       if (r.ok) o.emit({ type: 'blobStored', hash: s.hash, peer }, ep);
       else { o.log(`peer ${peer}: blob ${hx.slice(0, 8)} failed verification (got ${r.hex.slice(0, 8)})`); o.emit({ type: 'blobFailed', peer, hash: s.hash }, ep); }
     }, (e) => {
+      // A write that was still pending at END may have failed, in which case finish() never ran:
+      // abort the sink so the writer and the temp file go away (a no-op after finish()).
+      s.sink.then((sink) => sink.abort(), () => {});
       o.log(`peer ${peer}: could not store blob ${hx.slice(0, 8)}: ${e.message}`);
       o.onStorageError?.(e);
       o.emit({ type: 'blobFailed', peer, hash: s.hash }, ep);

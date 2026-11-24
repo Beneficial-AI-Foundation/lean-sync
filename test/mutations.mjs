@@ -106,6 +106,13 @@ const M = [
     from: '      if (c.recv.get(hx) !== s || s.failed) return;\n      o.onStorageError?.(e);\n      failStream(c, s.hash,', to: '      return;\n      o.onStorageError?.(e);\n      failStream(c, s.hash,', check: unit('links') },
   { id: 'fragment-size-unchecked', row: 'received: bounded reassembly', file: 'app/js/links.mjs',
     from: 'if (more && part.length !== FRAME_PAYLOAD) {', to: 'if (false) {', check: unit('links') },
+  { id: 'sink-not-aborted-after-end', row: 'no temp files accumulate', file: 'app/js/links.mjs',
+    from: '      s.sink.then((sink) => sink.abort(), () => {});\n      o.log(`peer ${peer}: could not store blob', to: '      o.log(`peer ${peer}: could not store blob', check: unit('links') },
+  { id: 'blobs-dropped-while-starting', row: 'blob durable before blobStored (reported to the machine that runs)', file: 'app/js/core.mjs',
+    from: "          emit({ type: 'blobsStored', hashes: items.map((it) => it.hash) });   // queued until running",
+    to: "          if (st.phase === 'running') emit({ type: 'blobsStored', hashes: items.map((it) => it.hash) });", check: unit('core') },
+  { id: 'size-lookup-per-path', row: 'UI scales with the file count', file: 'app/js/ui.mjs',
+    from: '        const todo = new Set();', to: "        const todo = []; todo.add = todo.push; Object.defineProperty(todo, 'size', { get: () => todo.length });", check: e2e('cold-load-many-files') },
   { id: 'sendAgain-wrong', row: 'sendAgain', file: 'app/js/codec.mjs',
     from: "out.push({ type: 'send', peer, bytes: lastState, again: true });", to: "out.push({ type: 'send', peer, bytes: new Uint8Array(0), again: true });", check: unit('codec') },
 ];

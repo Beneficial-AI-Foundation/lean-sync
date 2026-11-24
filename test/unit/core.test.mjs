@@ -17,11 +17,12 @@ function setup(o = {}) {
   links.acceptedAfter = [];
   const setAcc = links.setAccepting; links.setAccepting = (v) => { if (v) links.acceptedAfter.push(seen.length); setAcc(v); };
   const notices = []; const phases = [];
+  const ctx = {};
   const core = createCore({
-    storage, links, makeEngine: async () => { const e = trappable(await realEngine(), trap); return { ...e, process: (b) => { seen.push(b[2]); return e.process(b); } }; },
+    storage, links, makeEngine: async () => { if (ctx.holdEngine) { const g = ctx.holdEngine; ctx.holdEngine = null; await g; } const e = trappable(await realEngine(), trap); return { ...e, process: (b) => { seen.push(b[2]); return e.process(b); } }; },
     ui: { onNotice: (n) => notices.push(n), onPhase: (p) => phases.push(p) }, ...o.core,
   });
-  return { core, storage, links, trap, seen, notices, phases };
+  return Object.assign(ctx, { core, storage, links, trap, seen, notices, phases });
 }
 
 test('first start: initFresh, and the record is acknowledged only once the save completed', async () => {
@@ -176,4 +177,26 @@ test('an add that spans an engine restart is not applied to the new machine; its
   assert.ok(!t.seen.slice(n).includes(5), 'no localOp reached the new machine');
   assert.ok(t.seen.slice(n).includes(12), 'the stored blob was reported (blobsStored)');
   assert.ok(!t.core.st.lastSnapshot.some((f) => f.path === 'q'));
+});
+
+test('an add finishing while the restarted engine loads: edit dropped, blob reported once running', async () => {
+  const t = setup();
+  await t.core.start(); await sleep(150);
+  let release; const slow = new Promise((r) => { release = r; });
+  const orig = t.storage.storeLocal; t.storage.storeLocal = async (b) => { await slow; return orig(b); };
+  let open; const gate = new Promise((r) => { open = r; });
+  const pending = t.core.addFiles([{ name: 'r', blob: new Blob([new Uint8Array([6])]) }]);
+  t.holdEngine = gate;                                          // hold the next engine creation
+  t.trap.next = 1; t.core.emit({ type: 'query', q: 'status' });
+  await sleep(50);                                              // restart: inventory listed, engine loading
+  assert.equal(t.core.st.phase, 'starting');
+  release(); const r = await pending;                           // the add completes now
+  assert.equal(r.added, 0);
+  const n = t.seen.length;
+  open(); await sleep(200);
+  assert.equal(t.core.st.phase, 'running');
+  const after = t.seen.slice(n);
+  assert.equal(after[0], 0, 'init first');
+  assert.ok(after.includes(12), 'the stored blob reaches the new machine as blobsStored');
+  assert.ok(!after.includes(5), 'no edit');
 });

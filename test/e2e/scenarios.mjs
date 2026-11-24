@@ -48,21 +48,27 @@ export const scenarios = [
       // once per file while loading sizes: quadratic).
       const N = Number(process.env.COLD_LOAD_N ?? 3000);   // COLD_LOAD_N=20000 for the larger measurement
       const [A] = await devices(ctx, kinds);
-      const fs = Array.from({ length: N }, (_, i) => randomFile(`f${String(i).padStart(5, '0')}-${ctx.id}.txt`, 16));
+      // plus DUP paths that all have the same content: sizes must be looked up once per hash
+      const DUP = 500, same = randomFile('x', 16);
+      const fs = Array.from({ length: N }, (_, i) => randomFile(`f${String(i).padStart(5, '0')}-${ctx.id}.txt`, 16))
+        .concat(Array.from({ length: DUP }, (_, i) => ({ ...same, name: `same${String(i).padStart(4, '0')}-${ctx.id}.txt` })));
       const t0 = Date.now();
       await A.add(fs);
-      await A.waitRows((rows) => rows.length === N && rows.every((r) => r.status === 'complete'), 300000, `${N} files added`);
+      await A.waitRows((rows) => rows.length === N + DUP && rows.every((r) => r.status === 'complete'), 300000, `${N + DUP} files added`);
       const tAdd = Date.now() - t0;
       await A.waitFor(`document.querySelector('#saving').dataset.state === 'saved'`, 30000);
       const t1 = Date.now();
       await A.page.reload();
-      await A.waitFor(`window.leansync && window.leansync.phase === 'running' && document.querySelectorAll('#files tr').length === ${N}`, 120000, 'all rows');
+      await A.waitFor(`window.leansync && window.leansync.phase === 'running' && document.querySelectorAll('#files tr').length === ${N + DUP}`, 120000, 'all rows');
       const tRows = Date.now() - t1;
       await A.waitFor(`[...document.querySelectorAll('#files td.size')].every((c) => c.textContent !== '')`, 120000, 'all sizes');
       const tLoad = Date.now() - t1;
       const renders = await A.eval('window.leansync.renders');
       ctx.note(`${N} files: adding took ${(tAdd / 1000).toFixed(1)} s; reload to all rows shown ${(tRows / 1000).toFixed(1)} s, to every size shown ${(tLoad / 1000).toFixed(1)} s, ${renders} table renders`);
       assert.ok(renders <= 30, `table rendered ${renders} times for ${N} files`);
+      const lookups = await A.eval('window.__hashLookups');
+      ctx.note(`${lookups} OPFS lookups for ${N + DUP} paths and ${N + 1} distinct contents`);
+      assert.ok(lookups <= N + 1 + 20, `sizes looked up per hash, not per path (${lookups} lookups)`);
     },
   },
   {

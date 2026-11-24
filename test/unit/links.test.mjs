@@ -278,3 +278,22 @@ test('a storage write error stops the transfer: blobFailed, ABORT, no more credi
   assert.ok(kinds.filter((k) => k === 6).length <= 1, 'at most the one grant earned by the successful write');
   assert.equal(aborted, 1, 'the partial file is discarded');
 });
+
+test('a write still pending at END that then fails: blobFailed once, and the sink is aborted', async () => {
+  const { events, link, links, storage } = setup(); link.deliver(hello(OTHER));
+  let aborted = 0, failLast;
+  storage.beginIncoming = async () => ({
+    write() { return new Promise((res, rej) => { failLast = rej; }); },   // the write stays pending
+    async finish() { throw new Error('should not finish'); },
+    async abort() { aborted++; },
+  });
+  const h = new Uint8Array(32).fill(9);
+  links.expect(1, [h]);
+  link.deliver(start(h, 100)); await sleep(5);
+  link.deliver(data(h, new Uint8Array(100))); link.deliver(end(h));   // END while the write is pending
+  await sleep(5);
+  failLast(new Error('disk full'));
+  await sleep(20);
+  assert.deepEqual(types(events), ['connected', 'blobFailed']);
+  assert.equal(aborted, 1, 'writer and temp file discarded');
+});

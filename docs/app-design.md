@@ -133,7 +133,7 @@ never reach the new machine (its tags restart at 0).
 ## 4. Host obligations
 
 Audited by mutation (`node test/mutations.mjs`): for each row the mechanism was removed or broken
-in the app's source and the named test was run (e2e in Chromium); **43 of 43 mutants were caught** (the final run is reported in the branch's last hand-back).
+in the app's source and the named test was run (e2e in Chromium); **46 of 46 mutants were caught** (the final run is reported in the branch's last hand-back).
 "Mutant" names the break that was tried.
 
 | Obligation (sync-design §8, decision 7) | Mechanism | Test (fails when the mechanism is broken) | Mutant |
@@ -161,11 +161,11 @@ in the app's source and the named test was run (e2e in Chromium); **43 of 43 mut
 | A blob is replaced only by a verified copy, never deleted first | an intact existing copy is kept; a damaged one is overwritten by one `move()` | e2e `existing-blob-kept-when-replacement-fails` | delete, then move |
 | Row statuses follow request planning | `pending` re-queried on peer changes and on `pendingSummary` | e2e `peer-leaves-mid-fetch-row-updates` | refresh removed |
 | Transport only to the serving origin | no URL parameter selects the relay | e2e `relay-parameter-ignored` (a second relay that accepts any origin sees no connection) | `?relay=` honoured |
-| A storage failure on receive stops the transfer | the first failed write rejects; no more credit; `blobFailed` + ABORT; the temp file is removed (also after a failed publish) | unit `links`; e2e `incoming-write-or-publish-failure` (a 12 MiB transfer stops after ~1 MiB) | write errors swallowed (storage or links); temp kept |
+| A storage failure on receive stops the transfer | the first failed write rejects; no more credit; `blobFailed` + ABORT; the temp file is removed (also after a failed publish, and when a write still pending at END fails) | unit `links`; e2e `incoming-write-or-publish-failure` (a 12 MiB transfer stops after ~1 MiB) | write errors swallowed (storage or links); temp kept |
 | Bounded reassembly | a continuation fragment must be exactly 16 KiB (our framing), so fragments are bounded by the message limit | unit `links` | size unchecked |
 | Paths round-trip byte for byte | `TextDecoder(fatal, ignoreBOM)`; vectors include a leading U+FEFF | unit `codec` | BOM stripped |
-| An edit is applied only to the machine the user saw | the add captures the epoch; across a restart it is dropped (blobs still reported as `blobsStored`) | unit `core` | epoch not checked |
-| The UI scales with the file count | sizes loaded in batches, one render per batch | e2e `cold-load-many-files` (≤ 30 renders for 3,000 files) | one render per file |
+| An edit is applied only to the machine the user saw | the add captures the epoch; across a restart it is dropped, and its blobs are queued as `blobsStored` for the new machine even while it is still starting | unit `core` (two tests) | epoch not checked; blobs dropped while starting |
+| The UI scales with the file count | sizes loaded in batches, one render per batch, one lookup per distinct hash | e2e `cold-load-many-files` (≤ 30 renders for 3,000 files; lookups ≤ distinct hashes for 3,500 paths with 3,001 contents) | one render per file; one lookup per path |
 | Re-instantiate after a trap; no loop | §8 | e2e `trap-mid-sync…`, `trap-at-startup…`; unit `core` | no restart; start-up trap retried; restart stays `running` |
 | Refuse a peer with our own replica id | host HELLO check before Lean | unit `links`; e2e `same-replica-id-refused` | check removed |
 | Nothing else persisted | IDB holds the record, `rotateId`, the label | review only (not mutation-tested) | — |
@@ -276,8 +276,8 @@ device) creates a second path rather than replacing it. Files over
 
 ## 10. Tests and results
 
-Unit (`node --test test/unit/*.test.mjs`): 43 tests — codec vs Lean (6), links (21), core with the
-real engine (11), relay access (2), view (3), plus the mutation audit of §4. Engine checks: §0.
+Unit (`node --test test/unit/*.test.mjs`): 45 tests — codec vs Lean (6), links (22), core with the
+real engine (12), relay access (2), view (3), plus the mutation audit of §4. Engine checks: §0.
 End-to-end (`node test/e2e/run.mjs`): 27 scenarios, 66 runs; browsers per run in the table below (Chromium 154.0.8037.92, Firefox 146.0, Firefox ESR
 140.16.0esr, all headless, each device its own browser process and profile).
 

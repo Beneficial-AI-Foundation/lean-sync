@@ -89,7 +89,9 @@ export const FS_FAULT = `
     return __wr.apply(this, a);
   };
   const __gfh = FileSystemDirectoryHandle.prototype.getFileHandle;
+  window.__hashLookups = 0;                     // lookups of blobs/<hash> (counted, never altered)
   FileSystemDirectoryHandle.prototype.getFileHandle = function (name, opts) {
+    if (/^[0-9a-f]{64}$/.test(name) && !(opts && opts.create)) window.__hashLookups++;
     if (window.__failCreate > 0 && opts && opts.create && !/^[0-9a-f]{64}$/.test(name)) { window.__failCreate--; return Promise.reject(new DOMException('injected', 'QuotaExceededError')); }
     return __gfh.call(this, name, opts);
   };

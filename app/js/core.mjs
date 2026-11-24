@@ -295,7 +295,7 @@ export function createCore(o) {
         // The engine restarted while the files were being stored: the versions the user saw belong to
         // the old machine, so the edit is not applied. The stored blobs are durable: report them.
         if (st.epoch !== ep) {
-          if (st.phase === 'running') emit({ type: 'blobsStored', hashes: items.map((it) => it.hash) });
+          emit({ type: 'blobsStored', hashes: items.map((it) => it.hash) });   // queued until running
           log('an add was dropped: the engine restarted while its files were being stored');
           errors.push(...items.map((it) => ({ name: it.path, error: 'the sync engine restarted meanwhile; please add it again' })));
           return { added: 0, errors };
