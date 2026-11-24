@@ -81,6 +81,20 @@ test('"Retry now" sends retrySave at once; harmless when nothing failed', async 
   assert.equal(t.core.st.retryTimer, null, 'the scheduled retry was cancelled');
 });
 
+test('a blob that could not be stored schedules a retrySave with the back-off; a stale one does not', async () => {
+  const t = setup();
+  await t.core.start(); await sleep(50);
+  t.core.emit({ type: 'blobStoreFailed', hash: new Uint8Array(32).fill(7) }, t.core.st.epoch - 1);   // stale: dropped
+  await sleep(50);
+  assert.equal(t.core.st.retryTimer, null, 'no retry for a stale failure');
+  t.core.emit({ type: 'blobStoreFailed', hash: new Uint8Array(32).fill(7) });
+  await sleep(50);
+  assert.ok(t.seen.includes(14), 'blobStoreFailed delivered');
+  assert.ok(!t.seen.includes(13), 'not retried at once');
+  await sleep(1100);
+  assert.ok(t.seen.includes(13), 'retrySave after the 1 s back-off');
+});
+
 test('the inventory is reported in chunks before peers are accepted', async () => {
   const storage = memoryStorage();
   for (let i = 0; i < 25000; i++) storage.blobs.set(i.toString(16).padStart(64, '0'), new Uint8Array(0));

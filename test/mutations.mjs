@@ -21,11 +21,24 @@ const M = [
     from: "emit({ type: 'persistFailed', tag }, ep);", to: '', check: unit('core') },
   { id: 'persist-slot-race', row: 'one persist in flight / restart waits', file: 'app/js/core.mjs',
     from: 'const done = () => { if (st.persist === slot) st.persist = null; };', to: 'const done = () => {}; queueMicrotask(() => queueMicrotask(() => { st.persist = null; }));', check: unit('core') },
-  // The original loop: the UI refreshed its status on saveFailed, and refresh queries were not held
-  // back while saves failed (both parts restored; either alone was fixed).
-  { id: 'host-events-while-save-fails', row: 'retry after back-off', file: 'app/js/core.mjs',
-    from: ['if (st.refreshTimer || st.saveFailed) return;', '        st.saveFailed = true;\n', '      if (st.saveFailed) return;                     // deferred to the nudge\n'],
-    to: ['if (st.refreshTimer) return;', "        st.saveFailed = true; refresh('status');\n", ''], check: unit('core') },
+  // Lean holds a failed save and parks a blob it could not store until `retrySave`: the host must
+  // send it, after a back-off, and only then.
+  { id: 'retry-without-back-off', row: 'retry after back-off', file: 'app/js/core.mjs',
+    from: 'if (ep === st.epoch && st.retryOwed) sendRetry(ep); }, st.retryBackoff);', to: 'if (ep === st.epoch && st.retryOwed) sendRetry(ep); }, 0);', check: unit('core') },
+  { id: 'retry-never-sent', row: 'retry after back-off', file: 'app/js/core.mjs',
+    from: 'if (ep === st.epoch && st.retryOwed) sendRetry(ep); }', to: 'if (false) sendRetry(ep); }', check: unit('core') },
+  { id: 'store-failure-not-retried', row: 'blob store failure: retried', file: 'app/js/core.mjs',
+    from: "if (ev.type === 'persistFailed' || ev.type === 'blobStoreFailed') owesRetry(ep);", to: "if (ev.type === 'persistFailed') owesRetry(ep);", check: e2e('incoming-write-or-publish-failure') },
+  { id: 'store-failure-not-retried (unit)', row: 'blob store failure: retried', file: 'app/js/core.mjs',
+    from: "if (ev.type === 'persistFailed' || ev.type === 'blobStoreFailed') owesRetry(ep);", to: "if (ev.type === 'persistFailed') owesRetry(ep);", check: unit('core') },
+  { id: 'store-failure-blames-peer', row: 'blob store failure: not the peer\'s fault', file: 'app/js/links.mjs',
+    from: "o.emit(local ? { type: 'blobStoreFailed', hash } : { type: 'blobFailed', peer: c.peer, hash }, c.epoch);", to: "o.emit({ type: 'blobFailed', peer: c.peer, hash }, c.epoch);", check: unit('links') },
+  { id: 'store-failure-blames-peer (e2e)', row: 'blob store failure: not the peer\'s fault', file: 'app/js/links.mjs',
+    from: "o.emit(local ? { type: 'blobStoreFailed', hash } : { type: 'blobFailed', peer: c.peer, hash }, c.epoch);", to: "o.emit({ type: 'blobFailed', peer: c.peer, hash }, c.epoch);", check: e2e('incoming-file-creation-fails-then-next-file') },
+  { id: 'publish-failure-blames-peer', row: 'blob store failure: not the peer\'s fault', file: 'app/js/links.mjs',
+    from: "o.emit({ type: 'blobStoreFailed', hash: s.hash }, ep);        // not the peer's fault", to: "o.emit({ type: 'blobFailed', peer, hash: s.hash }, ep);", check: unit('links') },
+  { id: 'local-failure-shown-as-waiting', row: 'blob store failure: shown as such', file: 'app/js/view.mjs',
+    from: "localFailure: 'could not be stored on this device',", to: "localFailure: 'waiting: nobody reachable has it',", check: unit('view') },
   { id: 'save-banner-removed', row: 'surface saveFailed', file: 'app/js/ui.mjs',
     from: 'if (state.saveFailed) b.append(', to: 'if (false) b.append(', check: e2e('storage-failure') },
   { id: 'supersede-after-await', row: 'supersession = what was shown', file: 'app/js/core.mjs',
@@ -118,7 +131,7 @@ const M = [
 ];
 
 const only = (() => { const i = process.argv.indexOf('--only'); return i > 0 ? process.argv[i + 1].split(',') : null; })();
-const appFiles = ['app/js/core.mjs', 'app/js/storage.mjs', 'app/js/links.mjs', 'app/js/ui.mjs', 'app/js/main.mjs', 'app/js/codec.mjs'];
+const appFiles = ['app/js/core.mjs', 'app/js/storage.mjs', 'app/js/links.mjs', 'app/js/ui.mjs', 'app/js/main.mjs', 'app/js/codec.mjs', 'app/js/view.mjs'];
 const pristine = Object.fromEntries(appFiles.map((f) => [f, readFileSync(join(root, f), 'utf8')]));
 const site = () => execFileSync(join(root, 'scripts/build-site.sh'), { stdio: 'ignore' });
 const results = [];
