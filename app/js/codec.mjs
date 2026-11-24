@@ -29,12 +29,12 @@ export const QUERIES = { snapshot: 0, pending: 1, status: 2 };
 // What this codec handles; test/unit/codec.test.mjs checks these against Lean's constructor lists.
 // Event `localOp` is flattened into its three operations.
 export const EVENT_TYPES = ['init', 'initFresh', 'connected', 'disconnected', 'received', 'putMany', 'deleteMany', 'resolve',
-  'persisted', 'persistFailed', 'blobStored', 'blobsStored', 'blobFailed', 'blobLost', 'query'];
+  'persisted', 'persistFailed', 'blobStored', 'blobsStored', 'blobFailed', 'blobLost', 'query', 'retrySave', 'blobStoreFailed'];
 export const EFFECT_TYPES = ['send', 'close', 'persist', 'fetch', 'serveBlob', 'notify', 'reply'];   // + sendAgain (encoding only)
 export const NOTICES = ['indexChanged', 'blobsChanged', 'peerStatus', 'peerClosed', 'peerLeft', 'peerError', 'rollbackDetected',
   'opRejected', 'badEvent', 'startupFailed', 'notInitialized', 'alreadyInitialized', 'pendingSummary', 'saveFailed'];  // by tag
 export const REPLIES = ['snapshot', 'pending', 'status'];                                   // by tag
-export const PENDING_STATUS = ['waiting', 'requested', 'queued'];                           // by tag
+export const PENDING_STATUS = ['waiting', 'requested', 'queued', 'localFailure'];           // by tag
 
 export class CodecError extends Error {
   constructor(msg) { super(msg); this.name = 'CodecError'; }
@@ -131,6 +131,8 @@ export function encodeEvent(ev) {
       w.byte(11).byte(QUERIES[ev.q]);
       break;
     case 'blobsStored': w.byte(12); wHashes(w, ev.hashes); break;
+    case 'retrySave': w.byte(13); break;
+    case 'blobStoreFailed': w.byte(14); wHash(w, ev.hash); break;
     default: throw new CodecError(`unknown event type ${ev.type}`);
   }
   return w.done();
@@ -209,7 +211,10 @@ function rNotice(r) {
     case 9: return { notice: 'startupFailed', ...rErr(r) };
     case 10: return { notice: 'notInitialized' };
     case 11: return { notice: 'alreadyInitialized' };
-    case 12: { const fetching = r.nat(); const queued = r.nat(); const waiting = r.nat(); return { notice: 'pendingSummary', fetching, queued, waiting }; }
+    case 12: {
+      const fetching = r.nat(); const queued = r.nat(); const waiting = r.nat(); const localFailure = r.nat();
+      return { notice: 'pendingSummary', fetching, queued, waiting, localFailure };
+    }
     case 13: return { notice: 'saveFailed' };
     default: throw new CodecError(`bad notice tag ${t}`);
   }
@@ -229,6 +234,7 @@ function rReply(r) {
         if (s === 0) return { hash, status: 'waiting' };
         if (s === 1) return { hash, status: 'requested', peer: r.peer() };
         if (s === 2) return { hash, status: 'queued' };
+        if (s === 3) return { hash, status: 'localFailure' };
         throw new CodecError(`bad pending status ${s}`);
       }),
     };

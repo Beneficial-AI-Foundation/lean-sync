@@ -207,7 +207,7 @@ test('an empty blob is received and stored', async () => {
   assert.deepEqual(events.at(-1), { type: 'blobStored', hash: h, peer: 1 }); assert.ok(storage.blobs.has(hex(h)));
 });
 
-test('if no file can be created for a stream: blobFailed, and ABORT so the sender moves on', async () => {
+test('if no file can be created for a stream: blobStoreFailed (not the peer\'s fault), and ABORT so the sender moves on', async () => {
   const { events, link, links, storage } = setup(); link.deliver(hello(OTHER));
   storage.beginIncoming = async () => { throw Object.assign(new Error('quota'), { name: 'QuotaExceededError' }); };
   const h = new Uint8Array(32).fill(3);
@@ -215,7 +215,8 @@ test('if no file can be created for a stream: blobFailed, and ABORT so the sende
   link.sent.length = 0;
   link.deliver(start(h, 10 * 1024 * 1024));                 // larger than the initial credit window
   await sleep(10);
-  assert.deepEqual(types(events), ['connected', 'blobFailed']);
+  assert.deepEqual(types(events), ['connected', 'blobStoreFailed']);
+  assert.deepEqual(events.at(-1), { type: 'blobStoreFailed', hash: h });
   assert.ok(link.sent.some((f) => f[0] === 5), 'ABORT sent');
 });
 
@@ -256,7 +257,7 @@ test('a continuation fragment of the wrong size closes the link (fragment count 
   assert.equal(b.link.closed, true);
 });
 
-test('a storage write error stops the transfer: blobFailed, ABORT, no more credit, temp file removed', async () => {
+test('a storage write error stops the transfer: blobStoreFailed, ABORT, no more credit, temp file removed', async () => {
   const { events, link, links, storage } = setup(); link.deliver(hello(OTHER));
   let writes = 0, aborted = 0;
   storage.beginIncoming = async () => ({
@@ -271,7 +272,7 @@ test('a storage write error stops the transfer: blobFailed, ABORT, no more credi
   link.sent.length = 0;
   for (let i = 0; i < 8; i++) link.deliver(data(h, new Uint8Array(16384)));
   await sleep(20);
-  assert.deepEqual(types(events), ['connected', 'blobFailed']);
+  assert.deepEqual(types(events), ['connected', 'blobStoreFailed']);
   assert.ok(link.sent.some((f) => f[0] === 5), 'ABORT sent');
   const kinds = link.sent.map((f) => f[0]);
   assert.ok(kinds.lastIndexOf(6) < kinds.indexOf(5), 'no credit after the failure');
@@ -279,7 +280,7 @@ test('a storage write error stops the transfer: blobFailed, ABORT, no more credi
   assert.equal(aborted, 1, 'the partial file is discarded');
 });
 
-test('a write still pending at END that then fails: blobFailed once, and the sink is aborted', async () => {
+test('a write still pending at END that then fails: blobStoreFailed once, and the sink is aborted', async () => {
   const { events, link, links, storage } = setup(); link.deliver(hello(OTHER));
   let aborted = 0, failLast;
   storage.beginIncoming = async () => ({
@@ -294,6 +295,6 @@ test('a write still pending at END that then fails: blobFailed once, and the sin
   await sleep(5);
   failLast(new Error('disk full'));
   await sleep(20);
-  assert.deepEqual(types(events), ['connected', 'blobFailed']);
+  assert.deepEqual(types(events), ['connected', 'blobStoreFailed']);
   assert.equal(aborted, 1, 'writer and temp file discarded');
 });

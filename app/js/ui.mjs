@@ -123,7 +123,10 @@ export function createUI({ storage, getCore, transport, label }) {
       el('span', { class: 'peer', 'data-status': x.status }, `${i ? ' · ' : ''}${x.label ?? 'peer ' + x.peer}${x.replica ? ` (${replicaKey(x.replica).slice(0, 6)})` : ''} ${x.status === 'inSync' ? 'in sync' : x.status}`))
       : [el('span', { class: 'muted' }, transport.online ? 'none connected' : 'offline')]));
     const s = state.summary;
-    $('#summary').textContent = s && (s.fetching + s.queued + s.waiting) ? `Missing file contents: ${s.fetching} fetching · ${s.queued} queued · ${s.waiting} waiting` : '';
+    $('#summary').textContent = s && (s.fetching + s.queued + s.waiting + s.localFailure)
+      ? `Missing file contents: ${s.fetching} fetching · ${s.queued} queued · ${s.waiting} waiting` +
+        (s.localFailure ? ` · ${s.localFailure} could not be stored on this device (retrying)` : '')
+      : '';
   }
 
   function renderFiles() {

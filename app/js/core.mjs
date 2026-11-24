@@ -11,6 +11,10 @@
 // - `persisted` is emitted only after storage.saveRecord resolved, which happens only from the
 //   IndexedDB transaction's `complete` event; any failure becomes `persistFailed`.
 // - Peers are accepted (`connected`) only after the whole blob inventory was reported.
+// - Storage failures: after `persistFailed` Lean issues no write, and after `blobStoreFailed` it
+//   requests that blob from nobody, until the host sends `retrySave`. The host owns the back-off:
+//   one timer, 1 s doubling to 60 s per retry, reset when a write succeeds; "Retry now" sends
+//   `retrySave` at once.
 import { encodeEvent, decodeEffects, replicaKey } from './codec.mjs';
 import { EngineTrap } from './engine.mjs';
 import { sha256, hex, fromHex } from './hash.mjs';
@@ -37,7 +41,7 @@ export function createCore(o) {
   const st = {
     phase: 'idle',           // idle | starting | running | startupFailed | failed
     epoch: 0, engine: null, instances: 0, traps: [], replica: null, clearRotateOnSave: false,
-    queue: [], pumping: false, persist: null, saveFailed: false, saveBackoff: 0, nudgeTimer: null,
+    queue: [], pumping: false, persist: null, saveFailed: false, retryOwed: false, retryBackoff: 0, retryTimer: null,
     rollback: false, startupError: null, failure: null, lastSnapshot: null, refreshTimer: null, refreshWhat: new Set(),
     log: [],
   };
@@ -50,9 +54,29 @@ export function createCore(o) {
       if (ev.type === 'blobStored') ev = { type: 'blobsStored', hashes: [ev.hash] };   // durable fact survives
       else return;                                                                       // peer- or persist-bound: stale
     }
+    if (ev.type === 'persistFailed' || ev.type === 'blobStoreFailed') owesRetry(ep);
+    else if (ev.type === 'blobStored' && ev.peer != null) storageWorks();
     st.queue.push(ev);
     schedulePump();
   }
+
+  // ------------------------------------------------------------ storage failures and the back-off
+  // Lean holds a failed save and parks a blob it could not store until `retrySave` (sync-design §3,
+  // §5), so nothing the host or a peer does in the meantime causes a write; the timer below is the
+  // only automatic retry.
+  function owesRetry(ep) {
+    st.retryOwed = true;
+    if (st.retryTimer) return;
+    st.retryBackoff = st.retryBackoff ? Math.min(st.retryBackoff * 2, 60000) : 1000;
+    st.retryTimer = setTimeout(() => { st.retryTimer = null; if (ep === st.epoch && st.retryOwed) sendRetry(ep); }, st.retryBackoff);
+  }
+  function sendRetry(ep) {
+    st.retryOwed = false;
+    log('retrying storage (retrySave)');
+    emit({ type: 'retrySave' }, ep);
+  }
+  function storageWorks() { st.retryBackoff = 0; }
+  function cancelRetry() { clearTimeout(st.retryTimer); st.retryTimer = null; st.retryOwed = false; st.retryBackoff = 0; }
   function schedulePump() { if (!st.pumping) { st.pumping = true; queueMicrotask(pump); } }
   function pump() {
     try {
@@ -104,7 +128,8 @@ export function createCore(o) {
       done();
       if (ep !== st.epoch) return;
       if (clearRotate) st.clearRotateOnSave = false;
-      if (st.saveFailed) { st.saveFailed = false; st.saveBackoff = 0; clearTimeout(st.nudgeTimer); st.nudgeTimer = null; log('saving works again'); ui.onNotice({ notice: 'saveRecovered' }); }
+      storageWorks();
+      if (st.saveFailed) { st.saveFailed = false; log('saving works again'); ui.onNotice({ notice: 'saveRecovered' }); }
       emit({ type: 'persisted', tag, digest }, ep);
       refresh('status', ...st.refreshWhat);
     }, (err) => {
@@ -121,18 +146,7 @@ export function createCore(o) {
       case 'startupFailed': st.startupFailedNotice = e; break;
       case 'indexChanged': refresh('snapshot', 'pending', 'status'); break;
       case 'blobsChanged': refresh('snapshot', 'pending'); break;
-      case 'saveFailed': {
-        st.saveFailed = true;
-        // Lean retries on the next event; if no other event comes, nudge it after a back-off
-        // (1, 2, 4 ... 60 s). The back-off grows only with the nudges themselves, so failures
-        // caused by a burst of real events do not push the next scheduled retry far away.
-        if (!st.nudgeTimer) {
-          st.saveBackoff = st.saveBackoff || 1000;
-          const ep = st.epoch;
-          st.nudgeTimer = setTimeout(() => { st.nudgeTimer = null; st.saveBackoff = Math.min(st.saveBackoff * 2, 60000); nudge(ep); }, st.saveBackoff);
-        }
-        break;
-      }
+      case 'saveFailed': st.saveFailed = true; refresh('status'); break;   // the retry is scheduled by owesRetry
       case 'rollbackDetected':
         st.rollback = true;
         log('rollback detected: edits are blocked; a restart under a new identity is required');
@@ -164,21 +178,13 @@ export function createCore(o) {
     else if (e.reply === 'status') ui.onStatus({ ...e, saveFailed: st.saveFailed, rollback: st.rollback || e.rollback });
   }
 
-  // While saves fail, every event makes Lean retry the write, so the host must not generate events
-  // of its own (UI queries) in reaction: they wait for the back-off nudge.
-  function nudge(ep) {
-    if (ep !== st.epoch) return;
-    st.refreshWhat.add('status');
-    const ws = [...st.refreshWhat]; st.refreshWhat.clear();
-    for (const q of ['status', 'snapshot', 'pending']) if (ws.includes(q)) emit({ type: 'query', q }, ep);
-  }
+  // UI queries are ordinary events: while a save failure holds Lean, they cause no write.
   function refresh(...what) {
     for (const w of what) st.refreshWhat.add(w);
-    if (st.refreshTimer || st.saveFailed) return;
+    if (st.refreshTimer) return;
     const ep = st.epoch;
     st.refreshTimer = setTimeout(() => {
       st.refreshTimer = null;
-      if (st.saveFailed) return;                     // deferred to the nudge
       const ws = [...st.refreshWhat]; st.refreshWhat.clear();
       for (const q of ['snapshot', 'pending', 'status']) if (ws.includes(q)) emit({ type: 'query', q }, ep);
     }, 60);
@@ -240,7 +246,7 @@ export function createCore(o) {
     o.links.setAccepting(false);
     o.links.resetAll();
     st.engine = null;
-    clearTimeout(st.nudgeTimer); st.nudgeTimer = null; st.saveFailed = false; st.saveBackoff = 0;
+    cancelRetry(); st.saveFailed = false;
     const p = st.persist; st.persist = null;
     if (p) await p.catch(() => {});        // let the in-flight write settle before re-reading storage
     await start(opts);
@@ -339,7 +345,13 @@ export function createCore(o) {
       }
       return new Blob([data]);
     },
-    retrySave() { if (st.phase === 'running') { clearTimeout(st.nudgeTimer); st.nudgeTimer = null; nudge(st.epoch); } },
+    /** "Retry now": end the hold and request the parked blobs at once (harmless when nothing failed). */
+    retrySave() {
+      if (st.phase !== 'running') return;
+      clearTimeout(st.retryTimer); st.retryTimer = null;
+      sendRetry(st.epoch);
+      refresh('status', 'pending');
+    },
     resetIndex: () => restart('reset confirmed by the user', { reset: true }),
     async newIdentity() { await o.storage.setRotate(); await restart('new identity confirmed by the user'); },
     retryStart: () => restart('retry'),
