@@ -23,11 +23,12 @@ closure (build/c and build/obj are shared caches). `scripts/wasm/check-engine.sh
 | 20k files: `putMany` + persist / full sync of a fresh device (index + 20k blobs) | 54 ms / 11.8 s wall, of which ~10 s inside the receiving engine (~0.5 ms per `blobStored`, about 2× the native figure) |
 
 **Same behaviour as native: yes, as far as tested.** `sync-tests trace 1 200` (new test subcommand
-in `Tests/Sync.lean`; libraries untouched) records 200 simulator worlds — 83,729 events with every
-injected fault (crashes, drops, garbage, truncation, persist and blob failures) — with the native
-output of `process` on each Lean-encoded event. `test/wasm-replay.mjs` feeds each device's events
-to its own wasm instance (a fresh instance after each simulated crash: 1,601 instances) and
-compares: **0 byte mismatches**, and all 83,729 outputs decode with the JS decoder. The Node smoke
+in `Tests/Sync.lean`; libraries untouched) records 200 simulator worlds — 78,457 events with every
+injected fault (crashes, drops, garbage, truncation, persist and blob failures, storage-full
+periods with `blobStoreFailed` and `retrySave`) — with the native output of `process` on each
+Lean-encoded event. `test/wasm-replay.mjs` feeds each device's events to its own wasm instance (a
+fresh instance after each simulated crash: 1,623 instances) and compares: **0 byte mismatches**,
+and all 78,457 outputs decode with the JS decoder (numbers of the storage-failure branch). The Node smoke
 test (`test/wasm-smoke.mjs`) runs `initFresh` → `persisted` → `putMany` → `persisted` → `snapshot`
 through the JS encoder, wasm and the JS decoder and checks the exact record bytes; the browser smoke
 (`test/browser-smoke.mjs`) does the same in Chromium 154, Firefox 146 and Firefox ESR 140, each run
@@ -89,7 +90,7 @@ build on every run (`scripts/test-app.sh`):
 - `scripts/wasm/Ctors.lean` prints the constructor lists of the ten boundary types from the Lean
   environment; the JS test fails unless the codec's tables cover exactly those constructors, and
   unless the vectors exercise every one of them.
-- The 83,729 real envelopes of the trace replay (§0) all decode.
+- The 78,457 real envelopes of the trace replay (§0) all decode.
 
 ## 3. Event loop (as built)
 
