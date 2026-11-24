@@ -1,0 +1,31 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>LeanSync wasm smoke</title>
+<pre id="out">running…</pre>
+<script type="module">
+// Stage-1 browser smoke: load the wasm engine, initFresh, putMany(<assigned path>), snapshot.
+// Reports to the test server, which checks the snapshot against the path IT assigned to this run.
+import { createEngine } from '/app/js/engine.mjs';
+import { encodeEvent, decodeEffects } from '/app/js/codec.mjs';
+const q = new URLSearchParams(location.search);
+const run = q.get('run'), path = q.get('path');
+const report = (body) => fetch('/report', { method: 'POST', body: JSON.stringify({ run, ...body }) });
+try {
+  const t0 = performance.now();
+  const { default: createLeanSync } = await import('/build/sync/lean_sync.mjs');
+  const eng = await createEngine(createLeanSync);
+  const startupMs = performance.now() - t0;
+  const step = (ev) => decodeEffects(eng.process(encodeEvent(ev)));
+  const sha = async (b) => new Uint8Array(await crypto.subtle.digest('SHA-256', b));
+  const ack = async (effs) => { for (const e of effs) if (e.type === 'persist') step({ type: 'persisted', tag: e.tag, digest: await sha(e.state) }); };
+  await ack(step({ type: 'initFresh', replica: { hi: 5n, lo: 6n }, blobs: [] }));
+  const h = await sha(new TextEncoder().encode('x'));
+  await ack(step({ type: 'putMany', items: [{ path, hash: h, supersedes: [] }] }));
+  const snap = step({ type: 'query', q: 'snapshot' }).find((e) => e.reply === 'snapshot');
+  const files = snap.files.map((f) => f.path);
+  document.getElementById('out').textContent = `files: ${JSON.stringify(files)}`;
+  await report({ files, startupMs, ua: navigator.userAgent });
+} catch (e) {
+  await report({ error: String(e?.stack ?? e) });
+}
+</script>

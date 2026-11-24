@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
-# Generate C for every module in the import closure of the demo, using the native Lean
+# Generate C for every module in the import closure of ROOT_MODULE, using the native Lean
 # toolchain of the same version:
-#   - our own modules come from Lake (`lake build`, C lands in .lake/build/ir)
+#   - our own modules come from Lake (`lake build <Module>:c`, C lands in .lake/build/ir)
 #   - Init/Std modules are re-elaborated from the matching lean4 sources with `lean -c`
 #     (the release ships oleans and static libs for them, but not their C).
-# Output: build/c/<Module/Path>.c and build/c/modules.txt
+# usage: gen-c.sh <RootModule> <outdir>
+# Output: build/c/<Module/Path>.c (a cache shared by all targets) and <outdir>/modules.txt
+# (the closure, in import order), which is what build-wasm.sh links.
 source "$(dirname "$0")/common.sh"
-ROOT_MODULE="${1:-WasmDemo}"
+ROOT_MODULE="${1:?root module}"
+LIST_DIR="${2:?output dir}"
 OUT="$BUILD/c"
-mkdir -p "$OUT"
+mkdir -p "$OUT" "$LIST_DIR"
 
 cd "$ROOT"
 lake build "$ROOT_MODULE" >/dev/null
-LEAN_PATH="$ROOT/.lake/build/lib/lean" lake env "$LEAN" --run scripts/wasm/ModClosure.lean "$ROOT_MODULE" > "$OUT/modules.txt"
+LEAN_PATH="$ROOT/.lake/build/lib/lean" lake env "$LEAN" --run scripts/wasm/ModClosure.lean "$ROOT_MODULE" > "$LIST_DIR/modules.txt"
 
 export LEAN LEAN_SRC OUT ROOT
-grep -E '^(Init|Std|Lean)(\.|$)' "$OUT/modules.txt" | xargs -P "$JOBS" -I{} bash -c '
+grep -E '^(Init|Std|Lean)(\.|$)' "$LIST_DIR/modules.txt" | xargs -P "$JOBS" -I{} bash -c '
   m={}; rel="${m//.//}"; src="$LEAN_SRC/$rel.lean"; dst="$OUT/$rel.c"
   if [ ! -f "$dst" ] || [ "$src" -nt "$dst" ]; then
     mkdir -p "$(dirname "$dst")"
@@ -24,9 +27,10 @@ grep -E '^(Init|Std|Lean)(\.|$)' "$OUT/modules.txt" | xargs -P "$JOBS" -I{} bash
       && mv "$dst.tmp" "$dst" || { echo "C generation failed for $m" >&2; exit 255; }
   fi'
 
-# Our own modules: Lake already produced the C.
-grep -vE '^(Init|Std|Lean)(\.|$)' "$OUT/modules.txt" | while read -r m; do
+# Our own modules: Lake produces the C (the `:c` facet), we copy it.
+grep -vE '^(Init|Std|Lean)(\.|$)' "$LIST_DIR/modules.txt" | while read -r m; do
   rel="${m//.//}"; mkdir -p "$(dirname "$OUT/$rel.c")"
-  cp "$ROOT/.lake/build/ir/$rel.c" "$OUT/$rel.c"
+  lake build "$m:c" >/dev/null
+  cmp -s "$ROOT/.lake/build/ir/$rel.c" "$OUT/$rel.c" || cp "$ROOT/.lake/build/ir/$rel.c" "$OUT/$rel.c"
 done
-echo "gen-c: $(wc -l < "$OUT/modules.txt") modules -> $OUT"
+echo "gen-c: $(wc -l < "$LIST_DIR/modules.txt") modules -> $OUT (closure: $LIST_DIR/modules.txt)"

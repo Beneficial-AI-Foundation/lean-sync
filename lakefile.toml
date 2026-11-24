@@ -9,15 +9,6 @@ name = "LeanCrdt"
 [[lean_lib]]
 name = "LeanSync"
 
-# Spike: Lean -> WebAssembly feasibility demo (see docs/spike-lean-wasm.md).
-[[lean_lib]]
-name = "WasmDemo"
-
-# Native build of the same code, used as the reference the wasm output is checked against.
-[[lean_exe]]
-name = "wasm-demo-native"
-root = "WasmDemo"
-
 # Native tests for the CRDT core (see Tests/Main.lean and scripts/test-stack.sh).
 [[lean_exe]]
 name = "crdt-tests"

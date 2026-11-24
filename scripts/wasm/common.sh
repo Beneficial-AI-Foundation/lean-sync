@@ -1,4 +1,4 @@
-# Shared settings for the Lean -> wasm spike scripts. Sourced, not executed.
+# Shared settings for the Lean -> wasm build scripts. Sourced, not executed.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -9,7 +9,7 @@ LIBUV_TAG="v1.48.0"   # the version lean4's CMakeLists.txt pins for Emscripten
 VENDOR="$ROOT/vendor"
 LEAN_SRC="$VENDOR/lean4/src"
 LIBUV_SRC="$VENDOR/libuv"
-BUILD="$ROOT/build"
+BUILD="${BUILD:-$ROOT/build}"   # overridable, e.g. for a timed clean build
 
 # The native toolchain is used only to *generate C* (and must be the same version).
 LEAN_TC="${LEAN_TC:-$HOME/.elan/toolchains/leanprover--lean4---v${LEAN_VERSION}}"

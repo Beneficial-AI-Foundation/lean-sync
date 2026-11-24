@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# One-command build of the Lean -> wasm64 spike.
+# One-command build of the sync engine (LeanSync.Envelope) for wasm64.
 #   scripts/wasm/build.sh
-# Produces build/site/ (static page: index.html, host.mjs, lean_demo.{mjs,wasm}).
+# Produces build/sync/lean_sync.{mjs,wasm}: an ES module exporting `createLeanSync`, whose
+# instance exposes _ls_init/_ls_input/_ls_process/_ls_result/_ls_release (wasm/sync_shim.c).
 source "$(dirname "$0")/common.sh"
-
+TDIR="$BUILD/sync"
+t0=$SECONDS
 "$ROOT/scripts/wasm/fetch.sh"
-cd "$ROOT" && lake build wasm-demo-native >/dev/null   # native reference for the checks
-"$ROOT/scripts/wasm/gen-c.sh" WasmDemo
+t1=$SECONDS
+"$ROOT/scripts/wasm/gen-c.sh" LeanSync.Envelope "$TDIR"
+t2=$SECONDS
 "$ROOT/scripts/wasm/build-runtime.sh"
-"$ROOT/scripts/wasm/build-wasm.sh"
-
-SITE="$BUILD/site"
-mkdir -p "$SITE"
-cp "$ROOT/wasm/index.html" "$ROOT/wasm/host.mjs" "$BUILD/lean_demo.mjs" "$BUILD/lean_demo.wasm" "$SITE/"
-echo "site: $SITE  (serve with: node wasm/serve.mjs 8000)"
+t3=$SECONDS
+"$ROOT/scripts/wasm/build-wasm.sh" "$TDIR" "$ROOT/wasm/sync_shim.c" lean_sync createLeanSync \
+  _ls_init,_ls_input,_ls_process,_ls_result,_ls_release
+t4=$SECONDS
+echo "timings (s): fetch $((t1-t0)), gen-c $((t2-t1)), runtime $((t3-t2)), compile+link $((t4-t3)), total $((t4-t0))"

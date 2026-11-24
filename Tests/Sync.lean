@@ -6,7 +6,7 @@ import Std.Data.HashSet
 # Native tests for the sync protocol and wire format
 
 Usage: `sync-tests [unit | codec | sim [seed] [count] | sim-lenient [seed] [count] | mutation |
-scale [n] | control [n] | deep [n] | debug seed | all]`.
+scale [n] | control [n] | deep [n] | debug seed | trace seed count file | vectors file | all]`.
 
 * `unit`      hand-written flows: handshake, state exchange, persist-before-send, stale events,
               protocol errors, blob re-planning, the `noBlob` → `have` chain, rollback mode,
@@ -166,6 +166,10 @@ structure World where
   keepLog : Bool := false
   work : Array (Nat × Event) := #[]
   stats : Stats := {}
+  /-- `trace` subcommand: record every event each device processed, with the native output of
+  `process` on its encoding, for replay through the wasm build (`test/wasm-replay.mjs`). -/
+  keepTrace : Bool := false
+  trace : ByteArray := .empty
 
 abbrev WM := StateT World IO
 
@@ -307,12 +311,25 @@ def runEffect (d : Nat) (e : Effect) : WM Unit := do
     let _ ← pushItem p.val.toNat d it
   | .notify _ | .reply _ => pure ()
 
+/-- Append one trace record: `kind:u8 device:u32le len:u32le event len:u32le effects`
+(kind 0 = event and native output, 1 = the device's machine was reset (crash), 2 = new world). -/
+def traceRec (kind : UInt8) (d : Nat) (ev out : ByteArray) : WM Unit := do
+  if (← get).keepTrace then
+    let u32 (acc : ByteArray) (n : Nat) : ByteArray :=
+      ((((acc.push (n % 256).toUInt8).push (n / 256 % 256).toUInt8).push (n / 65536 % 256).toUInt8).push
+        (n / 16777216 % 256).toUInt8)
+    modify fun w =>
+      { w with trace := (u32 (u32 (u32 (w.trace.push kind) d) ev.size ++ ev) out.size) ++ out }
+
 /-- Process one event at device `d`: step (directly or through the byte boundary), check every
 effect against the host view, carry the effects out, check the node. -/
 def processEvent (d : Nat) (ev : Event) : WM Unit := do
   modStats fun s => { s with events := s.events + 1 }
   let dev ← getDev d
   let w ← get
+  if w.keepTrace then
+    let input := encodeEvent ev
+    traceRec 0 d input (process dev.m input).2
   let viaBytes ← if w.useProcess then (do return (← rand 4) == 0) else pure false
   let (m', effs) ← if viaBytes then do
       modStats fun s => { s with viaProcess := s.viaProcess + 1 }
@@ -464,6 +481,7 @@ def crash (d : Nat) : WM Unit := do
     | some (_, b) => if completes then some b else dev.record
     | none => dev.record
   setDev d { dev with m := .uninit, view := {}, pending := none, record, inc := dev.inc + 1 }
+  traceRec 1 d .empty .empty
   let ids := (← get).conns.filter (fun c => c.a == d || c.b == d) |>.map (·.id)
   for id in ids do
     if let some c ← dropConnRaw id then
@@ -1411,6 +1429,154 @@ def deep : Nat → Nat
   | 0 => 0
   | n + 1 => deep n + 1
 
+/-! ## Golden vectors for the JS codec (`sync-tests vectors FILE`, read by test/unit/codec.test.mjs)
+
+One JSON object per line: `{"event": <JS event>, "hex": <Lean encodeEvent>}` or
+`{"effects": [<JS effect>...], "hex": <Lean encodeEffects>}`. The JSON is written in the shape the
+JS codec uses (app/js/codec.mjs): byte strings as hex, replica halves as decimal strings. Every
+renderer below is an exhaustive `match`, so a new constructor in LeanSync breaks this file's build
+until it is rendered here; the JS test separately checks its tables against the constructor lists
+printed by scripts/wasm/Ctors.lean. -/
+
+def jHex (b : ByteArray) : String :=
+  "\"" ++ String.join (b.data.toList.map fun x =>
+    let s := (Nat.toDigits 16 x.toNat).asString; if s.length == 1 then "0" ++ s else s) ++ "\""
+def jStr (s : String) : String :=
+  "\"" ++ String.join (s.toList.map fun c =>
+    if c == '"' then "\\\"" else if c == '\\' then "\\\\"
+    else if c.toNat < 32 then s!"\\u{String.mk ((List.replicate (4 - (Nat.toDigits 16 c.toNat).length) '0') ++ Nat.toDigits 16 c.toNat)}"
+    else c.toString) ++ "\""
+def jObj (kvs : List (String × String)) : String :=
+  "{" ++ ",".intercalate (kvs.map fun (k, v) => jStr k ++ ":" ++ v) ++ "}"
+def jArr (xs : List String) : String := "[" ++ ",".intercalate xs ++ "]"
+def jBool (b : Bool) : String := if b then "true" else "false"
+def jRep (r : ReplicaId) : String := jObj [("hi", jStr (toString r.hi.toNat)), ("lo", jStr (toString r.lo.toNat))]
+def jHash (h : Hash) : String := jHex h.bytes
+def jHashes (hs : List Hash) : String := jArr (hs.map jHash)
+def jPeer (p : PeerId) : String := toString p.val.toNat
+
+def jEvent : Event → String
+  | .init r st bs => jObj [("type", jStr "init"), ("replica", jRep r), ("stored", jHex st), ("blobs", jHashes bs)]
+  | .initFresh r bs => jObj [("type", jStr "initFresh"), ("replica", jRep r), ("blobs", jHashes bs)]
+  | .connected p => jObj [("type", jStr "connected"), ("peer", jPeer p)]
+  | .disconnected p => jObj [("type", jStr "disconnected"), ("peer", jPeer p)]
+  | .received p b => jObj [("type", jStr "received"), ("peer", jPeer p), ("bytes", jHex b)]
+  | .localOp (.putMany items) => jObj [("type", jStr "putMany"), ("items", jArr (items.map fun it =>
+      jObj [("path", jStr it.path), ("hash", jHash it.hash), ("supersedes", jHashes it.supersedes)]))]
+  | .localOp (.deleteMany items) => jObj [("type", jStr "deleteMany"), ("items", jArr (items.map fun it =>
+      jObj [("path", jStr it.path), ("supersedes", match it.supersedes with | none => "null" | some hs => jHashes hs)]))]
+  | .localOp (.resolve p h) => jObj [("type", jStr "resolve"), ("path", jStr p), ("hash", jHash h)]
+  | .persisted t d => jObj [("type", jStr "persisted"), ("tag", toString t), ("digest", jHex d.bytes)]
+  | .persistFailed t => jObj [("type", jStr "persistFailed"), ("tag", toString t)]
+  | .blobStored h src => jObj [("type", jStr "blobStored"), ("hash", jHash h), ("peer", match src with | none => "null" | some p => jPeer p)]
+  | .blobsStored hs => jObj [("type", jStr "blobsStored"), ("hashes", jHashes hs)]
+  | .blobFailed p h => jObj [("type", jStr "blobFailed"), ("peer", jPeer p), ("hash", jHash h)]
+  | .blobLost h => jObj [("type", jStr "blobLost"), ("hash", jHash h)]
+  | .query q => jObj [("type", jStr "query"), ("q", jStr (match q with | .snapshot => "snapshot" | .pending => "pending" | .status => "status"))]
+
+def jReason : CloseReason → String
+  | .protocolError => jStr "protocolError" | .incompatible => jStr "incompatible"
+  | .sameReplicaId => jStr "sameReplicaId" | .tooManyPeers => jStr "tooManyPeers" | .stateTooLarge => jStr "stateTooLarge"
+def jStatus : PeerStatus → String
+  | .handshaking => jStr "handshaking" | .syncing => jStr "syncing" | .inSync => jStr "inSync"
+def jErr : DecodeError → List (String × String)
+  | .truncated => [("error", jStr "truncated"), ("value", "0")]
+  | .trailing => [("error", jStr "trailing"), ("value", "0")]
+  | .tooLarge => [("error", jStr "tooLarge"), ("value", "0")]
+  | .badVersion v => [("error", jStr "badVersion"), ("value", toString v)]
+  | .badKind k => [("error", jStr "badKind"), ("value", toString k)]
+  | .badTag t => [("error", jStr "badTag"), ("value", toString t)]
+  | .nonCanonical => [("error", jStr "nonCanonical"), ("value", "0")]
+  | .badUtf8 => [("error", jStr "badUtf8"), ("value", "0")]
+def jNotice : Notice → List (String × String)
+  | .indexChanged => [("notice", jStr "indexChanged")]
+  | .blobsChanged => [("notice", jStr "blobsChanged")]
+  | .peerStatus p s r => [("notice", jStr "peerStatus"), ("peer", jPeer p), ("status", jStatus s),
+      ("replica", match r with | none => "null" | some r => jRep r)]
+  | .peerClosed p r b => [("notice", jStr "peerClosed"), ("peer", jPeer p), ("reason", jReason r), ("byPeer", jBool b)]
+  | .peerLeft p => [("notice", jStr "peerLeft"), ("peer", jPeer p)]
+  | .peerError p e => [("notice", jStr "peerError"), ("peer", jPeer p)] ++ jErr e
+  | .rollbackDetected => [("notice", jStr "rollbackDetected")]
+  | .opRejected why => [("notice", jStr "opRejected"), ("why", jStr why)]
+  | .badEvent e => [("notice", jStr "badEvent")] ++ jErr e
+  | .saveFailed => [("notice", jStr "saveFailed")]
+  | .startupFailed e => [("notice", jStr "startupFailed")] ++ jErr e
+  | .pendingSummary f q w => [("notice", jStr "pendingSummary"), ("fetching", toString f), ("queued", toString q), ("waiting", toString w)]
+  | .notInitialized => [("notice", jStr "notInitialized")]
+  | .alreadyInitialized => [("notice", jStr "alreadyInitialized")]
+def jPend : Hash × PendingStatus → String
+  | (h, .requested p) => jObj [("hash", jHash h), ("status", jStr "requested"), ("peer", jPeer p)]
+  | (h, .queued) => jObj [("hash", jHash h), ("status", jStr "queued")]
+  | (h, .waiting) => jObj [("hash", jHash h), ("status", jStr "waiting")]
+def jReply : Reply → List (String × String)
+  | .snapshot files => [("reply", jStr "snapshot"), ("files", jArr (files.map fun (p, vs) =>
+      jObj [("path", jStr p), ("versions", jArr (vs.map fun v => jObj [("hash", jHash v.hash), ("present", jBool v.present)]))]))]
+  | .pending items => [("reply", jStr "pending"), ("items", jArr (items.map jPend))]
+  | .status pf d rb peers => [("reply", jStr "status"), ("persistInFlight", jBool pf), ("dirty", jBool d), ("rollback", jBool rb),
+      ("peers", jArr (peers.map fun (p, s) => jObj [("peer", jPeer p), ("status", jStatus s)]))]
+def jEffect : Effect → String
+  | .send p m => jObj [("type", jStr "send"), ("peer", jPeer p), ("bytes", jHex (encodeMessage m))]
+  | .close p r => jObj [("type", jStr "close"), ("peer", jPeer p), ("reason", jReason r)]
+  | .persist t s => jObj [("type", jStr "persist"), ("tag", toString t), ("state", jHex (encodeState s))]
+  | .fetch p hs => jObj [("type", jStr "fetch"), ("peer", jPeer p), ("hashes", jHashes hs), ("bytes", jHex (encodeMessage (.want hs)))]
+  | .serveBlob p h => jObj [("type", jStr "serveBlob"), ("peer", jPeer p), ("hash", jHash h)]
+  | .notify n => jObj ([("type", jStr "notify")] ++ jNotice n)
+  | .reply r => jObj ([("type", jStr "reply")] ++ jReply r)
+
+/-- One sample of every constructor (and every tag-carrying sub-constructor), with edge values. -/
+def sampleEvents (st : State) : List Event :=
+  let big : ReplicaId := ⟨0xFFFFFFFFFFFFFFFF, 0x8000000000000000⟩
+  let p : PeerId := ⟨0xFFFFFFFF⟩
+  [ .init big (encodeState st) [h32 1, h32 2], .init ⟨0, 0⟩ ByteArray.empty [],
+    .initFresh ⟨1, 127⟩ [], .initFresh big [h32 3],
+    .connected ⟨0⟩, .connected p, .disconnected ⟨128⟩,
+    .received ⟨300⟩ (encodeMessage (.hello 1 big (mkDigest (ByteArray.mk (Array.replicate 32 9))))), .received ⟨1⟩ ByteArray.empty,
+    .localOp (.putMany []), .localOp (.putMany [{ path := "日本/ファイル \"q\" \\ x", hash := h32 4, supersedes := [h32 5, h32 6] }, { path := "", hash := h32 7, supersedes := [] }]),
+    .localOp (.deleteMany []), .localOp (.deleteMany [{ path := "a", supersedes := none }, { path := "b/c", supersedes := some [] }, { path := "d", supersedes := some [h32 8] }]),
+    .localOp (.resolve "x y" (h32 9)), .localOp (.resolve "\uFEFFbom-first.txt" (h32 9)),
+    .persisted 0 (mkDigest (ByteArray.mk (Array.replicate 32 0xAB))), .persisted 1099511627776 (mkDigest (ByteArray.mk (Array.replicate 32 1))),
+    .persistFailed 0, .persistFailed 16384,
+    .blobStored (h32 10) none, .blobStored (h32 11) (some p),
+    .blobsStored [], .blobsStored ((List.range 300).map h32),
+    .blobFailed ⟨5⟩ (h32 12), .blobLost (h32 13),
+    .query .snapshot, .query .pending, .query .status ]
+
+def sampleEffectLists (st : State) : List (List Effect) :=
+  let p : PeerId := ⟨77⟩
+  let d := mkDigest (ByteArray.mk (Array.replicate 32 3))
+  let errs : List DecodeError := [.truncated, .trailing, .tooLarge, .badVersion 2, .badKind 300, .badTag 99, .nonCanonical, .badUtf8]
+  let reasons : List CloseReason := [.protocolError, .incompatible, .sameReplicaId, .tooManyPeers, .stateTooLarge]
+  [ [],
+    [.send p (.hello 1 ⟨1, 2⟩ d), .send p (.digest d), .send p (.state d st), .send ⟨78⟩ (.state d st), .send ⟨79⟩ (.state d st),
+     .send p (.noBlob [h32 1]), .send p (.have [h32 2, h32 3]), .send p (.bye .sameReplicaId)],
+    reasons.map (.close p ·),
+    [.persist 0 st, .persist 1099511627776 State.empty],
+    [.fetch p [h32 4], .fetch ⟨0xFFFFFFFF⟩ ((List.range 32).map h32), .serveBlob p (h32 5)],
+    [.notify .indexChanged, .notify .blobsChanged, .notify (.peerStatus p .handshaking none),
+     .notify (.peerStatus p .syncing (some ⟨0xFFFFFFFFFFFFFFFF, 0⟩)), .notify (.peerStatus p .inSync (some ⟨3, 4⟩)),
+     .notify (.peerLeft p), .notify .rollbackDetected, .notify (.opRejected "path too long: é"), .notify .notInitialized,
+     .notify .alreadyInitialized, .notify (.pendingSummary 0 0 0), .notify (.pendingSummary 32 1 4096), .notify .saveFailed],
+    reasons.map (fun r => .notify (.peerClosed p r (r == .incompatible))),
+    errs.map (fun e => .notify (.peerError p e)) ++ errs.map (fun e => .notify (.badEvent e)) ++ errs.map (fun e => .notify (.startupFailed e)),
+    [.reply (.snapshot []), .reply (.snapshot [("a", [⟨h32 1, true⟩, ⟨h32 2, false⟩]), ("b/ü", []), ("c", [⟨h32 3, false⟩]), ("\uFEFFbom", [⟨h32 4, true⟩])]),
+     .reply (.pending []), .reply (.pending [(h32 3, .waiting), (h32 4, .requested p), (h32 5, .queued)]),
+     .reply (.status false false false []), .reply (.status true true true [(p, .handshaking), (⟨78⟩, .syncing), (⟨79⟩, .inSync)])] ]
+
+def vectorsCmd (file : String) (randomCount : Nat := 300) : IO Unit := do
+  let ((), _) ← (do
+    let st ← randomState 25
+    let mut lines : Array String := #[]
+    for e in sampleEvents st do lines := lines.push (jObj [("event", jEvent e), ("hex", jHex (encodeEvent e))])
+    for l in sampleEffectLists st do lines := lines.push (jObj [("effects", jArr (l.map jEffect)), ("hex", jHex (encodeEffects l))])
+    for _ in [0:randomCount] do
+      let st ← randomState (← rr 20)
+      let e ← randomEvent st
+      lines := lines.push (jObj [("event", jEvent e), ("hex", jHex (encodeEvent e))])
+      let l ← randomEffects st
+      lines := lines.push (jObj [("effects", jArr (l.map jEffect)), ("hex", jHex (encodeEffects l))])
+    IO.FS.writeFile file ("\n".intercalate lines.toList ++ "\n")
+    IO.println s!"vectors: {lines.size} lines -> {file}" : RM Unit).run ⟨12345⟩
+
 end SyncTests
 
 
@@ -1479,6 +1645,24 @@ def main (args : List String) : IO UInt32 := do
     let count := (rest[1]? >>= String.toNat?).getD 200
     simTests { c with label := "sim-lenient" } seed count (ackFirst := true)
   | ["mutation"] => mutationTests { c with label := "mutation" }
+  | ["vectors", file] => vectorsCmd file; return 0
+  | ["trace", seed, count, file] =>
+    -- Simulator runs (4 devices, 400 random steps + quiescence per seed) recorded for wasm replay.
+    let s0 := seed.toNat?.getD 1
+    let mut out : ByteArray := .empty
+    let mut nev := 0
+    for s in [s0:s0 + count.toNat?.getD 1] do
+      let act : WM Unit := do
+        traceRec 2 0 .empty .empty
+        for d in [0:4] do boot d
+        for _ in [0:400] do randomStep
+        quiesce s
+      let ((), w) ← act.run { newWorld 4 s with keepTrace := true }
+      check c s!"trace seed {s}" w.violations.isEmpty (fun _ => s!"{w.violations.toList.take 2}")
+      out := out ++ w.trace
+      nev := nev + w.stats.events
+    IO.FS.writeBinFile file out
+    IO.println s!"trace: {nev} events, {out.size} bytes -> {file}"
   | ["debug", seed] =>
     let sd := seed.toNat?.getD 1
     let act : WM Unit := do
@@ -1514,7 +1698,7 @@ def main (args : List String) : IO UInt32 := do
     codecTests { c with label := "codec" }
     simTests { c with label := "sim" } 1 200
     mutationTests { c with label := "mutation" }
-  | _ => IO.eprintln "usage: sync-tests [unit | codec | sim [seed] [count] | sim-lenient [seed] [count] | mutation | scale [n] | control [n] | deep [n] | debug seed | all]"; return 2
+  | _ => IO.eprintln "usage: sync-tests [unit | codec | sim [seed] [count] | sim-lenient [seed] [count] | mutation | scale [n] | control [n] | deep [n] | debug seed | trace seed count file | vectors file | all]"; return 2
   let n ← failures.get
   IO.println s!"{← checks.get} checks run"
   if n == 0 then IO.println "all tests passed"; return 0

@@ -1,3 +1,8 @@
+> **Note (branch `browser-app`):** the demo this note describes (`WasmDemo.lean`, its lakefile targets, `wasm/index.html`,
+> `serve.mjs`, `check-node.mjs`, `host.mjs`, `shim.c`, `scripts/wasm/check-browsers.sh`) was removed. The build scripts now build
+> the sync engine; the equivalent checks live in `scripts/wasm/check-engine.sh` (Node and browser checks of the engine) and
+> `scripts/test-app.sh` (the app); see `docs/app-design.md`.
+
 # Spike: running compiled Lean in the browser (WebAssembly)
 
 Date: 2026-11-23 · Lean **4.36.0 (pinned for the demo)** · Emscripten 6.0.5 · branch `spike/lean-wasm`
