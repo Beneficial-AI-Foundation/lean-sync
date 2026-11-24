@@ -24,6 +24,12 @@ open LeanSync
 #print axioms decodeEffects_encodeEffects
 #print axioms step_effects_ok
 #print axioms persistFailed_no_retry_in_step
+#print axioms held_no_persist
+#print axioms persistFailed_no_persist_until_retry
+#print axioms retrySave_releases
+#print axioms retrySave_persists
+#print axioms retrySave_not_held
+#print axioms blobStoreFailed_parks
 #print axioms step_received_state
 #print axioms step_putMany
 #print axioms step_current_grows

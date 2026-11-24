@@ -96,8 +96,8 @@ inductive Event where
   | localOp (op : LocalOp)
   /-- The state of `persist tag` is durably stored; `digest` is SHA-256 of the stored bytes. -/
   | persisted (tag : Nat) (digest : Digest)
-  /-- The host could not store the state of `persist tag` (e.g. quota). Lean will issue a new
-  persist on a later event; the host decides when to call again (back-off is the host's job). -/
+  /-- The host could not store the state of `persist tag` (e.g. quota). Lean then holds: it issues
+  no persist on any later event until the host sends `retrySave` (back-off is the host's job). -/
   | persistFailed (tag : Nat)
   /-- Blob `h` was verified and durably stored (`src` = the peer it came from, if any). -/
   | blobStored (h : Hash) (src : Option PeerId)
@@ -109,6 +109,14 @@ inductive Event where
   /-- The host found that a blob it had reported present is gone or unreadable. -/
   | blobLost (h : Hash)
   | query (q : Query)
+  /-- Local storage may work again (the host's back-off timer fired, or the user asked): end the
+  hold that `persistFailed` started, so the latest state is persisted at the end of this step,
+  and request the blobs parked by `blobStoreFailed` again. When nothing is held or parked this
+  changes nothing: no persist is issued that would not have been issued anyway. -/
+  | retrySave
+  /-- Blob `h` arrived intact but this device could not store it (quota, I/O error). The sender is
+  not blamed: `h` is parked (no longer requested from anyone) until the next `retrySave`. -/
+  | blobStoreFailed (h : Hash)
 
 /-! ## Lean → host: effects -/
 
@@ -123,6 +131,7 @@ inductive PendingStatus where
   | requested (p : PeerId)   -- a `want` is outstanding at `p`
   | queued                   -- a greeted ready peer may have it, but its request slots are full
   | waiting                  -- every greeted ready peer said it lacks it (or there is none)
+  | localFailure             -- it arrived but could not be stored on this device; parked until `retrySave`
   deriving DecidableEq, Repr, Inhabited
 
 /-- Why a host input was rejected. -/
@@ -151,16 +160,17 @@ inductive Notice where
   | opRejected (why : String)             -- invalid local op (bad hash size, too long path, too large)
   | badEvent (e : DecodeError)            -- the event envelope did not decode
   /-- The host could not store the state (`persistFailed`): recent changes are not durable, and
-  nothing new is sent to peers until a later persist succeeds. Lean retries on the next event. -/
+  nothing new is sent to peers until a later persist succeeds. Lean retries after `retrySave`. -/
   | saveFailed
   /-- `init` with a stored state that does not decode. Lean stays uninitialised; the host may
   retry, or (after user confirmation) start with `initFresh` and a fresh replica id. -/
   | startupFailed (e : DecodeError)
   /-- Missing blobs: `fetching` are requested from a peer now; `queued` are not requested yet
   but some greeted ready peer may have them (its request slots are full); `waiting` have no
-  reachable source (every greeted ready peer lacks them, or none is connected). Emitted
-  whenever the triple changes. -/
-  | pendingSummary (fetching : Nat) (queued : Nat) (waiting : Nat)
+  reachable source (every greeted ready peer lacks them, or none is connected); `localFailure`
+  arrived but could not be stored here (parked until `retrySave`). Emitted whenever the four
+  counts change. -/
+  | pendingSummary (fetching : Nat) (queued : Nat) (waiting : Nat) (localFailure : Nat)
   | notInitialized                        -- an event other than `init` before `init`
   | alreadyInitialized                    -- a second `init`
 
@@ -236,15 +246,18 @@ structure Node where
   nextTag : Nat := 0
   /-- `current` changed since the last `persist` was issued. -/
   dirty : Bool := false
-  /-- The host just reported a failed persist: do not issue the retry in the same step, but on
-  the next event (so failures alone cannot drive a write loop). -/
+  /-- The host reported a failed persist: issue no persist until the host sends `retrySave`
+  (so no event, of any kind, can drive a write loop; the host owns the back-off). -/
   holdPersist : Bool := false
+  /-- Blobs that arrived but could not be stored locally (`blobStoreFailed`), strictly sorted:
+  not requested from any peer until the next `retrySave`. -/
+  parked : List Hash := []
   /-- Blob hashes present in local storage, strictly sorted. -/
   blobs : List Hash := []
   /-- Hashes referenced by `current` and not in `blobs`, strictly sorted (a cache). -/
   missing : List Hash := []
   /-- Last `pendingSummary` reported. -/
-  summary : Nat × Nat × Nat := (0, 0, 0)
+  summary : Nat × Nat × Nat × Nat := (0, 0, 0, 0)
   /-- Sessions, strictly sorted by `peer`. -/
   sessions : List Session := []
   /-- A peer revealed dots of `self` beyond `current`: host-rule violation detected. -/

@@ -12,9 +12,12 @@ from stage 1; each is marked **CHANGED** with the reason:
   stage-1 `step_putMany` was already false under the stage-1 design, which refused local edits).
 * `step_plans_blobs` quantifies over ready sessions *to which we have sent our hello*: the
   simulator found that requesting blobs before our own hello makes the peer close the session
-  (a real bug, fixed), so no blob is requested on a session before that.
+  (a real bug, fixed), so no blob is requested on a session before that. It also gained the
+  disjunct "the blob is parked": a blob this device could not store (`blobStoreFailed`) is
+  deliberately not requested again until `retrySave` (`retrySave_releases` empties the set).
 
-`rollback_no_state` is new. Definitions used below (`Node.Inv`, `Node.Missing`, `effectsAt`,
+`rollback_no_state` is new, and section 6 (storage failures) lists the theorems of the
+`retrySave` / `blobStoreFailed` protocol change. Definitions used below (`Node.Inv`, `Node.Missing`, `effectsAt`,
 `AckedBy`, `Message.revealed`, `HostView`, `Executable`) are in `LeanSync.StepProofs` and
 `LeanSync.HostModel`.
 -/
@@ -132,13 +135,17 @@ theorem step_settles (n : Node) (ev : Event) (h : n.Inv) (n' : Node)
       (x.peerDigest = some P.digest ∨ x.lastSent = some P.digest) :=
   step_settles' n ev h n' hstep P hP hrb
 
-/-- After every step, every missing blob is requested from some peer, or no ready peer we have
-greeted can take the request (it said it lacks the blob, or its request window is full).
+/-- After every step, every missing blob is requested from some peer, or is parked because this
+device could not store it, or no ready peer we have greeted can take the request (it said it
+lacks the blob, or its request window is full).
 **CHANGED**: only sessions to which we have sent our hello (`x.helloSent`): a request before our
-hello would be rejected by the peer (bug found by the simulator, fixed). -/
+hello would be rejected by the peer (bug found by the simulator, fixed).
+**CHANGED** (protocol change B): the disjunct `hb ∈ n'.parked` is new. This weakens the
+statement on purpose: a parked blob is not requested until `retrySave`, which empties the parked
+set (`retrySave_releases`), after which this theorem again gives one of the other disjuncts. -/
 theorem step_plans_blobs (n : Node) (ev : Event) (h : n.Inv) (n' : Node)
     (hstep : (step (.running n) ev).1 = .running n') (hb : Hash) (hm : n'.Missing hb) :
-    (∃ x ∈ n'.sessions, hb ∈ x.inflight) ∨
+    (∃ x ∈ n'.sessions, hb ∈ x.inflight) ∨ hb ∈ n'.parked ∨
     (∀ x ∈ n'.sessions, x.Ready → x.helloSent = true →
       hb ∈ x.lacks ∨ x.inflight.length = maxInflightPerPeer) :=
   step_plans_blobs' n ev h n' hstep hb hm
@@ -197,10 +204,60 @@ theorem process_output_decodes (m : Machine) (hm : m.Inv) (input : ByteArray) :
 
 /-! ## 6. Storage failures -/
 
-/-- New: the step that handles a `persistFailed` event never emits a `persist`; the retry waits
-for the next event. So failure events alone cannot drive the host into a write loop. -/
+/-- The step that handles a `persistFailed` event never emits a `persist`. (Unchanged; the trace
+form `persistFailed_no_persist_until_retry` below extends it to every later step up to the next
+`retrySave`.) -/
 theorem persistFailed_no_retry_in_step (m : Machine) (hm : m.Inv) (t : Nat) :
     ∀ t' s, Effect.persist t' s ∉ (step m (.persistFailed t)).2 :=
   persistFailed_no_persist m hm t
+
+/-- New (protocol change A): a held node (a save failed and no `retrySave` came since) emits no
+`persist` on any event other than `retrySave`, and stays held. -/
+theorem held_no_persist (n : Node) (h : n.Inv) (ev : Event) (hev : ev ≠ .retrySave)
+    (hh : n.holdPersist = true) :
+    (∀ t s, Effect.persist t s ∉ (step (.running n) ev).2) ∧
+      ∃ n', (step (.running n) ev).1 = .running n' ∧ n'.holdPersist = true :=
+  held_no_persist' n h ev hev hh
+
+/-- New (A), trace form: if the machine is running when the host reports `persistFailed` at step
+`j`, then no step from `j` up to and including `i` emits a `persist`, as long as no `retrySave`
+arrives in between. Whatever else happens (peer messages, blob completions, queries), the host is
+never asked to write again until it says so. -/
+theorem persistFailed_no_persist_until_retry (evs : List Event) (j t : Nat) (n : Node)
+    (hm : machineAt evs j = .running n) (hj : evs[j]? = some (.persistFailed t)) (i : Nat)
+    (hji : j ≤ i) (hno : ∀ k, j < k → k ≤ i → evs[k]? ≠ some .retrySave) :
+    ∀ t' s, Effect.persist t' s ∉ effectsAt evs i :=
+  persistFailed_no_persist_until_retry' evs j t n hm hj i hji hno
+
+/-- New (A and B), liveness: `retrySave` always ends the hold and releases every parked blob, and
+afterwards either a persist is in flight or there is nothing left to save. So the machine is
+never stuck: the host's next `retrySave` gets saving and fetching going again. -/
+theorem retrySave_releases (n : Node) :
+    ∃ n', (step (.running n) .retrySave).1 = .running n' ∧ n'.holdPersist = false ∧
+      n'.parked = [] ∧ (n'.inflight.isSome = true ∨ n'.dirty = false) :=
+  retrySave_releases' n
+
+/-- New (A), liveness: a `retrySave` while the state is dirty and no persist is in flight (the
+situation after a failed save) emits a persist of the latest state. -/
+theorem retrySave_persists (n : Node) (hd : n.dirty = true) (hi : n.inflight = none) :
+    Effect.persist n.nextTag n.current ∈ (step (.running n) .retrySave).2 :=
+  retrySave_persists' n hd hi
+
+/-- New (A): `retrySave` when not held issues no persist: after any step a node that is not held
+has a persist in flight or nothing dirty, so the retry has nothing to add. (Its only other effect
+is to release parked blobs, if any.) -/
+theorem retrySave_not_held (m : Machine) (hm : m.Inv) (ev : Event) (n : Node)
+    (hs : (step m ev).1 = .running n) (hh : n.holdPersist = false) :
+    ∀ t s, Effect.persist t s ∉ (step (.running n) .retrySave).2 :=
+  retrySave_not_held' m hm ev n hs hh
+
+/-- New (B): a blob that arrived but could not be stored here is parked, is in flight nowhere
+after the step, and no peer is blamed for it: every session keeps exactly the `lacks` set it had
+(contrast `blobFailed p h`, which records `h` as lacking at `p` for the session). -/
+theorem blobStoreFailed_parks (n : Node) (h : n.Inv) (hb : Hash) (hm : n.Missing hb) :
+    ∃ n', (step (.running n) (.blobStoreFailed hb)).1 = .running n' ∧ hb ∈ n'.parked ∧
+      (∀ x ∈ n'.sessions, hb ∉ x.inflight) ∧
+      (∀ x ∈ n'.sessions, ∃ y ∈ n.sessions, y.peer = x.peer ∧ y.lacks = x.lacks) :=
+  blobStoreFailed_parks' n h hb hm
 
 end LeanSync

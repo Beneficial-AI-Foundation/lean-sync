@@ -86,6 +86,7 @@ structure Node.Inv (n : Node) : Prop where
   sessionsSorted : SessSorted n.sessions
   sessionCap : n.sessions.length ≤ maxSessions
   sessOk : ∀ s ∈ n.sessions, SessOk n.blobs s
+  parkedSorted : StrictlySorted n.parked
 
 def Machine.Inv : Machine → Prop
   | .uninit => True
@@ -211,6 +212,7 @@ theorem Inv.setSession {n : Node} (h : n.Inv) {s : Session} (hs : SessOk n.blobs
     rcases mem_setSession hx with rfl | hx
     · exact hs
     · exact h.sessOk x hx
+  parkedSorted := h.parkedSorted
 
 theorem Inv.dropSession {n : Node} (h : n.Inv) (p : PeerId) : (n.dropSession p).Inv where
   currentOk := h.currentOk
@@ -225,6 +227,7 @@ theorem Inv.dropSession {n : Node} (h : n.Inv) (p : PeerId) : (n.dropSession p).
   sessionsSorted := sessSorted_filter _ h.sessionsSorted
   sessionCap := Nat.le_trans (List.length_filter_le _ _) h.sessionCap
   sessOk := fun x hx => h.sessOk x (mem_dropSession hx).1
+  parkedSorted := h.parkedSorted
 
 /-! ### Invariant under the other node updates -/
 
@@ -243,6 +246,7 @@ theorem Inv.withCurrent {n : Node} (h : n.Inv) {s : State} (hs : s.WireOk) (hle 
   sessionsSorted := h.sessionsSorted
   sessionCap := h.sessionCap
   sessOk := h.sessOk
+  parkedSorted := h.parkedSorted
 
 theorem length_eraseH_le (h : Hash) (l : List Hash) : (eraseH h l).length ≤ l.length :=
   List.length_filter_le _ _
@@ -295,6 +299,7 @@ theorem inv_gotBlobs {n : Node} (h : n.Inv) (hs : List Hash) : (gotBlobs n hs).1
         simp only [Node.Missing]; grind
       sessionsSorted := sessSorted_map _ (fun _ => rfl) h.sessionsSorted
       sessionCap := by simpa using h.sessionCap
+      parkedSorted := h.parkedSorted
       sessOk := fun x hx => by
         simp only [List.mem_map] at hx
         obtain ⟨y, hy, rfl⟩ := hx
@@ -514,6 +519,20 @@ theorem handle_inv {n : Node} (h : n.Inv) (ev : Event) : (handle n ev).1.Inv := 
         sessOk := fun x hx => sessOk_mono (h.sessOk x hx) (fun z hz => ((mem_eraseH z).1 hz).1) }
     · exact h
   | query q => exact h
+  | retrySave => exact { h with parkedSorted := List.Pairwise.nil }
+  | blobStoreFailed hb =>
+    simp only [handle]
+    split
+    · exact { h with
+        sessionsSorted := sessSorted_map _ (fun _ => rfl) h.sessionsSorted
+        sessionCap := by simpa using h.sessionCap
+        sessOk := fun x hx => by
+          simp only [List.mem_map] at hx
+          obtain ⟨y, hy, rfl⟩ := hx
+          have ho := h.sessOk y hy
+          exact { ho with inflightCap := Nat.le_trans (length_eraseH_le _ _) ho.inflightCap }
+        parkedSorted := sorted_insertH h.parkedSorted }
+    · exact h
 
 /-! ### The end-of-step passes -/
 
@@ -785,19 +804,24 @@ theorem mem_busyOf {l : List Session} {h : Hash} (hh : h ∈ busyOf l) : ∃ x �
   rw [mem_sortDedup, List.mem_flatMap] at hh
   exact hh
 
-/-- The spec of the planning pass, instantiated. -/
+/-- The spec of the planning pass, instantiated: it plans the missing blobs that are not parked. -/
 theorem planPass_spec {n : Node} (h : n.Inv) :
-    ∃ l', (planPass n).1 = { n with sessions := l' } ∧ Forall2 (PlanRel n.missing) n.sessions l' ∧
-      (∀ e ∈ (planPass n).2, FetchOk n.missing n.sessions e) ∧
-      ∀ hb ∈ n.missing, (∃ x ∈ l', hb ∈ x.inflight) ∨
+    ∃ l', (planPass n).1 = { n with sessions := l' } ∧
+      Forall2 (PlanRel (sdiff n.missing n.parked)) n.sessions l' ∧
+      (∀ e ∈ (planPass n).2, FetchOk (sdiff n.missing n.parked) n.sessions e) ∧
+      ∀ hb ∈ n.missing, hb ∈ n.parked ∨ (∃ x ∈ l', hb ∈ x.inflight) ∨
         ∀ s' ∈ l', s'.ready = true → s'.helloSent = true → hb ∈ s'.lacks ∨ maxInflightPerPeer ≤ s'.inflight.length := by
-  obtain ⟨l', es, heq, hrel, hes, hcov⟩ := planGo_spec n.missing h.missingSorted n.sessions (busyOf n.sessions)
-    [] [] (sorted_sortDedup _) (fun x hx => (h.sessOk x hx).lacksSorted)
+  have hM := sorted_sdiff h.missingSorted h.parkedSorted
+  obtain ⟨l', es, heq, hrel, hes, hcov⟩ := planGo_spec (sdiff n.missing n.parked) hM n.sessions
+    (busyOf n.sessions) [] [] (sorted_sortDedup _) (fun x hx => (h.sessOk x hx).lacksSorted)
     (fun hb hh => by simpa using mem_busyOf hh)
   refine ⟨l', by simp [planPass, heq], hrel, by simpa [planPass, heq] using hes, fun hb hh => ?_⟩
-  rcases hcov hb hh with ⟨x, hx, hxi⟩ | hall
-  · exact .inl ⟨x, by simpa using hx, hxi⟩
-  · exact .inr hall
+  by_cases hp : hb ∈ n.parked
+  · exact .inl hp
+  have hb' : hb ∈ sdiff n.missing n.parked := (mem_sdiff h.missingSorted h.parkedSorted hb).2 ⟨hh, hp⟩
+  rcases hcov hb hb' with ⟨x, hx, hxi⟩ | hall
+  · exact .inr (.inl ⟨x, by simpa using hx, hxi⟩)
+  · exact .inr (.inr hall)
 
 theorem planPass_inv {n : Node} (h : n.Inv) : (planPass n).1.Inv := by
   obtain ⟨l', heq, hrel, -, -⟩ := planPass_spec h
@@ -834,7 +858,8 @@ theorem startNode_inv (self : ReplicaId) {s : State} (hs : s.WireOk) (blobs : Li
     missingSpec := fun z => by rw [mem_computeMissing _ (sorted_sortDedup _)]; rfl
     sessionsSorted := List.Pairwise.nil
     sessionCap := by simp [maxSessions]
-    sessOk := fun _ hx => by simp at hx }
+    sessOk := fun _ hx => by simp at hx
+    parkedSorted := List.Pairwise.nil }
 
 theorem step_inv' (m : Machine) (ev : Event) (h : m.Inv) : (step m ev).1.Inv := by
   cases m with
@@ -934,6 +959,8 @@ theorem handle_grows (n : Node) (ev : Event) :
   | init => exact ⟨rfl, State.le_refl' _⟩
   | initFresh => exact ⟨rfl, State.le_refl' _⟩
   | query q => exact ⟨rfl, State.le_refl' _⟩
+  | retrySave => exact ⟨rfl, State.le_refl' _⟩
+  | blobStoreFailed hb => simp only [handle]; split <;> exact ⟨rfl, State.le_refl' _⟩
 
 theorem step_current_grows' (n : Node) (ev : Event) :
     ∃ n', (step (.running n) ev).1 = .running n' ∧ n'.self = n.self ∧ State.Le n.current n'.current := by
@@ -1079,7 +1106,7 @@ theorem step_settles' (n : Node) (ev : Event) (h : n.Inv) (n' : Node)
 
 theorem step_plans_blobs' (n : Node) (ev : Event) (h : n.Inv) (n' : Node)
     (hstep : (step (.running n) ev).1 = .running n') (hb : Hash) (hm : n'.Missing hb) :
-    (∃ x ∈ n'.sessions, hb ∈ x.inflight) ∨
+    (∃ x ∈ n'.sessions, hb ∈ x.inflight) ∨ hb ∈ n'.parked ∨
     (∀ x ∈ n'.sessions, x.peerReplica.isSome = true → x.helloSent = true →
       hb ∈ x.lacks ∨ x.inflight.length = maxInflightPerPeer) := by
   have hinv' : n'.Inv := by
@@ -1097,15 +1124,20 @@ theorem step_plans_blobs' (n : Node) (ev : Event) (h : n.Inv) (n' : Node)
   have hsess : (reportPass (planPass n2).1).1.sessions =
       l'.map (fun s => { s with reported := sessionStatus (planPass n2).1 s }) := by
     unfold reportPass; rw [heq]; simp only; split <;> rfl
+  have hpk : (reportPass (planPass n2).1).1.parked = n2.parked := by
+    unfold reportPass; simp only; split <;> rfl
   change (∃ x ∈ (reportPass (planPass n2).1).1.sessions, hb ∈ x.inflight) ∨
+    hb ∈ (reportPass (planPass n2).1).1.parked ∨
     ∀ x ∈ (reportPass (planPass n2).1).1.sessions, x.peerReplica.isSome = true → x.helloSent = true →
       hb ∈ x.lacks ∨ x.inflight.length = maxInflightPerPeer
   have hcap : ∀ x ∈ (reportPass (planPass n2).1).1.sessions, x.inflight.length ≤ maxInflightPerPeer :=
     fun x hx => (hinv'.sessOk x hx).inflightCap
   rw [hsess] at hcap ⊢
-  rcases hcov hb hm2 with ⟨x, hx, hxi⟩ | hall
+  rw [hpk]
+  rcases hcov hb hm2 with hp | ⟨x, hx, hxi⟩ | hall
+  · exact .inr (.inl hp)
   · exact .inl ⟨_, List.mem_map_of_mem hx, hxi⟩
-  · refine .inr (fun x hx hr hh => ?_)
+  · refine .inr (.inr (fun x hx hr hh => ?_))
     simp only [List.mem_map] at hx
     obtain ⟨y, hy, rfl⟩ := hx
     rcases hall y hy (by simpa [Session.ready] using hr) hh with h1 | h2
@@ -1255,6 +1287,8 @@ theorem handle_effs (n : Node) (ev : Event) : ∀ e ∈ (handle n ev).2, HandleE
   | init => simp [handle, HandleEff]
   | initFresh => simp [handle, HandleEff]
   | query q => simp [handle, HandleEff]
+  | retrySave => simp only [handle]; split <;> simp [HandleEff]
+  | blobStoreFailed hb => simp only [handle]; split <;> simp [HandleEff]
 
 /-- `handle` leaves the persistence bookkeeping alone, except when the host answers the persist in
 flight. -/
@@ -1337,6 +1371,8 @@ theorem handle_persistence (n : Node) (ev : Event) :
   | init => exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
   | initFresh => exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
   | query q => exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+  | retrySave => exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
+  | blobStoreFailed hb => simp only [handle]; split <;> exact ⟨rfl, .inl ⟨rfl, rfl⟩⟩
 
 /-- An unanswered persist stays in flight through `handle`. -/
 theorem handle_keeps_inflight {n : Node} {ev : Event} {t : Nat} {s : State}
@@ -1395,8 +1431,8 @@ theorem reconcilePass_effs (n : Node) : ∀ e ∈ (reconcilePass n).2, LateEff n
 theorem planPass_effs {n : Node} (h : n.Inv) : ∀ e ∈ (planPass n).2, LateEff n e := by
   obtain ⟨l', -, -, hes, -⟩ := planPass_spec h
   intro e he
-  obtain ⟨x, hx, c, rfl, rest⟩ := hes e he
-  exact ⟨x, hx, c, rfl, rest⟩
+  obtain ⟨x, hx, c, rfl, h1, h2, h3, h4, h5⟩ := hes e he
+  exact ⟨x, hx, c, rfl, h1, h2, h3, h4, fun z hz => mem_of_mem_sdiff (h5 z hz)⟩
 
 theorem reportPass_effs (n : Node) : ∀ e ∈ (reportPass n).2, LateEff n e := by
   unfold reportPass
@@ -1551,7 +1587,8 @@ theorem startNode_facts (self : ReplicaId) {s : State} (hs : s.WireOk) (blobs : 
     missingSpec := fun z => by rw [mem_computeMissing _ (sorted_sortDedup _)]; rfl
     sessionsSorted := List.Pairwise.nil
     sessionCap := by simp [n0, maxSessions]
-    sessOk := fun _ hx => by simp [n0] at hx }
+    sessOk := fun _ hx => by simp [n0] at hx
+    parkedSorted := List.Pairwise.nil }
   have hpers : .persist 0 s ∈ (finish n0).2 := by
     unfold finish; simp only [List.mem_append]; left; left; left
     unfold persistPass; simp [n0]
@@ -2404,6 +2441,19 @@ theorem handle_exec {v : HostView} {n : Node} (hn : n.Inv) (hr : PreRel v n) (ev
       have : z ≠ h := fun e => by subst e; exact hnot hz
       simp [HostView.onEvent, hr.2.1 z hz, this]
   | query q => exact ⟨_, rfl, hr⟩
+  | retrySave =>
+    simp only [handle]
+    split
+    · exact ⟨_, rfl, hr.1, hr.2.1, hr.2.2⟩
+    · exact ⟨_, hnotify _ _, hr.1, hr.2.1, hr.2.2⟩
+  | blobStoreFailed h =>
+    simp only [handle]
+    split
+    · refine ⟨_, hnotify _ _, fun x hx => ?_, hr.2.1, hr.2.2⟩
+      simp only [List.mem_map] at hx
+      obtain ⟨y, hy, rfl⟩ := hx
+      exact hr.1 y hy
+    · exact ⟨_, rfl, hr⟩
 
 theorem step_exec {v : HostView} {m : Machine} (hm : m.Inv) (hr : HostRel v m) (ev : Event) :
     ∃ v2, (v.onEvent ev).execAll (step m ev).2 = some v2 ∧ HostRel v2 (step m ev).1 := by
@@ -2431,7 +2481,8 @@ theorem step_exec {v : HostView} {m : Machine} (hm : m.Inv) (hr : HostRel v m) (
         missingSpec := fun z => by rw [mem_computeMissing _ (sorted_sortDedup _)]; rfl
         sessionsSorted := List.Pairwise.nil
         sessionCap := by simp [n0, maxSessions]
-        sessOk := fun _ hx => by simp [n0] at hx }
+        sessOk := fun _ hx => by simp [n0] at hx
+        parkedSorted := List.Pairwise.nil }
       obtain ⟨v2, h1, h2⟩ := finish_exec h0 (v := v.onEvent ev) (by simp [n0])
         (fun z hz => hbs z (mem_sortDedup.1 hz)) (by simp [n0, hpend])
       exact ⟨v2, by simp only [startNode, HostView.execAll, HostView.exec]; exact h1, h2⟩
@@ -2510,6 +2561,8 @@ theorem handle_rollback_mono (n : Node) (ev : Event) (h : n.rollback = true) :
   | init => exact h
   | initFresh => exact h
   | query q => exact h
+  | retrySave => exact h
+  | blobStoreFailed hb => simp only [handle]; split <;> exact h
 
 theorem reconcileSession_no_state (self : ReplicaId) (P : Published) (s : Session) (p : PeerId)
     (d : Digest) (st : State) : .send p (.state d st) ∉ (reconcileSession self true P s).2 := by
@@ -2548,7 +2601,8 @@ theorem finish_rollback_no_state {n : Node} (h : n.rollback = true) (p : PeerId)
       simp only
       suffices ∀ (busy : List Hash) (l acc : List Session) (effs : List Effect),
           (∀ e ∈ effs, ∃ q c, e = .fetch q c) →
-          ∀ e ∈ (planGo (reconcilePass (persistPass n).1).1.missing busy l acc effs).2, ∃ q c, e = .fetch q c by
+          ∀ e ∈ (planGo (sdiff (reconcilePass (persistPass n).1).1.missing (reconcilePass (persistPass n).1).1.parked)
+            busy l acc effs).2, ∃ q c, e = .fetch q c by
         exact this _ _ _ _ (by simp)
       intro busy l
       induction l generalizing busy with
@@ -2669,5 +2723,305 @@ theorem persistFailed_no_persist (m : Machine) (hm : m.Inv) (t : Nat) :
     · rcases finish_mem (handle_inv hm _) he with he | ⟨m', -, hl⟩
       · rw [persistPass_hold (handle_persistFailed_hold n t)] at he; cases he
       · exact lateEff_not_persist hl t' s rfl
+
+/-! ## A failed save holds the machine until `retrySave` -/
+
+theorem gotBlobs_hold_parked (n : Node) (hs : List Hash) :
+    (gotBlobs n hs).1.holdPersist = n.holdPersist ∧ (gotBlobs n hs).1.parked = n.parked := by
+  unfold gotBlobs; dsimp only; split <;> exact ⟨rfl, rfl⟩
+
+theorem onMessage_hold_parked (n : Node) (s : Session) (msg : Message) :
+    (onMessage n s msg).1.holdPersist = n.holdPersist ∧ (onMessage n s msg).1.parked = n.parked := by
+  unfold onMessage closeWith
+  split
+  · split
+    · split
+      · exact ⟨rfl, rfl⟩
+      · split <;> exact ⟨rfl, rfl⟩
+    · exact ⟨rfl, rfl⟩
+  · cases msg with
+    | state d st =>
+      simp only
+      split
+      · split
+        · split <;> exact ⟨rfl, rfl⟩
+        · split <;> exact ⟨rfl, rfl⟩
+      · split <;> exact ⟨rfl, rfl⟩
+    | want hs => simp only; split <;> exact ⟨rfl, rfl⟩
+    | _ => exact ⟨rfl, rfl⟩
+
+/-- Only `persistFailed` sets the hold and only `retrySave` clears it. -/
+theorem handle_hold (n : Node) (ev : Event) (hev : ev ≠ .retrySave) (h : n.holdPersist = true) :
+    (handle n ev).1.holdPersist = true := by
+  cases ev with
+  | received p b =>
+    simp only [handle]
+    split
+    · exact h
+    · split
+      · exact h
+      · rw [(onMessage_hold_parked _ _ _).1]; exact h
+  | localOp op =>
+    simp only [handle]
+    split
+    · exact h
+    · split
+      · rw [(gotBlobs_hold_parked _ _).1]; exact h
+      · split
+        · rw [(gotBlobs_hold_parked _ _).1]; exact h
+        · exact h
+  | blobStored hb src => simp only [handle]; rw [(gotBlobs_hold_parked _ _).1]; exact h
+  | blobsStored hs => simp only [handle]; rw [(gotBlobs_hold_parked _ _).1]; exact h
+  | connected p => simp only [handle]; split; exact h; split <;> exact h
+  | disconnected p => simp only [handle]; split <;> exact h
+  | persisted t d => simp only [handle]; split; split <;> exact h; exact h
+  | persistFailed t => simp only [handle]; split; split <;> rfl; rfl
+  | blobFailed p hb => simp only [handle]; split; split <;> exact h; exact h
+  | blobLost hb => simp only [handle]; split <;> exact h
+  | init => exact h
+  | initFresh => exact h
+  | query q => exact h
+  | retrySave => exact absurd rfl hev
+  | blobStoreFailed hb => simp only [handle]; split <;> exact h
+
+/-- The end-of-step passes keep the hold, the parked set and `dirty` as the persist pass left them. -/
+theorem finish_hold_parked (n : Node) :
+    (finish n).1.holdPersist = n.holdPersist ∧ (finish n).1.parked = n.parked ∧
+      (finish n).1.dirty = (persistPass n).1.dirty := by
+  have h1 : (persistPass n).1.holdPersist = n.holdPersist ∧ (persistPass n).1.parked = n.parked := by
+    unfold persistPass; (repeat' split) <;> exact ⟨rfl, rfl⟩
+  have h2 : ∀ m : Node, (reconcilePass m).1.holdPersist = m.holdPersist ∧
+      (reconcilePass m).1.parked = m.parked ∧ (reconcilePass m).1.dirty = m.dirty := by
+    intro m; unfold reconcilePass; split <;> exact ⟨rfl, rfl, rfl⟩
+  have h4 : ∀ m : Node, (reportPass m).1.holdPersist = m.holdPersist ∧
+      (reportPass m).1.parked = m.parked ∧ (reportPass m).1.dirty = m.dirty := by
+    intro m; unfold reportPass; simp only; split <;> exact ⟨rfl, rfl, rfl⟩
+  unfold finish
+  simp only
+  rw [(h4 _).1, (h4 _).2.1, (h4 _).2.2]
+  simp only [planPass]
+  rw [(h2 _).1, (h2 _).2.1, (h2 _).2.2, h1.1, h1.2]
+  exact ⟨rfl, rfl, rfl⟩
+
+theorem persistPass_emits {n : Node} {t : Nat} {s : State} (he : .persist t s ∈ (persistPass n).2) :
+    n.holdPersist = false ∧ n.inflight = none ∧ n.dirty = true ∧ t = n.nextTag ∧ s = n.current := by
+  unfold persistPass at he
+  split at he
+  · cases he
+  · next hh =>
+    split at he
+    · next hc =>
+      simp only [Bool.and_eq_true, Option.isNone_iff_eq_none] at hc
+      simp only [List.mem_singleton, Effect.persist.injEq] at he
+      exact ⟨by simpa using hh, hc.1, hc.2, he.1, he.2⟩
+    · cases he
+
+/-- Unless held, the persist pass leaves no dirty state without a persist in flight. -/
+theorem finish_settled (n : Node) (hh : (finish n).1.holdPersist = false) :
+    (finish n).1.inflight.isSome = true ∨ (finish n).1.dirty = false := by
+  obtain ⟨e1, -, e3⟩ := finish_hold_parked n
+  rw [(finish_frame n).1, e3]
+  rw [e1] at hh
+  unfold persistPass
+  simp only [hh, Bool.false_eq_true, ite_false]
+  split
+  · exact .inl rfl
+  · next hc =>
+    simp only [Bool.and_eq_true, Option.isNone_iff_eq_none, not_and, Bool.not_eq_true] at hc
+    cases hi : n.inflight with
+    | none => exact .inr (hc hi)
+    | some x => exact .inl (by simp)
+
+/-- A held node stays held, and emits no persist, on every event except `retrySave`. -/
+theorem held_no_persist' (n : Node) (hn : n.Inv) (ev : Event) (hev : ev ≠ .retrySave)
+    (hh : n.holdPersist = true) :
+    (∀ t s, .persist t s ∉ (step (.running n) ev).2) ∧
+      ∃ n', (step (.running n) ev).1 = .running n' ∧ n'.holdPersist = true := by
+  have h1 := handle_hold n ev hev hh
+  refine ⟨fun t s he => ?_, _, rfl, by rw [(finish_hold_parked _).1]; exact h1⟩
+  rw [step_running] at he
+  simp only [List.mem_append] at he
+  rcases he with he | he
+  · exact handle_no_persist _ _ _ _ he
+  · rcases finish_mem (handle_inv hn _) he with he | ⟨m', -, hl⟩
+    · rw [persistPass_hold h1] at he; cases he
+    · exact lateEff_not_persist hl t s rfl
+
+/-- After `persistFailed` on a running machine, the machine is held. -/
+theorem persistFailed_holds (n : Node) (t : Nat) :
+    ∃ n', (step (.running n) (.persistFailed t)).1 = .running n' ∧ n'.holdPersist = true :=
+  ⟨_, rfl, by rw [(finish_hold_parked _).1]; exact handle_persistFailed_hold n t⟩
+
+theorem getElem?_ne_of {evs : List Event} {k : Nat} (hk : k < evs.length) {x : Event}
+    (h : evs[k]? ≠ some x) : evs[k] ≠ x := by
+  intro e; apply h; rw [List.getElem?_eq_getElem hk, e]
+
+/-- Trace form: once a running machine gets `persistFailed`, it is held at every later step up to
+the next `retrySave`. -/
+theorem held_after (evs : List Event) (j t : Nat) (n : Node) (hm : machineAt evs j = .running n)
+    (hj : evs[j]? = some (.persistFailed t)) : ∀ d, j + d < evs.length →
+    (∀ k, j < k → k ≤ j + d → evs[k]? ≠ some .retrySave) →
+    ∃ n', machineAt evs (j + d + 1) = .running n' ∧ n'.holdPersist = true
+  | 0, hl, _ => by
+    have hjl : j < evs.length := by omega
+    have hev : evs[j] = .persistFailed t := by
+      rw [List.getElem?_eq_getElem hjl] at hj; exact Option.some.inj hj
+    rw [Nat.add_zero, machineAt_succ hjl, hm, hev]
+    exact persistFailed_holds n t
+  | d + 1, hl, hno => by
+    obtain ⟨n', hm', hh'⟩ := held_after evs j t n hm hj d (by omega)
+      (fun k h1 h2 => hno k h1 (by omega))
+    have hkl : j + d + 1 < evs.length := by omega
+    have hne : evs[j + d + 1] ≠ .retrySave := getElem?_ne_of hkl (hno _ (by omega) (by omega))
+    have hinv : n'.Inv := by have := machineAt_inv evs (j + d + 1); rw [hm'] at this; exact this
+    rw [show j + (d + 1) + 1 = (j + d + 1) + 1 by omega, machineAt_succ hkl, hm']
+    exact (held_no_persist' n' hinv _ hne hh').2
+
+theorem persistFailed_no_persist_until_retry' (evs : List Event) (j t : Nat) (n : Node)
+    (hm : machineAt evs j = .running n) (hj : evs[j]? = some (.persistFailed t)) (i : Nat)
+    (hji : j ≤ i) (hno : ∀ k, j < k → k ≤ i → evs[k]? ≠ some .retrySave) :
+    ∀ t' s, .persist t' s ∉ effectsAt evs i := by
+  intro t' s he
+  have hil := lt_length_of_mem he
+  rw [effectsAt_eq hil] at he
+  rcases Nat.eq_or_lt_of_le hji with rfl | hlt
+  · have hev : evs[j] = .persistFailed t := by
+      rw [List.getElem?_eq_getElem hil] at hj; exact Option.some.inj hj
+    rw [hev, hm] at he
+    exact persistFailed_no_persist (.running n) (by have := machineAt_inv evs j; rw [hm] at this; exact this)
+      t t' s he
+  · obtain ⟨n', hm', hh'⟩ := held_after evs j t n hm hj (i - j - 1) (by omega)
+      (fun k h1 h2 => hno k h1 (by omega))
+    rw [show j + (i - j - 1) + 1 = i by omega] at hm'
+    rw [hm'] at he
+    have hinv : n'.Inv := by have := machineAt_inv evs i; rw [hm'] at this; exact this
+    exact (held_no_persist' n' hinv _ (getElem?_ne_of hil (hno i hlt (Nat.le_refl _))) hh').1 t' s he
+
+/-- Liveness: `retrySave` ends the hold and empties the parked set, and afterwards either a
+persist is in flight or nothing is left to save. -/
+theorem retrySave_releases' (n : Node) :
+    ∃ n', (step (.running n) .retrySave).1 = .running n' ∧ n'.holdPersist = false ∧ n'.parked = [] ∧
+      (n'.inflight.isSome = true ∨ n'.dirty = false) := by
+  obtain ⟨e1, e2, -⟩ := finish_hold_parked (handle n .retrySave).1
+  have hh : (finish (handle n .retrySave).1).1.holdPersist = false := by rw [e1]; simp [handle]
+  refine ⟨_, rfl, hh, by rw [e2]; simp [handle], finish_settled _ hh⟩
+
+/-- Liveness: a `retrySave` while dirty with no persist in flight (e.g. after a failed save)
+emits a persist of the latest state. -/
+theorem retrySave_persists' (n : Node) (hd : n.dirty = true) (hi : n.inflight = none) :
+    Effect.persist n.nextTag n.current ∈ (step (.running n) .retrySave).2 := by
+  rw [step_running]
+  apply List.mem_append_right
+  unfold finish
+  simp only [List.mem_append]
+  left; left; left
+  simp [handle, persistPass, hd, hi]
+
+/-- Every step leaves an unheld machine with a persist in flight or nothing dirty. -/
+theorem step_settled_persist (m : Machine) (ev : Event) (n : Node) (hs : (step m ev).1 = .running n)
+    (hh : n.holdPersist = false) : n.inflight.isSome = true ∨ n.dirty = false := by
+  cases m with
+  | running n0 =>
+    rw [step_running] at hs; simp only [Machine.running.injEq] at hs; subst hs
+    exact finish_settled _ hh
+  | uninit =>
+    rcases step_uninit ev with ⟨h1, -⟩ | ⟨self, s, blobs, -, hst⟩
+    · rw [h1] at hs; cases hs
+    · rw [hst] at hs; simp only [Machine.running.injEq] at hs; subst hs
+      exact finish_settled _ hh
+
+/-- `retrySave` on a machine that is not held issues no persist (it is a no-op for saving). -/
+theorem retrySave_not_held' (m : Machine) (hm : m.Inv) (ev : Event) (n : Node)
+    (hs : (step m ev).1 = .running n) (hh : n.holdPersist = false) :
+    ∀ t s, .persist t s ∉ (step (.running n) .retrySave).2 := by
+  intro t s he
+  have hn : n.Inv := by have := step_inv' m ev hm; rw [hs] at this; exact this
+  rw [step_running] at he
+  simp only [List.mem_append] at he
+  rcases he with he | he
+  · exact handle_no_persist _ _ _ _ he
+  · rcases finish_mem (handle_inv hn _) he with he | ⟨m', -, hl⟩
+    · obtain ⟨-, hi, hd, -⟩ := persistPass_emits he
+      simp only [handle] at hi hd
+      rcases step_settled_persist m ev n hs hh with h1 | h1
+      · rw [hi] at h1; cases h1
+      · rw [hd] at h1; cases h1
+    · exact lateEff_not_persist hl t s rfl
+
+/-! ## A blob that could not be stored locally is parked, without blaming the peer -/
+
+/-- What the end-of-step passes do to sessions: same peer, same `lacks`, and in flight only what
+was in flight plus newly planned, unparked missing blobs. -/
+theorem finish_sessions {n : Node} (h : n.Inv) : ∀ x ∈ (finish n).1.sessions, ∃ y ∈ n.sessions,
+    x.peer = y.peer ∧ x.lacks = y.lacks ∧ ∃ c, x.inflight = y.inflight ++ c ∧
+      ∀ z ∈ c, z ∈ sdiff n.missing n.parked := by
+  let r1 := persistPass n
+  have hs1 : r1.1.sessions = n.sessions := by
+    show (persistPass n).1.sessions = n.sessions; unfold persistPass; (repeat' split) <;> rfl
+  have hm1 : r1.1.missing = n.missing ∧ r1.1.parked = n.parked := by
+    show (persistPass n).1.missing = n.missing ∧ (persistPass n).1.parked = n.parked
+    unfold persistPass; (repeat' split) <;> exact ⟨rfl, rfl⟩
+  let r2 := reconcilePass r1.1
+  have hi2 : r2.1.Inv := reconcilePass_inv (persistPass_inv h)
+  have hm2 : r2.1.missing = n.missing ∧ r2.1.parked = n.parked := by
+    show (reconcilePass r1.1).1.missing = n.missing ∧ (reconcilePass r1.1).1.parked = n.parked
+    unfold reconcilePass; split <;> exact hm1
+  have hs2 : ∀ x ∈ r2.1.sessions, ∃ y ∈ n.sessions, x.peer = y.peer ∧ x.lacks = y.lacks ∧
+      x.inflight = y.inflight := by
+    show ∀ x ∈ (reconcilePass r1.1).1.sessions, _
+    unfold reconcilePass
+    split
+    · intro x hx; rw [hs1] at hx; exact ⟨x, hx, rfl, rfl, rfl⟩
+    · intro x hx
+      simp only [List.mem_map] at hx
+      obtain ⟨y, hy, rfl⟩ := hx
+      obtain ⟨f1, -, -, f4, f5, -⟩ := reconcileSession_fields r1.1.self r1.1.rollback _ y
+      rw [hs1] at hy
+      exact ⟨y, hy, f1, f5, f4⟩
+  obtain ⟨l', heq, hrel, -, -⟩ := planPass_spec hi2
+  intro x hx
+  have hx' : ∃ y ∈ l', x.peer = y.peer ∧ x.lacks = y.lacks ∧ x.inflight = y.inflight := by
+    change x ∈ (reportPass (planPass r2.1).1).1.sessions at hx
+    unfold reportPass at hx
+    rw [heq] at hx
+    simp only at hx
+    split at hx <;> (simp only [List.mem_map] at hx; obtain ⟨y, hy, rfl⟩ := hx; exact ⟨y, hy, rfl, rfl, rfl⟩)
+  obtain ⟨y, hy, e1, e2, e3⟩ := hx'
+  obtain ⟨z, hz, c, rfl, hc, -⟩ := forall2_mem hrel y hy
+  obtain ⟨w, hw, f1, f2, f3⟩ := hs2 z hz
+  refine ⟨w, hw, by rw [e1, ← f1], by rw [e2, ← f2], c, by rw [e3, ← f3], fun q hq => ?_⟩
+  rw [← hm2.1, ← hm2.2]; exact hc q hq
+
+theorem blobStoreFailed_parks' (n : Node) (h : n.Inv) (hb : Hash) (hm : n.Missing hb) :
+    ∃ n', (step (.running n) (.blobStoreFailed hb)).1 = .running n' ∧ hb ∈ n'.parked ∧
+      (∀ x ∈ n'.sessions, hb ∉ x.inflight) ∧
+      (∀ x ∈ n'.sessions, ∃ y ∈ n.sessions, y.peer = x.peer ∧ y.lacks = x.lacks) := by
+  have hmiss : hb ∈ n.missing := (h.missingSpec hb).2 hm
+  have hh : handle n (.blobStoreFailed hb) =
+      ({ n with sessions := n.sessions.map (fun s => { s with inflight := eraseH hb s.inflight }),
+                parked := insertH hb n.parked }, [.notify .blobsChanged]) := by
+    simp [handle, hmiss]
+  have hi1 := handle_inv h (.blobStoreFailed hb)
+  rw [hh] at hi1
+  refine ⟨_, rfl, ?_, ?_, ?_⟩
+  · rw [hh, (finish_hold_parked _).2.1]
+    exact (mem_insertH h.parkedSorted hb).2 (.inl rfl)
+  · intro x hx hin
+    rw [hh] at hx
+    obtain ⟨y, hy, -, -, c, hxc, hc⟩ := finish_sessions hi1 x hx
+    simp only [List.mem_map] at hy
+    obtain ⟨w, -, rfl⟩ := hy
+    rw [hxc, List.mem_append] at hin
+    rcases hin with hin | hin
+    · rw [mem_eraseH] at hin; exact hin.2 rfl
+    · have := hc hb hin
+      rw [mem_sdiff hi1.missingSorted hi1.parkedSorted] at this
+      exact this.2 ((mem_insertH h.parkedSorted hb).2 (.inl rfl))
+  · intro x hx
+    rw [hh] at hx
+    obtain ⟨y, hy, e1, e2, -⟩ := finish_sessions hi1 x hx
+    simp only [List.mem_map] at hy
+    obtain ⟨w, hw, rfl⟩ := hy
+    exact ⟨w, hw, e1.symm, e2.symm⟩
 
 end LeanSync
