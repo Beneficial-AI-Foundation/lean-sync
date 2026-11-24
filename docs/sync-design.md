@@ -173,7 +173,7 @@ acknowledged.
   - So nothing a peer or the UI does can drive a host with failing storage into a write loop: the
     host owns the back-off. Before this change the hold lasted only for the failing step, and in
     the Firefox quota test 131–139 writes failed in about a second while 150 files arrived; now it
-    is one write per `retrySave` (3–4 in the same test, app-design §10).
+    is one write per `retrySave` (3–4 in the same test, app-design §11).
   - **Liveness** (proved): `retrySave_releases` — after a `retrySave` the node is not held, nothing
     is parked, and either a persist is in flight or nothing is dirty; `retrySave_persists` — a
     `retrySave` while dirty with no persist in flight emits `persist nextTag current`. The local

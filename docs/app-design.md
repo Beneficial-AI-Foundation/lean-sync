@@ -372,7 +372,8 @@ attempted and failed within about a second, and the host could not apply a back-
 `persistFailed` holds the node until the host sends the new event `retrySave` (event tag 13), and
 the host owns the back-off (§3). Measured in the same test (`storage-failure`, about 4 s of failing
 storage, two runs each): on `main` 132 and 134 failed writes in Firefox 146, 141 and 138 in Firefox
-ESR 140; on this branch 4 in each (one per retry: 1 s, 2 s back-off, plus the first). Chromium,
+ESR 140; on this branch 3 or 4 in Firefox 146 and 4 in ESR 140 over four runs (one per retry,
+1 s and 2 s back-off, plus the first). Chromium,
 where the record failure is injected and no peer events arrive meanwhile, had 3 before and after. `retrySave` when
 nothing is held issues no write (proved), so "Retry now" is always safe. Proofs:
 `persistFailed_no_retry_in_step` is unchanged and generalises to `held_no_persist` and the trace
