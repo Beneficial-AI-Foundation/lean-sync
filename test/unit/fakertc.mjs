@@ -60,6 +60,8 @@ export function fakeRTC({ connectDelay = 1 } = {}) {
     async createAnswer() { return this._sdp('answer', 'active'); }
     async setLocalDescription(d) {
       this.localDescription = d ?? (this.remoteDescription ? await this.createAnswer() : await this.createOffer());
+      // the answering side's own DTLS role (what decides who sends the ClientHello)
+      if (this.localDescription.type === 'answer' && !/a=setup:passive/.test(this.localDescription.sdp)) world.activeAnswers = (world.activeAnswers ?? 0) + 1;
       byUfrag.set(this.ufrag, this);
       this.iceGatheringState = 'complete';
       setTimeout(() => this._fire('icegatheringstatechange', {}), 0);
@@ -68,7 +70,6 @@ export function fakeRTC({ connectDelay = 1 } = {}) {
       if (!/a=ice-ufrag:/.test(d.sdp) || !/a=fingerprint:sha-256 /.test(d.sdp)) throw new DOMException('bad sdp', 'InvalidAccessError');
       this.remoteDescription = d;
       if (d.type === 'answer') {
-        if (!/a=setup:passive/.test(d.sdp)) world.activeAnswers = (world.activeAnswers ?? 0) + 1;
         const other = byUfrag.get(/a=ice-ufrag:(\S+)/.exec(d.sdp)[1]);
         if (other && !other.closedHere && world.reachable(this, other)) setTimeout(() => world.connect(this, other), connectDelay);
       }

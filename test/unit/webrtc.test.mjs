@@ -111,8 +111,9 @@ test('onClose exactly once per link, for every way a link ends', async () => {
     await until(() => A.closes.get(first.id) >= 1, 1000, `${name}: onClose`);
     await sleep(120);
     assert.equal(A.closes.get(first.id), 1, `${name}: onClose once`);
-    const before = A.frames.length;
-    if (first._dc.peer?.readyState === 'open') { first._dc.peer.send(Uint8Array.of(7)); await sleep(20); }
+    const before = A.frames.filter((f) => f.link === first.id).length;
+    first._dc._fire('message', { data: Uint8Array.of(7).buffer });   // a late frame on the old channel
+    await sleep(5);
     assert.equal(A.frames.filter((f) => f.link === first.id).length, before, `${name}: nothing delivered on a closed link`);
   }
 });

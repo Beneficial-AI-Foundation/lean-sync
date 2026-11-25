@@ -145,7 +145,7 @@ never reach the new machine (its tags restart at 0).
 ## 4. Host obligations
 
 Audited by mutation (`node test/mutations.mjs`): for each row the mechanism was removed or broken
-in the app's source and the named test was run (e2e in Chromium); **55 of 55 mutants were caught** (the final run is reported in the branch's last hand-back).
+in the app's source and the named test was run (e2e in Chromium, or Chromium and Firefox where the row's test needs Firefox); **82 of 82 mutants are caught** on the final commit of the WebRTC stage (run reported in its hand-back). A check that runs no test counts as not caught.
 "Mutant" names the break that was tried.
 
 | Obligation (sync-design §8, decision 7) | Mechanism | Test (fails when the mechanism is broken) | Mutant |
@@ -174,11 +174,11 @@ in the app's source and the named test was run (e2e in Chromium); **55 of 55 mut
 | A blob is replaced only by a verified copy, never deleted first | an intact existing copy is kept; a damaged one is overwritten by one `move()` | e2e `existing-blob-kept-when-replacement-fails` | delete, then move |
 | Row statuses follow request planning | `pending` re-queried on peer changes and on `pendingSummary` | e2e `peer-leaves-mid-fetch-row-updates` | refresh removed |
 | No transport except to paired devices and STUN | one transport (WebRTC), started only by the user's pairing; ICE servers only from the setting; no URL parameter is read but `device` | e2e `no-network-except-paired-devices` (no WebSocket/EventSource/foreign fetch, no connection before pairing, ICE servers = setting, no request but the site's files, with `?relay=…&room=…&stun=…` in the URL); e2e `stun-settings` | a WebSocket to `/relay`; the setting ignored |
-| A link goes down when its connection is lost, even if the channel still says open (Chromium) | `onClose` on `failed`/`closed`, or `disconnected` for 5 s; a closing control channel ends the connection | unit `webrtc` (fake RTC; channel kept open as Chromium does); e2e `peer-killed-files-recover` | failure ignored (unit, e2e); channel close only (e2e); control-channel close ignored |
+| A link goes down when its connection is lost, even if the channel still says open (Chromium) | `onClose` on `failed`/`closed`, or `disconnected` for 5 s; a closing control channel ends the connection; a send on a channel no longer `open` takes the link down; a new incoming channel replaces the joining side's link | unit `webrtc` (fake RTC; channel kept open as Chromium does; channel stuck in `closing`); e2e `peer-killed-files-recover` | failure ignored (unit, e2e); channel close only (e2e); control-channel close ignored; `closing` channel kept; stale link blocks the new channel |
 | `onClose` once per link; nothing delivered after it | one guard per link; frames dropped once closed | unit `webrtc` (six ways a link ends) | guard removed; frames after close |
 | A failing `send` closes the link | exception → close | unit `webrtc` | exception swallowed |
 | Back-pressure never waits for an event that already fired | `onDrain` fires at once if the buffer is already below the threshold | unit `webrtc` | check removed |
-| Answerer is the DTLS server | the reply is edited to `a=setup:passive` | unit `webrtc` (fake RTC counts active answers) | default role |
+| Answerer is the DTLS server | the reply is edited to `a=setup:passive` before `setLocalDescription` | unit `webrtc` (the answering device's own description); e2e `pair-by-text` (with Firefox in the pairing; C+C tolerates two DTLS clients) | default role (unit, e2e) |
 | A reply stays usable while shown | reply attempts renewed every 2.5 s, at most 6 alive, the others closed on success | unit `webrtc`; e2e `reply-renewal` (B cannot reach A first; A reads the current reply 12 s after B joined; Firefox answerer) | no renewal (unit, e2e with Firefox); unbounded attempts |
 | Codes are checked before use | prefix, version, kind, base32, structure, CRC-32, offer tag | unit `netcode` (every prefix and every single-character change rejected); e2e `pairing-codes-rejected` | CRC skipped; tag unchecked |
 | An invitation accepts one reply | state per invitation | unit `webrtc`; e2e `pairing-codes-rejected` | second reply accepted (unit, e2e) |
@@ -308,10 +308,13 @@ device) creates a second path rather than replacing it. Files over
 
 ## 10. Tests and results
 
-Unit (`node --test test/unit/*.test.mjs`): 47 tests — codec vs Lean (6), links (22), core with the
-real engine (14), relay access (2), view (3), plus the mutation audit of §4. Engine checks: §0.
-End-to-end (`node test/e2e/run.mjs`): 27 scenarios, 66 runs; browsers per run in the table below (Chromium 154.0.8037.92, Firefox 146.0, Firefox ESR
-140.16.0esr, all headless, each device its own browser process and profile).
+Unit (`node --test test/unit/*.test.mjs`): 66 tests — codec vs Lean (6), links (23), core with the
+real engine (14), view (3), pairing codes (7), WebRTC transport against a fake RTCPeerConnection
+(13), plus the mutation audit of §4. Engine checks: §0.
+End-to-end (`node test/e2e/run.mjs`): 37 scenarios, 98 runs; browsers per run in the table below (Chromium 154.0.8037.92, Firefox 146.0, Firefox ESR
+140.16.0esr, all headless, each device its own browser process and profile). Since the WebRTC
+stage the devices are paired through the app's pairing UI and connect over WebRTC, inside a
+private network namespace with a dummy interface (`docs/net-design.md` §10).
 
 | Scenario | Configurations (device A + B [+ C]) |
 |---|---|
@@ -321,7 +324,7 @@ End-to-end (`node test/e2e/run.mjs`): 27 scenarios, 66 runs; browsers per run in
 | `incoming-file-creation-fails-then-next-file` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146 |
 | `peer-leaves-mid-fetch-row-updates` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146 |
 | `existing-blob-kept-when-replacement-fails` | Chromium 154; Firefox 146 |
-| `relay-parameter-ignored` | Chromium 154; Firefox 146 |
+| `no-network-except-paired-devices` | Chromium 154 + Firefox 146; Firefox 146 + Chromium 154 |
 | `record-request-error-not-acknowledged` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146 |
 | `peer-edit-during-upload-becomes-conflict` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146; Chromium 154 + Firefox 146 |
 | `damaged-or-missing-blob-recovers` | Chromium 154 + Chromium 154; Firefox 146 + Firefox 146 |
@@ -342,8 +345,19 @@ End-to-end (`node test/e2e/run.mjs`): 27 scenarios, 66 runs; browsers per run in
 | `trap-at-startup-does-not-loop` | Chromium 154; Firefox 146 |
 | `repeated-edits-heap-bound` | Chromium 154; Firefox 146 |
 | `file-size-limit-and-folder-drop` | Chromium 154; Firefox 146 |
+| `pair-by-text` | C+C; F+F; C+F; F+C; ESR+C; C+ESR; ESR+F (C = Chromium 154, F = Firefox 146, ESR = Firefox ESR 140) |
+| `pair-by-qr-fake-camera` | C+F; F+C; C+C; F+F |
+| `pairing-codes-rejected` | C+F+C; F+C+F |
+| `reply-renewal` | C+F; F+F; F+C; C+C |
+| `peer-killed-files-recover` | C+C; F+F; C+F; F+C |
+| `three-devices-pairwise` | C+F+C; F+C+F |
+| `stun-settings` | C; F |
+| `pairing-ui-phone-viewport` | C+F; F+C |
+| `runs-from-sub-path` | C+F |
+| `pair-with-browser-defaults` | C+C; F+F; C+F; F+C |
 
-`same-replica-id-refused` runs two profiles of one browser, the second a copy of the first.
+`same-replica-id-refused` runs two profiles of one browser, the second a copy of the first; they
+pair, and the host HELLO check refuses each link.
 
 **Scale in the browser** (`COLD_LOAD_N=20000 node test/e2e/run.mjs --only cold-load-many-files`,
 measured once; the suite itself uses 3,000): 20,000 files of 16 bytes added in one batch took

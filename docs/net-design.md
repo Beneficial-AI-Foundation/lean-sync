@@ -1,9 +1,11 @@
-# Peer-to-peer transport (WebRTC data channels): design note and feasibility probe
+# Peer-to-peer transport (WebRTC data channels): design, measurements, and what was built
 
-Branch `webrtc-transport` · stage 1 of the networking task: probe and design only. Nothing in
-`app/`, `LeanCrdt/` or `LeanSync/` changes in this stage; the Lean libraries need no change for
-the design below. Companion notes: `docs/app-design.md` (host, links, tests),
-`docs/sync-design.md` §8 (host obligations).
+Branch `webrtc-transport`. **Stage 1** (probe and design, §1 and the first version of §2–§13) and
+**stage 2** (built: `app/js/transport/webrtc.mjs`, `app/js/netcode.mjs`, `app/js/pairing-ui.mjs`,
+`app/vendor/qr/`; the relay is gone). §2–§11 now describe what was built; each deviation from the
+stage-1 design is marked **Deviation** with its reason, and every number is marked measured or
+designed. `LeanCrdt/` and `LeanSync/` are unchanged. Companion notes: `docs/app-design.md` (host,
+links, tests, host-obligations table §4), `docs/sync-design.md` §8 (host obligations).
 
 Decisions taken by the user, and the constraints this note works within:
 - **Manual signalling at every connection, no server of ours.** Device A shows an offer as a QR
@@ -24,20 +26,11 @@ documentation or believed is said to be so.
 
 ## 1. Feasibility probe (measured)
 
-`test/e2e/probe-webrtc.mjs` (throwaway; not run by `scripts/test-app.sh`) drives two separate
-headless browser processes with separate profiles through the existing e2e driver
-(`test/e2e/driver.mjs`, which gained an `args` option for extra Chromium flags). The driver passes
-the offer and the answer. `test/e2e/probe-static.mjs` checks the built site on a plain static
-server (§8). Browsers: Chromium 154.0.8037.92, Firefox 146.0, Firefox ESR 140.16.0esr, all
-headless, on Linux (one Wi-Fi interface with IPv4 and IPv6 ULA addresses, docker bridges down).
+The stage-1 probe (`test/e2e/probe-webrtc.mjs`, `test/e2e/probe-static.mjs`, in commit `5db05ec`;
+removed in stage 2, their findings now covered by tests) drove two separate headless browser
+processes with separate profiles through the e2e driver, the driver passing offer and answer.
+Browsers: Chromium 154.0.8037.92, Firefox 146.0, Firefox ESR 140.16.0esr, all headless, on Linux.
 Pairings are written offerer→answerer: C = Chromium, F = Firefox, E = Firefox ESR.
-
-```
-node test/e2e/probe-webrtc.mjs --phase connect|life|delay|stungather|qr|cert [--configs default,nomdns,fakestun,google]
-    delay options: --passive --offer-mod none|unreach|nocands --delays 0,20000 --pairings CC,FC --stun URL --gather-ms N
-unshare -rn sh -c 'ip link set lo up && node test/e2e/probe-webrtc.mjs --netns --phase connect'   # loopback only
-node test/e2e/probe-static.mjs
-```
 
 ### 1.1 Candidates and connectivity (no STUN unless stated)
 
@@ -194,374 +187,258 @@ interface can still run the WebRTC tests inside a namespace with a dummy interfa
 (needs unprivileged user namespaces, enabled here). In the namespace, Chromium with an unreachable
 STUN server did not even finish gathering within 60 s.
 
-## 2. The transport interface today, and what WebRTC must provide
+### 1.9 Stage 2 gate: reply renewal (measured before building)
 
-Today (`app/js/transport/relay.mjs` header, used by `main.mjs`, `links.mjs`, `ui.mjs`):
+B makes a fresh answer from the same offer every *period*, keeping at most 6 attempts alive; after
+*apply* seconds A applies the newest answer at least *age* old (the scan time). "Actual age" is the
+age when A applied it, including the driver's overhead. Minimal SDP, passive answerer, probe of
+stage 2 (in the history of this branch).
 
+| Case | Period | Result |
+|---|---|---|
+| simulated cross-NAT (B given unreachable addresses for A), mDNS off; apply at 12 / 31 / 62 s; ages 0.5 / 4.5 / 8 s; C→C, F→F, C→F, F→C | 5 s | **all actual ages 0.7–6.9 s connected in every pairing**; at 10.8–12.0 s a Firefox answerer fails (4 of 6), a Chromium answerer connects; no other attempt ever opened a channel |
+| reachable (mDNS off), same grid without 8 s | 5 s | 24/24 connected |
+| browser defaults (mDNS on), no STUN | 5 s | Chromium answerer all ok; Firefox answerer fails at actual ages 5.8–7.0 s: it cannot resolve the offerer's mDNS names here, which is its 5.0 s "no candidates" timeout of §1.2 |
+| browser defaults, no STUN | **2.5 s** | F→F, C→F, C→C all ok (ages 0.7–4.4 s) |
+| browser defaults, Google STUN | 5 s | C→C, C→F, F→F ok up to 6.9 s; F→C one failure among concurrent runs |
+| F→C, browser defaults, one pairing at a time in fresh browsers | 5 s | 6/6 with renewal, 8/8 without (control): the F→C failures came only with several pairings running at once in the same browsers (mDNS name resolution) |
+
+**Deviation (period): 2.5 s instead of 5 s**, so that the reply on screen is fresh enough for the
+5 s case (Firefox answerer, offerer candidates it cannot resolve, no STUN). The e2e scenario
+`reply-renewal` repeats the cross-NAT simulation in all four pairings through the real UI (§10).
+
+## 2. The transport (as built)
+
+Interface (header of `app/js/transport/webrtc.mjs`), the relay's plus pairing:
 ```
-transport.start({ onLink(link), onStatus(text) })   transport.setOnline(bool)   transport.stop()
-transport.online (getter)                           transport.closeAll()        (defined, never called)
-link: { id, remoteLabel, send(frame) → bool, close(), bufferedAmount,
-        onFrame(cb(frame)), onClose(cb()), onDrain(cb()) }
+transport.start({ onLink(link), onStatus(text) })   transport.setOnline(bool)   transport.stop()   transport.online
+link: { id, remoteLabel, send(frame) → bool, close(), bufferedAmount, onFrame(cb), onClose(cb), onDrain(cb) }
+invite() → { code, expiresAt, state, noSrflx, accept(replyText) → Promise, cancel() }
+respond(inviteText) → { code, state, noSrflx, attempts, onCode(cb), done: Promise, cancel() }   (throws CodeError at once)
+connections() → [{ id, role, state, since, linkId, remoteOnline }]   disconnect(id)   onChange(cb)
 ```
-Promises: links are ordered and reliable; frames ≤ 16 KiB + a few bytes; `onClose` exactly once per
-link, whoever closed it; `bufferedAmount`/`onDrain` give back-pressure. `links.mjs` attaches each
-link, sends HELLO, and turns it into a Lean peer only after the remote's HELLO; PeerIds are a
-page-lifetime counter in `links.mjs` (never reused). An engine restart (`core.mjs`) calls
-`links.resetAll()`, which closes every link with `link.close()`; the relay then re-links after its
-back-off.
+One pairing = one `RTCPeerConnection` (a *connection*) carrying:
+- a **control channel** `ctl` (negotiated, id 0) for the connection's life. It carries only
+  `{t:'online', v}`, so that a device that goes offline is not re-linked by the other one until
+  it is back, and its closing means the other device closed the connection (Disconnect, page
+  closed). **Deviation (addition):** the stage-1 design had no control channel; "offline keeps the
+  connection" (decision 5) needs one, otherwise the inviting device would keep reopening links to
+  an offline device;
+- at most one **sync channel** (ordered, reliable) = one link = one PeerId in `links.mjs`. The
+  inviting device opens it when the control channel is open and both sides are online; the
+  joining device accepts it. When a link closes on a live connection (engine restart via
+  `links.resetAll()`, a protocol error, the other side's restart or offline), the inviting device
+  opens a new one after a back-off (0.5 s doubling to 30 s, reset after a link lived 20 s; the
+  relay's rule, so a refused link cannot spin; measured in e2e `same-replica-id-refused`: 3
+  attempts in ~4 s).
 
-WebRTC fits with these mappings:
-
-| Interface | WebRTC |
+| Interface | As built |
 |---|---|
-| link | one ordered, reliable `RTCDataChannel` (label `sync`, binaryType `arraybuffer`) on a connection (`RTCPeerConnection`) made by one pairing |
-| `link.send(frame)` | `dc.send(frame)`; returns false if the channel is not open; **an exception closes the link** (it can only be the 16 MiB cap or a size error, i.e. a bug; never lose a frame silently) |
-| `bufferedAmount`, `onDrain` | `dc.bufferedAmount`; `bufferedamountlow` with threshold 256 KiB (measured to fire, §1.3) |
-| `onFrame` | `dc.onmessage` (ArrayBuffer → Uint8Array) |
-| `onClose`, exactly once | first of: channel `close`; connection `failed` or `closed`; connection `disconnected` for longer than `LOSS_MS` (5 s); `link.close()`. After it fires the transport closes the channel so nothing late is delivered |
-| `link.close()` | `dc.close()` (the connection stays up: a new channel can replace it, §5) |
-| `remoteLabel` | not known before HELLO: the transport passes "paired device"; `links.mjs` takes the label from HELLO as today |
-| `setOnline(false)` | close every channel; keep the connections (open question Q5) |
-| engine restart (`link.close()` on every link) | closes every channel; connections stay; channels are reopened (§5) |
-| `start` / `stop` | `stop` closes every connection |
+| `send` | `dc.send`; false if closed. An exception closes the link. **A channel no longer `open` while the link is up takes the link down at once** (measured in e2e `disconnect-mid-transfer-and-resume`, C→F: a Chromium channel closed with ~1 MiB buffered stayed `closing` and never reached Firefox, so frames were dropped silently and the transfer hung) |
+| `onDrain` | `bufferedamountlow` (threshold 256 KiB); fires at once if the buffer is already below it |
+| `onClose` exactly once | first of: channel `close`; connection `failed`/`closed`; `disconnected` for 5 s; control channel closed; `link.close()`; a failing send; **a new incoming channel on the joining side replaces its current link** (the inviting device opens one only after its own link is down, and the old one's close may never arrive) |
+| `remoteLabel` | "paired device"; the label comes with HELLO (`links.labelOfLink`) |
+| `setOnline(false)` | closes links, keeps connections, tells the other device (decision 5) |
+| `stop()` | closes every connection; called on `pagehide` |
 
-New, beyond the relay's interface: **pairing** (§3) and a connection list for the UI
-(`transport.connections()`: id, state, label once known, since when). The relay transport never
-needed these because the relay decided the topology.
+Measured (e2e `peer-killed-files-recover`, this machine, in the test network namespace): after the
+other browser is killed, the link goes down after 11.1 s (Chromium receiver) and 14.7–16.5 s
+(Firefox receiver); the connection is dropped (state `failed`) after 15.9 s and ~29.8 s. After the
+other device closes its tab, the connection is dropped after ~0.1 s in every pairing (the test
+polls every 100 ms), thanks to `pagehide` (Chromium does not close by itself, §1.4).
 
-## 3. Signalling interface
+## 3. Signalling (as built)
 
-Signalling moves exactly one offer from A to B and one answer from B to A. It is separate from the
-transport so that a later rendezvous service can replace the human without touching the transport:
+Exactly one offer goes from A to B and one answer from B to A; the codes are opaque strings to
+everything but `netcode.mjs`. The manual method is the UI (§6). A later rendezvous (not built)
+would carry the same strings; it would also need persistent certificates (§1.7) and a device list.
 
-```
-// webrtc transport: pairing operations (codes are opaque strings to everything else)
-const inv = await transport.invite();         // A: { code, expiresAt, accept(answerCode) → Promise, cancel() }
-const rsp = await transport.respond(offerCode); // B: { code, onCode(cb(newCode)), cancel() }  — code is live (§5)
-// both: connection becomes a link through onLink when its channel opens; failures through onPairing(id, state, reason)
+## 4. Code format (as built: `app/js/netcode.mjs`)
 
-// a signalling method carries those strings between two devices
-interface Signalling {
-  sendOffer(code) / receiveOffer() → code      // manual: show QR+text / scan or paste
-  sendAnswer(code) / receiveAnswer() → code
-}
-```
-The manual method is the UI of §6: "send" = show a QR and a text with Copy/Share; "receive" = scan
-with the camera or paste. A later automatic method (not built) would post the same codes to a
-rendezvous, keyed by something both devices learnt in a first manual pairing (a shared secret, and
-the peer's persistent certificate fingerprint, §1.7), so that the user is not involved: it needs
-only this interface plus persistent certificates and a device list. Nothing in the code format
-below prevents that: a rendezvous can carry the same codes.
+**Text:** `LSN1` (invitation) or `LSR1` (reply) + the payload in Crockford base32 (digits and
+capitals without I, L, O, U). Reading ignores case, spaces, line breaks and `-`, and reads O as 0
+and I/L as 1 in the payload. The QR holds the text in alphanumeric mode. Shown in groups of four.
+**Deviation:** prefix `LSN1`/`LSR1` instead of `LS1O`/`LS1A` (the letter O in a prefix would
+collide with the O→0 rule).
 
-## 4. Code format
+**Payload (version 1):** as designed (§4.2 of stage 1): kind byte; reply: 4-byte offer tag =
+SHA-256(invitation payload)[0..4]; ufrag and password (lower-case hex packed two digits per
+byte); 32-byte SHA-256 fingerprint; ≤ 4 UDP candidates (≤ 2 host, then ≤ 2 srflx; IPv4, IPv6,
+mDNS UUID or name); CRC-32. Not carried: setup (invitation `actpass`, reply always `passive`), the
+inviting device's mid, SCTP port, `max-message-size` (always 262,144).
 
-### 4.1 Text form
-`LS1` + kind (`O` offer, `A` answer) + payload in **Crockford base32** (digits and upper-case
-letters without I, L, O, U). The reader ignores case, spaces, line breaks and `-`, and maps
-`O→0`, `I/L→1`, so a code survives being pasted through chat apps, line-wrapped or read aloud. In
-the QR the code is upper-case only, which QR encodes in **alphanumeric mode** (5.5 bits per char).
-base45 was considered: 7 % shorter but it contains space, `%`, `$`, `*` and `/`, which chat apps and
-editors trim or rewrite; at error-correction level M both give the same QR versions for our sizes.
-Displayed in groups of four characters.
+**Sizes (measured, e2e `pair-by-text`, no STUN, mDNS off, one host candidate):** invitation 124
+characters from Chromium, 112 from Firefox; reply 131 from Chromium, 118 from Firefox. Unit tests
+encode real SDPs of both browsers (fixtures, addresses replaced by documentation ranges) in ≤ 210
+characters.
 
-### 4.2 Payload (version 1)
-```
-u8   0x10 | kind (1 offer, 2 answer)            version 1 in the high nibble
-[answer only] 4 B offer tag = SHA-256(offer payload)[0..4]
-u8 len + ufrag      u8 len + password            (ASCII; hex ones packed: flag in the length's top bit)
-32 B DTLS fingerprint (SHA-256)
-u8 n, then n candidates (UDP, component 1 only, at most 4):
-     u8 type(host/srflx/prflx) | addr kind<<2 (IPv4, IPv6, mDNS UUID, other name)
-     address (4 / 16 / 16 / u8 len + bytes)   u16 port
-4 B CRC-32 of everything before it
-```
-Not carried because the receiver knows it: `a=setup` (offer `actpass`; answer always `passive`,
-§1.2), `mid` (the offerer keeps its own; the answer is rebuilt with it), SCTP port 5000, the
-`max-message-size` (always stated as 262,144: §1.3), the session lines. Candidates kept: first
-IPv4 host, first IPv6 host, srflx; TCP candidates are dropped (the probe connected over UDP in
-every case). The rebuilt SDP is the probe's `rebuild()` (§1.1: accepted by both browsers).
+**Checks (measured, unit `netcode`):** every proper prefix and every single-character change of a
+code is rejected; also a wrong kind, version, foreign text, empty input, over-long input. Messages:
+"not a LeanSync pairing code", "made by a different version of the app", "a reply code, not an
+invitation" (and vice versa), "incomplete or mistyped", "belongs to another invitation", "already
+used", "expired". e2e `pairing-codes-rejected` checks them through the UI.
 
-### 4.3 Checks and their messages
-A code is rejected before any WebRTC call if: the prefix is not `LS`; the version is not one this
-app reads ("made by a different version of the app"); the kind is wrong ("this is an invitation,
-not a reply" and vice versa); the CRC fails or the length does not match the structure ("this code
-is incomplete or mistyped": CRC-32 detects every burst error up to 32 bits and anything else with
-probability 1 − 2⁻³²; a truncated code fails the CRC or the length); an answer's offer tag is not
-the one of the invitation on screen ("this reply belongs to another invitation"). A QR has its own
-Reed-Solomon correction; the CRC is for the text path.
+**Reuse and staleness (as built):** an invitation is single-use and lives in A's page: void when
+its dialog is closed, the page reloads, after the first accepted reply, or after 10 minutes. A
+second reply is refused ("already used"); a reply made for another invitation is refused ("belongs
+to another invitation"). B keeps renewing its reply for **2 minutes**, then says "The other device
+did not answer. Start again on the device that made the invitation." **Deviation:** 2 min instead
+of 30 s: B cannot tell a void invitation from one not yet scanned.
 
-### 4.4 Reuse and staleness
-- **An offer is single-use** and lives in A's memory: it is void when A's pairing screen is closed,
-  the page reloads, the first answer has been accepted, or after a time limit (proposal: 10 min; A
-  then makes a fresh one on screen). A second answer to a used offer is refused ("this invitation
-  was already used"); two devices that scanned the same invitation: only the one whose reply A
-  scans connects, the other's reply times out.
-- **B with a void offer** produces an answer that nobody accepts: B shows "could not connect — the
-  other device is no longer waiting for this code; start again there" after its attempt times out
-  (30 s).
-- **An answer is good for ~10 s** across networks (§1.2), so B's code is live (§5) and an answer
-  pasted much later may fail on a Firefox device or across NATs; the UI says so.
-- An old answer pasted into a new invitation is refused by the offer tag. Replaying codes needs
-  the user to scan the attacker's code, i.e. outside the trust model. The codes contain local and
-  public IP addresses: the UI says not to post them publicly.
-
-## 5. Connection lifecycle
+## 5. Connection lifecycle (as built)
 
 ```
-A invite()                      B respond(offer)                          (manual or later automatic signalling)
-  new pc(iceServers), dc "sync"    every 5 s while not connected (max 6 live attempts):
-  setLocalDescription                new pc, setRemoteDescription(rebuilt offer)
-  wait: gathering complete,          answer with a=setup:passive; setLocalDescription
-    or first srflx + 300 ms,         wait for candidates as A does; publish the newest code
-    or 2 s                         when any attempt's channel opens: close the other attempts
-  show code                        
-  accept(answer): rebuild SDP, setRemoteDescription   → ICE, DTLS (A is the client), SCTP, channel open
-both: channel open → onLink(link) → links.mjs HELLO → Lean `connected p`
+A invite()                                   B respond(invitation)
+  pc + ctl; offer; gather (≤ 2 s)              every 2.5 s while waiting (≤ 6 alive, oldest closed; 2 min max):
+  show the invitation                            pc + ctl; offer rebuilt; answer with a=setup:passive;
+                                                 gather (≤ 2 s); show the newest reply
+  accept(reply): checks; rebuild; setRemote  → ICE, DTLS (A client), SCTP → ctl open on both
+  30 s without ctl open → "could not connect"   the attempt whose ctl opens wins; the others are closed
+A opens the sync channel → link on both sides → links.mjs HELLO → Lean `connected p`
 ```
-- **Renewed answers are a design, not yet measured as such**: the probe measured one answer per
-  offer with a delay (§1.2). That A answers ICE checks from several of B's attempts harmlessly, and
-  that the attempt A scanned wins, is to be tested first in stage 2 (unit with the probe's
-  "unreachable" mode, then e2e).
-- **Peer ids.** Unchanged: `links.mjs` assigns PeerIds on HELLO (page-lifetime counter). Every new
-  channel is a new link, hence a new PeerId and a fresh Lean session, as with the relay.
-- **Loss.** `onClose` fires on channel `close`, on connection `failed`/`closed`, or after
-  `disconnected` has lasted `LOSS_MS` = 5 s (measured detection after a silent loss: Chromium 5 s
-  to `disconnected`, Firefox 10 s, so links go down after ~10 s and ~15 s). Lean then gets
-  `disconnected p` and re-plans. The connection is kept while it is only `disconnected`; if ICE
-  recovers to `connected`, a new channel is opened (new PeerId). `failed` is final: **the user must
-  pair again** (no signalling channel exists for an ICE restart).
-- **Channel closed, connection alive** (engine restart via `links.resetAll()`, `links.mjs` killing a link
-  for a protocol error, own-replica refusal, the remote's restart): the device that made the offer
-  opens a new channel after a back-off (0.5 s doubling to 30 s, reset after a channel lived 20 s —
-  the relay's rule, so a link closed for an error cannot spin); the answerer accepts incoming
-  channels as new links. Measured: a replacement channel opens in ~300 ms (§1.4). So **an engine
-  restart does not need re-pairing**.
-- **Page closing.** On `pagehide` the transport closes every connection, so that peers learn at
-  once (Firefox does this itself; Chromium does not — §1.4; whether it works from `pagehide` is to
-  be measured in stage 2).
-- **Nothing is persisted**: connections, codes, ICE passwords and certificates live only in the
-  page. Reloading the page drops every connection; every device must pair again. (See Q1.)
+Gathering is finished on `complete`, on the first srflx + 300 ms, or after 2 s (measured, e2e
+`stun-settings`: with an unreachable STUN server the invitation is shown 2.06–2.09 s after the
+click in both browsers; Chromium alone reports completion after ~40 s, §1.1). Nothing is
+persisted except the STUN list; a reload ends every connection (decision 1).
 
-## 6. Pairing UI, step by step
+## 6. Pairing UI (as built: `app/js/pairing-ui.mjs`)
 
-A "Devices" panel replaces the relay's status: the connected devices (label from HELLO, since when,
-Disconnect), and two buttons, **Invite a device** and **Join a device**.
+A **Devices** panel (connected devices with their label and state — connected, connecting…,
+reconnecting…, paired (you are offline / the other device is offline) — and *Disconnect*),
+*Invite a device*, *Join a device*, the *online* box, and *Connection settings* (STUN list).
+The pairing dialog:
+- **Invite:** the invitation QR, its text with *Copy* (and *Share…* where available), "valid for
+  one device, until HH:MM", a STUN warning if a STUN server was configured but unreachable; then
+  "read the reply": *Scan the reply with the camera* and a paste field.
+- **Join:** *Scan the invitation* / paste; then the reply QR and text, renewed every 2.5 s, with
+  "Sending it as text instead? Paste it on the first device right away: when the devices are on
+  different networks a reply is good for only about 10 seconds."; the no-camera rule ("If one of
+  your two devices has no camera, start the invitation on the device that has one") is stated on
+  the Join screen.
+- **Camera:** no `videoinput` → "No camera found on this device: paste the code instead." and no
+  scan button; permission refused → "Camera access was refused: paste the code instead."; other
+  errors named. The scanning loop draws the video into a canvas (≤ 640 px wide) every 200 ms and
+  decodes it with the vendored `qr` decoder.
+- **Results:** "Connecting…", "Connected. You can close this window." (the dialog stays open until
+  the user closes it: **Deviation**, so that a mistaken second reply still gets its message), the
+  connection-failure help of stage 1 §6, and a message when a connection ends ("…ended (lost, or
+  closed by the other device). Pair again to reconnect.").
+- **Phone size (measured, e2e `pairing-ui-phone-viewport` at 360×740):** no horizontal scroll of
+  the page or the dialog, dialog inside the screen, QR 200–340 px wide, code box inside.
 
-Device A (inviting):
-1. *Invite a device* → "Preparing…" (≤ 2 s, gathering) → the invitation QR, the code as text with
-   *Copy* (and *Share…* where `navigator.share` exists), and "On the other device choose *Join a
-   device* and scan this code. If that device has no camera, send it this text." A timer shows the
-   invitation's remaining validity (10 min).
-2. *Scan the reply* (opens the camera; the video and a frame for aiming) or *Paste the reply*.
-3. On a valid reply: "Connecting…" → "Connected to *label*" (label from HELLO), the panel closes.
-   Errors: messages of §4.3; after 30 s without a channel: "Could not connect" (below).
+Two browser behaviours found while building (both fixed in the app, both caught by tests): a
+`<video>` made by script must be muted by **property** (the attribute does not mute it, `play()`
+is then refused and the frame stays frozen: the camera never scanned); a dialog's `close` event
+is queued, and in Chromium a late one arrived after the next dialog had opened and cancelled its
+reply (the handler now ignores it while the dialog is open).
 
-Device B (joining):
-1. *Join a device* → *Scan invitation* (camera) or *Paste invitation*.
-2. On a valid invitation: the reply QR, its text with Copy/Share, and "Now scan this code with the
-   first device". The QR is replaced by a fresh one every 5 s (a small progress ring shows it);
-   that is invisible to someone scanning, and keeps the reply usable (§1.2).
-3. When the channel opens: "Connected to *label*". After 2 minutes without success B stops making
-   attempts: "The first device did not answer. Start again on the first device."
+## 7. STUN configuration (as built)
 
-**No camera.** The slow manual leg must carry the invitation, the fast leg the reply (§1.2). So:
-if one device has no camera, **start on the device that has one** (it invites; the camera-less
-device pastes the invitation, which does not age, and shows the reply QR, which the first device
-scans at once). Both devices without a camera: both codes go by text (send-to-self, chat); the
-reply must then be pasted within about 10 s when the devices are on different networks — the UI
-says "paste the reply quickly" and offers "make a new reply". The UI detects a missing camera
-(`enumerateDevices` has no `videoinput`, or permission denied) and hides the scan buttons.
+*Connection settings*: one `stun:`/`stuns:` URL per line; default `stun:stun.l.google.com:19302`;
+empty = none. Stored in IndexedDB (`stun`), never read from the URL. Each URL is checked by
+constructing a throw-away `RTCPeerConnection` (Firefox refuses e.g. port 9 there); a refused list
+is not saved and says why. Changes apply to the next pairing. With no STUN, codes carry host
+candidates only (measured in e2e). The tests never use the internet: every device's list is set to
+empty through this UI, except in `stun-settings`, which checks the default, refusals, an
+unreachable server and the empty list.
 
-**Failure messages.**
-- Camera denied: "Camera access was refused; you can paste the code instead."
-- No STUN reachable while one is configured (no srflx candidate gathered): shown before the code:
-  "Could not reach the connection helper (*host*); devices on different networks may not be able to
-  connect. Same Wi-Fi works."
-- No channel after 30 s: "Could not connect to *the other device*. Both devices must keep this
-  page open. Devices on different networks connect only if their routers allow direct
-  connections; this app does not relay data through a server. Try on the same Wi-Fi network, or
-  try again."
-- Connection lost later: the device disappears from the list with "connection lost — pair again
-  to reconnect" (after `failed`), or "reconnecting…" while `disconnected`.
+## 8. Static hosting (as built)
 
-## 7. STUN configuration
+The app is `build/site/` as plain files; nothing in it uses a server endpoint. Measured:
+`runs-from-sub-path` serves the site under `/some/sub/dir/` and pairs two devices there; every
+request was for a site file. `no-network-except-paired-devices` checks that a page makes no
+WebSocket, EventSource or foreign fetch, no connection before the user pairs, uses only the ICE
+servers of the setting, and that URL parameters `relay`, `room`, `stun` are ignored. Server
+requirements (unchanged from stage 1 §8): HTTPS; `.mjs` served as JavaScript; `.wasm` preferably as
+`application/wasm`; revalidation (`Cache-Control: no-cache`) because file names are not
+versioned; no COOP/COEP. Storage is per origin: each device has its own; moving the app to another
+origin gives every device a fresh store there; two copies under different paths of one origin
+share one store and one Web Lock.
 
-- A setting "Connection helper (STUN)": a list of `stun:` URLs, default
-  `stun:stun.l.google.com:19302`, and "none". Stored in IndexedDB next to the label (one more
-  row in "nothing else persisted"); not settable by URL parameter (the reasoning of the old
-  `?relay=` finding: a crafted link must not change where the app talks to; here it would only
-  leak the IP address to another STUN server, but the rule stays simple). Changes apply to the next
-  pairing.
-- With "none": no srflx candidates, only host candidates; devices connect on the same LAN (and the
-  same machine), not across NATs. The pairing screen says so once.
-- What STUN reveals: the STUN server sees the device's public address; the codes contain it. With
-  mDNS on (browser default), local addresses are hidden behind `.local` names (§1.1), which works
-  between devices of one LAN when multicast works there (not measured beyond this machine).
-- Gathering is capped (§1.1), so an unreachable STUN server costs at most 2 s per code, not
-  Chromium's 40 s.
+## 9. The relay (done: option (a))
 
-## 8. Static hosting
+Removed from the app (`app/js/transport/relay.mjs`), from `dev/serve.mjs` (now a static server
+with an optional base path) and from the tests (`test/unit/relay.test.mjs`). The faults it
+injected are injected by the `NET` init script of `test/e2e/lib.mjs`, which wraps
+`RTCPeerConnection` and `RTCDataChannel.send` on the sending device: cut the sync channel after N
+bytes, flip a byte of the next blob frame, send a garbage message; it also counts connections,
+bytes, ICE servers and any WebSocket/EventSource/foreign fetch.
 
-The shipped app is `build/site/` served as plain files over HTTPS by any static web server. The
-WebRTC path uses nothing of `dev/serve.mjs`.
-- **Measured** (`test/e2e/probe-static.mjs`): the site runs from a **sub-path**
-  (`/some/sub/path/`) in Chromium and Firefox; every URL is relative (`js/main.mjs`, `app.css`,
-  `../lean/lean_sync.mjs`, `new URL("lean_sync.wasm", import.meta.url)` in the glue).
-- **MIME types**: `.mjs` must be served as JavaScript (`text/javascript`): module scripts are
-  rejected otherwise (read: HTML spec, strict MIME check for modules). `.wasm` should be
-  `application/wasm` for streaming compilation; served as `application/octet-stream` the app still
-  starts in both browsers (measured: the Emscripten glue falls back to ArrayBuffer instantiation).
-- **No special headers**: the engine uses no threads and no `SharedArrayBuffer` (none in the glue),
-  so cross-origin isolation (COOP/COEP) is not needed. HTTPS is needed for a secure context (OPFS,
-  Web Locks, camera); `http://127.0.0.1` and `http://localhost` count as secure for local tests.
-- **Caching**: file names are not versioned, so the server should make browsers revalidate
-  (`Cache-Control: no-cache` with ETag/Last-Modified), or a device may run a new `lean_sync.mjs`
-  with an old `.wasm`. A future build could hash file names instead.
-- **Storage is per origin** (scheme, host, port), not per path: two devices that load the same URL
-  each have their own storage (that is the point: each is one replica). Two copies of the app
-  under different paths of one origin would **share** one store and one Web Lock. Moving the app
-  to another origin later gives every device a fresh, empty store under the new origin (a new
-  replica: its files come back by syncing from a device that still has them; edits made only on
-  that device under the old origin stay behind until it is opened there again).
-- **What happens to `/relay` today** (measured): on a static server the relay client retries every
-  0.5 s doubling to 10 s forever and logs "relay unreachable"; the app otherwise runs. In the
-  design the relay client leaves `app/` (§9), so the shipped app makes no request to its origin
-  beyond loading its files, and no network traffic except STUN and paired peers.
+## 10. Tests (as built)
 
-## 9. What the relay transport becomes
+**Network for the e2e tests.** `test/e2e/run.mjs` re-runs itself inside `unshare -rn` (new user and
+network namespace, no root) with `lo` and a dummy interface 10.99.0.1/24 plus a default route:
+WebRTC needs a non-loopback interface (§1.8), and the tests then never touch the real network or
+the internet. Without user namespaces it uses the host network if it has a non-loopback IPv4
+address, else it stops with an explanation. Devices launch with mDNS off (Chromium flag, Firefox
+pref) except in `pair-with-browser-defaults`.
 
-Options:
-- **(a, recommended) Removed from the app.** The app has one transport, WebRTC. The end-to-end
-  tests pair devices through the real UI (§10), and the faults that the relay injected (cut at a
-  byte offset, corrupt the next blob frame, inject a garbage message, topology) are injected from
-  outside by init scripts that wrap `RTCPeerConnection`/`RTCDataChannel` — the same practice as the
-  existing storage and trap faults, keeping the app byte-identical to what ships. `dev/serve.mjs`
-  becomes a static server (still with the `no-store` header); the relay and admin API are deleted
-  with their unit test, after every scenario passes over WebRTC.
-- (b) Kept in the app and enabled only when the origin offers it (e.g. the dev server serves a
-  `transport.json`). No test-only code, but a second transport in the shipped app that real use
-  never exercises, and a server file that would switch it on anywhere.
-- (c) Chosen at build time. Then the tested app is not the shipped app: rejected.
+**Pairing in tests** goes through the real UI: `pair(A, B)` in `test/e2e/lib.mjs` clicks *Invite* and
+*Join*, pastes the codes into the paste fields, or shows each side's QR (the canvas, as an image)
+to the other side's fake camera (init script `CAMERA`: `enumerateDevices` and `getUserMedia`
+replaced by a canvas stream; also "absent" and "refused" modes).
 
-The relay was also what decided topology; with manual pairing the topology is exactly the pairs
-the driver makes, which is simpler for the tests.
+**Scenarios added:** `pair-by-text` (C+C, F+F, C+F, F+C, E+C, C+E, E+F), `pair-by-qr-fake-camera`
+(C+F, F+C, C+C, F+F; also decodes the drawn QR directly), `pairing-codes-rejected` (C+F+C, F+C+F:
+foreign, truncated, one character changed, wrong version, wrong kind both ways, stale, reused),
+`reply-renewal` (C+F, F+F, F+C, C+C: B given unreachable candidates, reply read 12 s after B
+joined; measured 5 replies in 12 s, at most 5 attempts alive), `peer-killed-files-recover` (C+C,
+F+F, C+F, F+C), `three-devices-pairwise` (C+F+C, F+C+F), `stun-settings` (C, F),
+`pairing-ui-phone-viewport` (C+F, F+C), `runs-from-sub-path` (C+F), `pair-with-browser-defaults`
+(C+C, F+F, C+F, F+C), `no-network-except-paired-devices` (C+F, F+C; replaces
+`relay-parameter-ignored`). **Every existing scenario runs over WebRTC**, with pairing in place of a
+relay room; a page reload or a killed browser is followed by pairing again; `three-device-chain`
+pairs A–B and B–C only. None had to be dropped.
 
-## 10. Test plan
+**Unit:** `netcode` (7 tests, real SDP fixtures of both browsers) and `webrtc` (13 tests, the
+transport against an in-memory fake `RTCPeerConnection` that keeps a vanished peer's channel open
+as Chromium does).
 
-Unit (`node --test`, no browser):
-- code format: round trip; every proper prefix rejected; every single-character substitution of
-  the text rejected; kind swap; wrong version; foreign offer tag; tolerant reading (case, spaces,
-  `-`, line breaks, `O/I/L`); size bound (≤ 4 candidates).
-- SDP extract/rebuild against SDPs captured from both browsers (fixtures from the probe).
-- transport with fake `RTCPeerConnection`/`RTCDataChannel` objects: `onClose` exactly once across
-  every combination of channel close / `failed` / `closed` / `disconnected` timeout / own close;
-  `send` exception closes the link; channel reopen back-off; offer single-use; answer attempts
-  rotate and are all closed when one opens.
+**Not testable automatically here:** real cameras and screens (glare, distance, focus); phones
+(Chrome on Android, Firefox on Android; Safari is unsupported: Memory64); real NATs and networks
+(the cross-NAT case is simulated by unreachable candidates); Google's STUN; mDNS between
+separate machines; background tabs and sleeping phones; `navigator.share` and the clipboard.
 
-End-to-end (headless, each device its own browser process and profile, as today):
-- **Pairing through the real UI**: the driver reads the invitation text from A's page, types it into
-  B's paste field, reads B's reply text and pastes it into A (no hook into the app). One scenario
-  per pairing also exercises the **QR path**: an init script replaces `getUserMedia` with
-  `canvas.captureStream()` of the other device's rendered QR (taken from its page as an image), so
-  the real scanning loop and decoder run; the decoder is also checked directly on the rendered
-  canvas. A camera cannot be used headless.
-- **Every existing scenario** runs over WebRTC (same browser configurations), with `pair()` in place
-  of joining a room; three-device chains pair A–B and B–C only.
-- New scenarios: answer applied after 30 s (passive role; same LAN); invitation reused (second
-  reply refused); stale reply (offer tag); peer browser killed → link down within ~15 s and a
-  re-pair works; engine trap → a new channel on the same connection, no re-pairing; STUN "none"
-  and an unreachable STUN server (gathering cap: code within 2 s in Chromium); no network
-  request other than loading files (init script counts `WebSocket`/`fetch`/`EventSource`).
-- **Browser settings for tests**: mDNS off (Chromium
-  `--disable-features=WebRtcHideLocalIpsWithMdns`, Firefox
-  `media.peerconnection.ice.obfuscate_host_addresses=false`) for deterministic candidates, no STUN;
-  plus one scenario with default browser settings (mDNS on) in each pairing, which worked on this
-  machine when the answer is applied at once. The tests need a network interface (loopback alone
-  gives no candidates, §1.8); `scripts/test-app.sh` can run the e2e step inside `unshare -rn` with
-  a dummy interface, which also isolates the tests from the real network and from Google's STUN.
+## 11. Host obligations
 
-Not testable automatically here: real cameras and scanning from a screen; phones (Safari, Chrome
-on Android); different networks and NAT types (the probe can only simulate "B cannot reach A");
-Google's STUN availability (one optional check when online); background tabs and sleeping phones.
+The rows are in `docs/app-design.md` §4, each with its mechanism, test and mutant
+(`node test/mutations.mjs`).
 
-## 11. Host-obligation rows this adds (app-design §4)
+## 12. Decisions (taken by the user after stage 1)
 
-| Obligation | Mechanism | Test | Mutant |
-|---|---|---|---|
-| A link goes down when its connection is lost, even if the channel still says open | `onClose` on `failed`/`closed`/`disconnected` > 5 s | e2e peer browser killed (Chromium receiver) | channel `close` only |
-| `onClose` once per link | one guard in the link | unit (fake RTC) | guard removed |
-| Answerer is the DTLS server | answer edited to `a=setup:passive` | e2e delayed reply (F→C) | default role |
-| A reply stays usable while shown | answer attempts renewed every 5 s, others closed on success | e2e reply scanned/pasted 20 s after B joined, B cannot reach A first (driver gives B unreachable candidates, as in the probe) | no renewal |
-| Codes are checked before use | version, kind, CRC, structure, offer tag | unit (prefixes, substitutions) | CRC skipped |
-| An invitation accepts one reply | state per invitation | unit; e2e invitation reused | second reply accepted |
-| Gathering never blocks for long | finalise on complete / srflx + 300 ms / 2 s | e2e unreachable STUN (Chromium) | wait for complete |
-| No transport except to paired devices and STUN | no relay client; STUN only from the setting | e2e network-request count; STUN "none" → no srflx in the code | relay kept; default ignored |
-| A failing `send` closes the link | exception → close | unit | exception swallowed |
-| Engine restart keeps the pairing | reopen a channel on the live connection with back-off | e2e trap mid-sync | close the connection instead |
-| Nothing else persisted | IDB holds record, `rotateId`, label, STUN setting | review | — |
+1. A reload, crash or sleep means pairing again; nothing about pairings is persisted.
+2. Codes as base32 text.
+3. `qr` (Paul Miller) vendored unmodified (`app/vendor/qr/`, README with version, source, integrity
+   and file hashes), no `BarcodeDetector` path; its round trip is tested in Chromium and Firefox
+   through the app's scanning loop (`pair-by-qr-fake-camera`).
+4. The reply renews itself while shown (2.5 s, §1.9); no-camera rule and text-path warning shown.
+5. Going offline closes links and keeps connections.
+6. No heartbeat; loss from the connection state (and the channel treated as dead).
+7. Relay removed; faults injected by init scripts; `dev/serve.mjs` a static server.
+8. Default STUN Google's, user-editable, empty works.
 
-The row "Transport only to the serving origin" (relay) is replaced by "No transport except to
-paired devices and STUN".
+## 13. What remains to verify on real devices (checklist: one phone, one desktop)
 
-## 12. Open questions for the user
-
-**Q1. Reload or tab closed = pair again?** Connections live in the page. Options: (a) accept — every
-reload, crash or phone sleep needs a new QR exchange; (b) keep the pairing across reloads with a
-persisted certificate and a stored peer list, which still cannot reconnect without a signalling
-channel, so it only helps the later rendezvous stage. *Recommendation: (a) now; the first item of
-the "pair once" stage is (b) plus rendezvous.*
-
-**Q2. Codes as base32 text** (≈ 120–210 characters, QR v5–v8) vs base45 (7 % shorter, same QR
-versions, worse for chat apps and typing). *Recommendation: base32.*
-
-**Q3. The QR library.** None of the browsers measured has `BarcodeDetector` on Linux. Proposal:
-vendor **`qr` by Paul Miller** (npm `qr` 0.7.2, Sep 2026, licence MIT OR Apache-2.0, zero
-dependencies, plain ES modules: `index.js` 43.7 KB encoder, `decode.js` 148 KB decoder, `dom.js`
-49 KB camera/canvas helpers, unminified with comments; read from the package, not run here). One
-library encodes and decodes, so the test can decode the QR the app renders with the same code the
-app uses for scanning, and it can be loaded with relative imports, no bundler. Alternatives:
-`jsqr` 1.4.0 (Apache-2.0, decoder only, 257 KB UMD file that would need wrapping, last release
-2021) with `nayuki-qr-code-generator` (MIT, encoder); `qr-scanner` (MIT, last release 2022);
-`zxing-wasm` (MIT, 3.5 MB). Use `BarcodeDetector` where present? *Recommendation: `qr` only, one
-code path everywhere (the native detector would be an untested path in our CI).* Licence and
-copyright notice to be kept next to the vendored files under `app/vendor/qr/`.
-
-**Q4. Answer lifetime across networks.** Measured: an answer is good for ~10 s when the answerer
-cannot reach the offerer first (Firefox 11 s). Options: (a) live reply QR + "start on the device
-with the camera" rule + a warning on the text path; (b) a third code (the offerer's "go" signal) —
-does not help, the answerer still starts too early; (c) accept failures across networks with
-text-only pairing. *Recommendation: (a).* To be confirmed on real networks with phones.
-
-**Q5. "Go offline" with manual pairing.** Options: (a) close channels but keep connections, so
-"online" again reopens channels without re-pairing (the connection still uses ICE keep-alives);
-(b) close connections, re-pair after. *Recommendation: (a).*
-
-**Q6. Loss detection.** Options: (a) connection state only (link down after ~10–15 s, browser
-dependent); (b) add a host-level heartbeat frame to `links.mjs` (e.g. every 2 s, down after 6 s),
-uniform across browsers. *Recommendation: (a) now; (b) only if 15 s proves too slow.*
-
-**Q7. The relay.** §9 (a) remove from the app, faults by init scripts; (b) keep behind a server
-switch. *Recommendation: (a).*
-
-**Q8. Default STUN server.** Google's, as decided; a second default (e.g. another public
-operator) would avoid depending on one company, at the cost of revealing the IP to two. *Recommend:
-Google only, user-editable list.*
-
-## 13. Surprises, and points that touch the decisions
-
-1. **The decided flow "A shows the offer, B scans and shows the answer, A scans" works only with
-   two changes**: the answerer must take the passive DTLS role, and its answer must be renewed
-   while shown, because the answerer starts ICE a human scan earlier than the offerer, and
-   Firefox gives up after 11 s when it cannot reach the offerer first (the usual case across NATs).
-   The text fallback is therefore asymmetric: pasting the invitation is fine, pasting the reply
-   is reliable only on the same network or if done within ~10 s. This does not contradict the
-   decisions, but it changes the no-camera instruction ("start on the device with the camera").
-2. **"Wait for ICE gathering to finish" is not usable as such**: Chromium reports completion after
-   ~40 s whenever a STUN server is configured (reachable or not, on this machine).
-3. **A Chromium receiver keeps a dead channel open** indefinitely; only the connection state
-   reveals the loss.
-4. Every disconnect that reaches `failed` (phone asleep, network change, reload) needs a new manual
-   pairing until the "pair once" stage exists (Q1). This is the main usability cost of the decided
-   signalling.
-5. Two copies of the app under different paths of one origin share storage (§8).
+Serve `build/site/` over HTTPS from any static host; open it on the desktop (Chrome or Firefox) and
+on the phone (Chrome or Firefox for Android; Safari is unsupported, it lacks WebAssembly Memory64).
+1. **QR, desktop invites:** desktop *Invite*, phone *Join* → *Scan*, then the desktop scans the
+   phone's reply with its webcam. Both say "Connected"; add a file on each side; both lists show
+   both files complete.
+2. **QR, phone invites:** the same with roles swapped.
+3. **Desktop without camera** (or camera permission refused): invite on the phone; send the
+   invitation text to the desktop (mail/chat to yourself), paste it in *Join*; the phone scans the
+   desktop's reply. Check the "No camera found" / "Camera access was refused" messages.
+4. **Text both ways:** copy the reply and paste it on the other device at once (expect success);
+   on different networks, also wait 30 s before pasting (expect the "Could not connect" help: the
+   documented limit, §1.2).
+5. **Different networks:** phone on mobile data, desktop on Wi-Fi, default STUN; pair by QR.
+   Record whether it connects (it cannot when both sides are behind symmetric NATs: no TURN).
+6. **Same Wi-Fi, STUN list emptied on both:** pair; expect a connection over the LAN (mDNS names).
+7. **Sleep and background:** lock the phone or switch apps for 1–2 minutes during a transfer; on
+   return the device shows "reconnecting…" or the connection ended; after pairing again the
+   transfer completes.
+8. **Closing:** close the desktop tab; the phone lists the connection as ended within a second.
+9. **Offline toggle:** untick and tick *online* on the phone; the devices re-link without pairing.
+10. **Phone UI:** portrait and landscape; the dialog fits, buttons are reachable, the QR scans from
+    20–40 cm, the code text can be copied.
+11. **Volume:** a 100 MB file phone ↔ desktop over Wi-Fi; note the time and that it completes.
