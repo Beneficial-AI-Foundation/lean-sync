@@ -149,7 +149,7 @@ in the app's source and the named test was run (e2e in Chromium); **55 of 55 mut
 | Persist atomically, then `persisted tag SHA-256(bytes)` | one strict `readwrite` transaction; resolved only from `complete`; digest of exactly those bytes | unit `core` (no `persisted` while the save is held) | ack without awaiting the save |
 | Never acknowledge a failed write | request errors abort the transaction (not prevented); `abort`/exception → reject → `persistFailed` | e2e `record-request-error-not-acknowledged` (request-level fault: no ack, record unchanged, peer unaffected); unit `core`; e2e `storage-failure` | `preventDefault` on request errors; `persistFailed` dropped |
 | Retry after back-off; surface `saveFailed` until resolved | `retrySave` from the back-off timer (1 s doubling to 60 s), and from "Retry now"; banner + "not saved" until a later save completes | unit `core` (no write on 150 other events while held; one write per retry; Retry now); e2e `storage-failure` (failed writes ≤ retries + 1) | retry with no back-off; retry never sent; banner removed |
-| A blob this device could not store: not the peer's fault, retried | receive-side storage failures (file creation, write, final move) report `blobStoreFailed`, not `blobFailed`; it schedules `retrySave` like a failed save; the row says "could not be stored on this device"; a banner offers "Retry now" (without claiming unsaved changes); a store that fails after its connection closed reports nothing (Lean has re-planned the hash, maybe to another peer, and the peerless event would cancel that transfer) | unit `links` (incl. late failure after close, late success still reported), `core`, `view`; e2e `incoming-write-or-publish-failure` (Retry now sends `retrySave` at once; recovers in the same session), `incoming-file-creation-fails-then-next-file` | `blobFailed` instead (sink and write errors; final move); not retried (unit and e2e); shown as `waiting`; late failure reported after close; no Retry now for store failures |
+| A blob this device could not store: not the peer's fault, retried | receive-side storage failures (file creation, write, final move) report `blobStoreFailed`, not `blobFailed`; it schedules `retrySave` like a failed save; the row says "could not be stored on this device"; a banner offers "Retry now" (without claiming unsaved changes); a store that fails after its connection closed reports nothing (Lean has re-planned the hash, maybe to another peer, and the peerless event would cancel that transfer; known limitation, §11: the event names no peer, other stale-report races not analysed) | unit `links` (incl. late failure after close, late success still reported), `core`, `view`; e2e `incoming-write-or-publish-failure` (Retry now sends `retrySave` at once; recovers in the same session), `incoming-file-creation-fails-then-next-file` | `blobFailed` instead (sink and write errors; final move); not retried (unit and e2e); shown as `waiting`; late failure reported after close; no Retry now for store failures |
 | One persist in flight; a restart waits for it | Lean issues one; the host slot is cleared only by its own write | unit `core` (back-to-back persists, then a trap) | slot cleared after the emit |
 | Blob verified and durable before `blobStored`; local blob before `localOp` | `incoming/` → hash of the stored bytes → `move()` (replacing a damaged copy) → emit | unit `links`; e2e `damaged-or-missing-blob-recovers`, `corrupted-blob…` | finish without hash; keep the damaged copy |
 | Supersede only what the user was shown | versions captured by the UI at the click, before any await | unit `core`; e2e `peer-edit-during-upload-becomes-conflict` | versions read after the upload |
@@ -372,7 +372,7 @@ attempted and failed within about a second, and the host could not apply a back-
 `persistFailed` holds the node until the host sends the new event `retrySave` (event tag 13), and
 the host owns the back-off (§3). Measured in the same test (`storage-failure`, about 4 s of failing
 storage, two runs each): on `main` 132 and 134 failed writes in Firefox 146, 141 and 138 in Firefox
-ESR 140; on this branch 3 or 4 in Firefox 146 and 4 in ESR 140 over four runs (one per retry,
+ESR 140; on this branch 3 or 4 in Firefox 146 and 3 or 4 in ESR 140 over the final runs (one per retry,
 1 s and 2 s back-off, plus the first). Chromium,
 where the record failure is injected and no peer events arrive meanwhile, had 3 before and after. `retrySave` when
 nothing is held issues no write (proved), so "Retry now" is always safe. Proofs:
@@ -394,6 +394,16 @@ stored on this device". Proofs: `blobStoreFailed_parks` (parked, in flight nowhe
 sync-design §9). E2e: `incoming-write-or-publish-failure` and
 `incoming-file-creation-fails-then-next-file` now show the new status and recover without a
 reconnect once storage works again.
+
+**Known limitation (not fixed, by decision).** `blobStoreFailed h` names no peer, so Lean cannot
+tell a stale report from a current one: a report that arrives after `h` was re-planned to another
+peer clears that peer's request and parks `h` while its transfer may still be running. The host
+must therefore not send `blobStoreFailed` for a connection that is no longer alive (covered by
+the unit test in `test/unit/links.test.mjs` "a store that fails after the link closed (END already received): no failure event, sink aborted; a late success is still reported", and the mutant `late-store-failure-after-close` in `test/mutations.mjs`). Other stale-report races, e.g. a reconnect before a slow failure, have not been analysed.
+The possible fix is `blobStoreFailed p h`, acting only when `h` is in flight at `p` (as `blobFailed
+p h` does): one more varint in event tag 14; `handle` takes the `blobFailed` shape, so its proof
+cases follow the existing `blobFailed` ones; `blobStoreFailed_parks` gains the hypothesis "`h` is in
+flight at `p`"; about an hour of work. Not doing it now was a deliberate decision by the user.
 
 Planned in the stage-1 note and not done:
 - Relay faults are injected at the relay, not by a "corrupting relay mode" per link direction for

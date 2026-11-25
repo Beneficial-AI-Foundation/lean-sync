@@ -321,6 +321,16 @@ simulation.
   good; one `retrySave` covers both kinds of failure. Proved: `blobStoreFailed_parks` (the hash is
   parked, in flight nowhere, and every session keeps exactly its `lacks`), `retrySave_releases`
   (nothing is parked after a `retrySave`).
+
+  **Known limitation (not fixed, by decision).** `blobStoreFailed h` names no peer, so Lean cannot
+  tell a stale report from a current one: a report that arrives after `h` was re-planned to another
+  peer clears that peer's request and parks `h` while its transfer may still be running. The host
+  must therefore not send `blobStoreFailed` for a connection that is no longer alive (covered by
+  the unit test in `test/unit/links.test.mjs` "a store that fails after the link closed (END already received): no failure event, sink aborted; a late success is still reported", and the mutant `late-store-failure-after-close` in `test/mutations.mjs`). Other stale-report races, e.g. a reconnect before a slow failure, have not been analysed.
+  The possible fix is `blobStoreFailed p h`, acting only when `h` is in flight at `p` (as `blobFailed
+  p h` does): one more varint in event tag 14; `handle` takes the `blobFailed` shape, so its proof
+  cases follow the existing `blobFailed` ones; `blobStoreFailed_parks` gains the hypothesis "`h` is in
+  flight at `p`"; about an hour of work. Not doing it now was a deliberate decision by the user.
 - **Four kinds of pending blob** (user decision: no clock, wait indefinitely; the review asked
   that a blob queued behind a busy peer not be reported as unreachable):
   - **fetching**: requested from a peer now;
