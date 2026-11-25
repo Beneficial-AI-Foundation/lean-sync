@@ -58,11 +58,15 @@ app/                         the shipped static site (scripts/build-site.sh copi
   js/view.mjs                snapshot + pending → rows (pure)
   js/ui.mjs                  DOM rendering, dialogs, drag-and-drop
   js/hash.mjs                WebCrypto SHA-256
-  js/transport/relay.mjs     the transport of this version: client of the dev relay (interface in its header)
+  js/transport/webrtc.mjs    the transport: WebRTC data channels between paired devices (interface in its header)
+  js/netcode.mjs             pairing codes: base32 text, CRC-32, SDP extract/rebuild (pure)
+  js/pairing-ui.mjs          Devices panel, pairing dialog, QR drawing and camera scanning, STUN setting
+  vendor/qr/                 `qr` 0.7.2 (Paul Miller, MIT OR Apache-2.0), encoder + decoder, unmodified (README there)
   lean/lean_sync.{mjs,wasm}  (in build/site only) the engine
-dev/serve.mjs                dev/test only: static server + WebSocket relay + admin API; 127.0.0.1 only
+dev/serve.mjs                dev/test only: a static server (optional base path); 127.0.0.1 only
 test/unit/                   node --test: codec vs Lean vectors, links, core (real engine), view
-test/e2e/                    driver (CDP / WebDriver BiDi on Node built-ins), lib, scenarios, runner, feature probe
+test/e2e/                    driver (CDP / WebDriver BiDi on Node built-ins), lib, scenarios, runner (in a private
+                             network namespace), feature probe
 test/proc.mjs                process groups and the per-run temporary directory for every browser test
 test/mutations.mjs           mutation audit of the host-obligations table (§4)
 test/wasm-*.mjs, test/browser-smoke.*   engine checks (§0)
@@ -169,7 +173,19 @@ in the app's source and the named test was run (e2e in Chromium); **55 of 55 mut
 | The single serving slot is always released | END right after START for an empty blob; ABORT from the receiver when it cannot create the file; release on END, receiver ABORT, link close, unreadable blob; abort after 60 s without credit | e2e `empty-file-then-normal-file`, `incoming-file-creation-fails-then-next-file`; unit `links` (all six paths) | no END for an empty blob; sink failure ignored; no stall timeout |
 | A blob is replaced only by a verified copy, never deleted first | an intact existing copy is kept; a damaged one is overwritten by one `move()` | e2e `existing-blob-kept-when-replacement-fails` | delete, then move |
 | Row statuses follow request planning | `pending` re-queried on peer changes and on `pendingSummary` | e2e `peer-leaves-mid-fetch-row-updates` | refresh removed |
-| Transport only to the serving origin | no URL parameter selects the relay | e2e `relay-parameter-ignored` (a second relay that accepts any origin sees no connection) | `?relay=` honoured |
+| No transport except to paired devices and STUN | one transport (WebRTC), started only by the user's pairing; ICE servers only from the setting; no URL parameter is read but `device` | e2e `no-network-except-paired-devices` (no WebSocket/EventSource/foreign fetch, no connection before pairing, ICE servers = setting, no request but the site's files, with `?relay=…&room=…&stun=…` in the URL); e2e `stun-settings` | a WebSocket to `/relay`; the setting ignored |
+| A link goes down when its connection is lost, even if the channel still says open (Chromium) | `onClose` on `failed`/`closed`, or `disconnected` for 5 s; a closing control channel ends the connection | unit `webrtc` (fake RTC; channel kept open as Chromium does); e2e `peer-killed-files-recover` | failure ignored (unit, e2e); channel close only (e2e); control-channel close ignored |
+| `onClose` once per link; nothing delivered after it | one guard per link; frames dropped once closed | unit `webrtc` (six ways a link ends) | guard removed; frames after close |
+| A failing `send` closes the link | exception → close | unit `webrtc` | exception swallowed |
+| Back-pressure never waits for an event that already fired | `onDrain` fires at once if the buffer is already below the threshold | unit `webrtc` | check removed |
+| Answerer is the DTLS server | the reply is edited to `a=setup:passive` | unit `webrtc` (fake RTC counts active answers) | default role |
+| A reply stays usable while shown | reply attempts renewed every 2.5 s, at most 6 alive, the others closed on success | unit `webrtc`; e2e `reply-renewal` (B cannot reach A first; A reads the current reply 12 s after B joined; Firefox answerer) | no renewal (unit, e2e with Firefox); unbounded attempts |
+| Codes are checked before use | prefix, version, kind, base32, structure, CRC-32, offer tag | unit `netcode` (every prefix and every single-character change rejected); e2e `pairing-codes-rejected` | CRC skipped; tag unchecked |
+| An invitation accepts one reply | state per invitation | unit `webrtc`; e2e `pairing-codes-rejected` | second reply accepted (unit, e2e) |
+| Gathering never blocks for long | code finished on gathering complete, first srflx + 300 ms, or 2 s | e2e `stun-settings` (unreachable STUN: invitation within 6 s; Chromium alone takes ~40 s) | cap removed |
+| Engine restart and "offline" keep the pairing | a closed link is reopened on the live connection (back-off 0.5 s → 30 s); offline closes links, not connections, and tells the other device over the control channel | e2e `trap-mid-sync-reinstantiates`, `offline-edits-both-sides` (same connection ids after offline/online); unit `webrtc` | connection dropped on a link close / on offline |
+| Closing the page tells the other devices | `pagehide` closes every connection | e2e `peer-killed-files-recover` (tab closed: dropped in < 5 s) | handler removed |
+| Pairing UI: camera refused or absent → text path with a message; the scanning loop reads the camera | messages per error; the video is muted by property | e2e `pairing-ui-phone-viewport` (360 px wide), `pair-by-qr-fake-camera` | message hidden; video not muted; a late `close` event ends the next dialog |
 | A storage failure on receive stops the transfer | the first failed write rejects; no more credit; `blobStoreFailed` + ABORT; the temp file is removed (also after a failed publish, and when a write still pending at END fails) | unit `links`; e2e `incoming-write-or-publish-failure` (each attempt of a 12 MiB transfer stops after ~1 MiB) | write errors swallowed (storage or links); temp kept |
 | Bounded reassembly | a continuation fragment must be exactly 16 KiB (our framing), so fragments are bounded by the message limit | unit `links` | size unchecked |
 | Paths round-trip byte for byte | `TextDecoder(fatal, ignoreBOM)`; vectors include a leading U+FEFF | unit `codec` | BOM stripped |
@@ -207,7 +223,12 @@ Browser behaviour found by the feature probe (`test/e2e/probe-features.mjs`) and
 - `navigator.storage.persist()` shows a permission prompt in Firefox (never answered in headless
   mode); it is requested without blocking start-up.
 
-## 6. Transport interface and the test transport (as built)
+## 6. Transport interface and the transport (as built)
+
+**Since the WebRTC stage (branch `webrtc-transport`), the transport is WebRTC data channels between
+devices the user paired by hand; the relay, its room parameter and the admin API are gone, and
+`dev/serve.mjs` is a static server. Design, measurements and pairing UI: `docs/net-design.md`. The
+interface below is unchanged; the text that follows it describes the relay as it was.**
 
 Interface: in the header of `app/js/transport/relay.mjs` (`start({onLink, onStatus})`,
 `setOnline`, `stop`; link: `send`, `close`, `bufferedAmount`, `onFrame`, `onClose`, `onDrain`).
@@ -406,7 +427,8 @@ cases follow the existing `blobFailed` ones; `blobStoreFailed_parks` gains the h
 flight at `p`"; about an hour of work. Not doing it now was a deliberate decision by the user.
 
 Planned in the stage-1 note and not done:
-- Relay faults are injected at the relay, not by a "corrupting relay mode" per link direction for
+- Link faults (cut at a byte offset, a corrupted blob frame, a garbage message) are injected by an
+  init script that wraps `RTCDataChannel.send` on the sending device, not per link direction for
   every frame type; a garbage-message test covers protocol errors.
 - No e2e test restores a *whole* backup (record plus blobs); the rollback test restores the record.
 - The "kill mid-persist → add lost" branch is accepted but was not observed (timing).
@@ -428,5 +450,5 @@ Planned in the stage-1 note and not done:
 5. One outgoing blob at a time per device: a slow peer delays others (a stalled one by at most 60 s).
 6. Accepted limits carried over: whole-state send per edit and peer, no blob GC, no file sizes in the
    index.
-7. The dev relay accepts only its own origin and uses a random room, but is otherwise unauthenticated;
-   the next task (WebRTC) replaces it.
+7. The relay is gone (WebRTC, `docs/net-design.md`). A pairing lasts while both pages are open:
+   a reload, a crash or a sleeping phone means pairing again (decision Q1 there).

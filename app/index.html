@@ -30,8 +30,23 @@
     <button id="add-button" disabled>Add files…</button>
     <input id="add-input" type="file" multiple hidden>
     <span class="muted">or drop files anywhere · adding a file under an existing name replaces it</span>
-    <label class="right"><input id="online" type="checkbox" checked> online</label>
   </div>
+  <section id="devices">
+    <div class="devices-head">
+      <strong>Devices</strong>
+      <button id="invite" type="button">Invite a device</button>
+      <button id="join" type="button">Join a device</button>
+      <label class="right"><input id="online" type="checkbox" checked> online</label>
+    </div>
+    <ul id="connections"></ul>
+    <details id="settings">
+      <summary>Connection settings</summary>
+      <label for="stun">Connection helpers (STUN servers), one per line. Leave empty for none: then devices connect only on the same network.</label>
+      <textarea id="stun" rows="2" spellcheck="false"></textarea>
+      <button id="stun-save" type="button">Save</button> <span id="stun-status" class="muted"></span>
+      <p class="muted">A STUN server tells this device its public address so that devices on different networks can find each other. It sees that address, never your files. No data is relayed through any server.</p>
+    </details>
+  </section>
   <div id="peers"></div>
   <div id="summary" class="muted"></div>
   <table>
@@ -43,5 +58,6 @@
   <details><summary>Diagnostics</summary><pre id="log"></pre></details>
 </main>
 <dialog id="confirm"></dialog>
+<dialog id="pair" aria-label="Pairing"></dialog>
 </body>
 </html>

@@ -5,6 +5,7 @@
 //              `persist` bytes) and the replica id it belongs to, replaced atomically
 //   'rotateId' true: the next start must use a fresh replica id (after rollbackDetected or reset)
 //   'label'    the device name shown to the user and to other devices
+//   'stun'     the STUN server URLs chosen by the user (array; absent = the default list)
 // OPFS: blobs/<64 hex>  complete files whose SHA-256 was verified on the stored bytes
 //       incoming/<rand> partial files (received streams, local adds); emptied at start-up
 //
@@ -116,6 +117,8 @@ export async function openStorage() {
     getRotate: async () => (await get('rotateId')) === true,
     getLabel: () => get('label'),
     setLabel: (label) => write({ label }),
+    getStun: () => get('stun'),
+    setStun: (list) => write({ stun: list }),
     setRotate: () => write({ rotateId: true }),
     /** The persist of one Lean `persist` effect: record and (optionally) clearing rotateId, atomically. */
     saveRecord(replica, state, { clearRotate = false } = {}) {

@@ -21,11 +21,13 @@ scripts/wasm/build.sh        # LeanSync -> build/sync/lean_sync.{mjs,wasm}  (a f
 scripts/build-site.sh        # app/ + engine -> build/site/
 ```
 
-**Start** the development server. It serves `build/site/` and runs the test transport (a
-WebSocket relay); it listens on 127.0.0.1 only and is not part of the app:
+**Serve** `build/site/` with any static web server, over HTTPS in real use (the app needs a secure
+context: OPFS, Web Locks, camera). It works from any path; `.mjs` must be served as JavaScript.
+For development, `dev/serve.mjs` is a minimal static server on 127.0.0.1 (`http://127.0.0.1` is a
+secure context):
 
 ```sh
-node dev/serve.mjs --port 8000        # add --admin only for the tests' fault-injection API
+node dev/serve.mjs --port 8000            # optionally --base /some/path/
 ```
 
 **Open two devices.** Each device is a browser profile with its own storage, e.g.:
@@ -35,9 +37,13 @@ chromium --user-data-dir=/tmp/dev-a 'http://127.0.0.1:8000/?device=laptop'
 firefox --no-remote --profile "$(mktemp -d)" 'http://127.0.0.1:8000/?device=phone'
 ```
 
-Devices in the same room connect to each other through the relay: without `?room=`, all devices of this server share a random room chosen when it starts. The relay accepts only pages served by itself (it checks `Origin`); `--admin` enables the fault-injection API the tests use.
-Add files with the button or by dropping them; untick "online" to edit offline. A second tab of the
-same profile shows "open in another tab" and does nothing.
+**Pair them** (docs/net-design.md): on one device choose *Invite a device*; on the other *Join a
+device* and scan the invitation's QR code with the camera, or paste its text; then let the first
+device scan (or paste) the reply. Devices connect directly over WebRTC; nothing goes through a
+server except the STUN query (default `stun:stun.l.google.com:19302`, editable under *Connection
+settings*, may be empty). Pairing lasts while both pages stay open: after a reload, pair again.
+Add files with the button or by dropping them; untick "online" to edit offline (the pairing is
+kept). A second tab of the same profile shows "open in another tab" and does nothing.
 
 **Tests:**
 
@@ -48,7 +54,9 @@ scripts/test-sync.sh         # protocol tests (native)
 scripts/wasm/check-engine.sh # wasm engine: Node smoke, native-vs-wasm replay, leak check and its
                              # negative control, 20k-file scale, browser smoke
 scripts/test-app.sh          # the app: codec vs Lean vectors, unit tests, engine checks,
-                             # end-to-end scenarios in headless Chromium and Firefox
+                             # end-to-end scenarios in headless Chromium and Firefox (run in a
+                             # private network namespace: needs unprivileged user namespaces, or a
+                             # network interface; see test/e2e/run.mjs)
 node test/e2e/run.mjs --only storage-failure --browsers chromium   # one scenario, one browser
-node test/mutations.mjs      # breaks each host obligation in turn; its test must fail (~10 min)
+node test/mutations.mjs      # breaks each host obligation in turn; its test must fail
 ```

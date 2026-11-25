@@ -105,6 +105,7 @@ async function launchIn(kind, dir, prefs, args, profile, keepProfile, onSpawn) {
         async navigate(u) { await s('Page.navigate', { url: u }); await waitReady(page); },
         async reload() { await s('Page.reload', {}); await new Promise((r) => setTimeout(r, 200)); await waitReady(page); },
         close: () => send('Target.closeTarget', { targetId }),
+        setViewport: (width, height) => s('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 2, mobile: true }),
         cdp: s,
       };
       await page.navigate(url);
@@ -122,6 +123,7 @@ async function launchIn(kind, dir, prefs, args, profile, keepProfile, onSpawn) {
       async navigate(u) { await send('browsingContext.navigate', { context, url: u, wait: 'complete' }); },
       async reload() { await send('browsingContext.reload', { context, wait: 'complete' }); },
       close: () => send('browsingContext.close', { context }),
+      setViewport: (width, height) => send('browsingContext.setViewport', { context, viewport: { width, height }, devicePixelRatio: 2 }),
     };
     await page.navigate(url);
     return page;

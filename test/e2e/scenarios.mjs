@@ -1,23 +1,40 @@
-// End-to-end scenarios (docs/app-design.md §10). Each scenario gets fresh devices (browser
-// processes with their own profiles) in its own relay room. `kinds` is the list of browsers for
-// the devices A, B, C...; test/e2e/run.mjs runs each scenario on each of its configurations.
+// End-to-end scenarios (docs/app-design.md §10, docs/net-design.md §10). Each scenario gets fresh
+// devices (browser processes with their own profiles); devices are paired through the app's own
+// pairing UI, over WebRTC. `kinds` is the list of browsers for the devices A, B, C...;
+// test/e2e/run.mjs runs each scenario on each of its configurations.
 import assert from 'node:assert/strict';
 import { cpSync } from 'node:fs';
 import { tempDir, removeDir } from '../proc.mjs';
 import { startServer } from '../../dev/serve.mjs';
-import { openDevice, randomFile, sleep, admin, sha } from './lib.mjs';
+import { randomFile, sleep, sha, pair } from './lib.mjs';
+import { parseCode, encodePayload, formatCode, offerTag } from '../../app/js/netcode.mjs';
 
 const CH = 'chromium', FF = 'firefox', ESR = 'firefox-esr';
 const files = (...fs) => Object.fromEntries(fs.map((f) => [f.name, f.sha]));
 
+/** Open the devices A, B, ...; two devices are paired (A invites, B joins) unless `paired: false`. */
 async function devices(ctx, kinds, opts = {}) {
   const out = [];
   for (let i = 0; i < kinds.length; i++) {
     const label = String.fromCharCode(65 + i);
     out.push(await ctx.open(kinds[i], label, opts[label] ?? {}));
   }
+  if (out.length === 2 && opts.paired !== false) await pair(out[0], out[1]);
   return out;
 }
+/** The invitation with every candidate address replaced by an unreachable one (TEST-NET-1): the
+ *  joining device's own checks then fail, as when the inviting device is behind a NAT. */
+function unreachableOffer(code) {
+  const x = parseCode(code, 'offer');
+  return formatCode('offer', encodePayload({ ...x, kind: 'offer', cands: x.cands.map((c) => ({ ...c, addr: '192.0.2.1' })) }));
+}
+/** B's reply to the altered invitation, carrying the real invitation's tag (only the candidate
+ *  addresses B was given differ, so A accepts it as the reply to its invitation). */
+async function retag(reply, offer) {
+  const r = parseCode(reply, 'answer');
+  return formatCode('answer', encodePayload({ ...r, kind: 'answer', tag: await offerTag(parseCode(offer, 'offer').payload) }));
+}
+const connIds = async (D) => (await D.connections()).map((c) => c.id).sort().join();
 async function expectSha(dev, path, f, version) {
   const d = await dev.download(path, version);
   assert.equal(d.sha, f.sha, `${dev.label}: downloaded ${path} has the bytes the test generated`);
@@ -79,16 +96,16 @@ export const scenarios = [
       // 1. A write error on B stops the transfer early: reported as a local failure (the peer is not
       //    blamed), sender told, no more credit. Every write fails until the disk is "freed".
       const big = randomFile(`w-${ctx.id}.bin`, 12 * 1024 * 1024);
+      const sent0 = await A.eval('window.__net.sent');
       await B.eval('(window.__failWrite = 1000000)');
       await A.add([big]);
       await B.waitRows((rows) => rows.length === 1 && rows[0].status === 'localFailure', 20000, 'write failure reported as local');
       assert.match(await B.eval(`document.querySelector('#files td.status').textContent`), /could not be stored on this device/);
       await sleep(1000);
-      const st = await (await fetch(`${ctx.server.url}/admin/state?room=${ctx.room}`)).json();
-      const bytes = st.links.reduce((n, l) => n + l.bytes, 0);
+      const bytes = (await A.eval('window.__net.sent')) - sent0;
       // the host retries with a back-off (1 s, 2 s, ...): each attempt must stop within the credit window
       const attempts = (await B.eval('window.leansync.log')).filter((l) => /could not write it/.test(l)).length;
-      ctx.note(`bytes relayed for a 12 MiB file whose writes fail: ${bytes} over ${attempts} attempt(s)`);
+      ctx.note(`bytes sent by A for a 12 MiB file whose writes fail on B: ${bytes} over ${attempts} attempt(s)`);
       assert.ok(attempts >= 1 && bytes < attempts * 4.5 * 1024 * 1024, `the sender stopped early each time (${bytes} bytes, ${attempts} attempts)`);
       await waitFor(async () => (await incomingCount(B)) === 0, 10000, 'temp file removed after the write failure');
       // Space comes back: the next automatic retry fetches the file again, from the same peer, with
@@ -104,8 +121,7 @@ export const scenarios = [
       await B.waitFiles(files(big), 30000);
       assert.ok(!(await B.eval(`!!document.querySelector('#retry-store')`)), 'the action goes away once stored');
       await expectSha(B, big.name, big);
-      const st2 = await (await fetch(`${ctx.server.url}/admin/state?room=${ctx.room}`)).json();
-      assert.equal(st2.links.length, 1, 'same session, no reconnect');
+      assert.equal(await A.eval('window.__net.syncSeen'), 1, 'same link, no reconnect');
       // 2. Publishing fails (move) after the stream completed: the temp file is removed too.
       const small = randomFile(`p-${ctx.id}.txt`, 2000);
       await B.eval('(window.__failMove = 1000000)');
@@ -202,18 +218,31 @@ export const scenarios = [
     },
   },
   {
-    name: 'relay-parameter-ignored',
-    kinds: [[CH], [FF]],
+    name: 'no-network-except-paired-devices',
+    kinds: [[CH, FF], [FF, CH]],
     async run(ctx, kinds) {
-      // A crafted link naming another relay must not move this device's sync there.
-      const rogue = await startServer({ port: 0, root: '/nonexistent', admin: true, anyOrigin: true });
-      ctx.cleanup.push(() => rogue.close());
-      const A = await ctx.open(kinds[0], 'A', { extraQuery: `&relay=${encodeURIComponent(`ws://127.0.0.1:${rogue.port}/relay`)}` });
-      await sleep(1500);
-      const rs = await (await fetch(`${rogue.url}/admin/state`, { method: 'POST', body: '{}' })).json();
-      assert.equal(rs.upgrades, 0, 'no connection to the other relay');
-      const own = await (await fetch(`${ctx.server.url}/admin/state?room=${ctx.room}`)).json();
-      assert.ok(own.devices.some((d) => d.label === 'A'), 'connected to its own relay');
+      // The app talks to nothing but the devices the user paired (and the STUN servers of the
+      // settings): no WebSocket, no server endpoint, no connection before the user pairs, and no
+      // URL parameter changes that (the old `?relay=` finding).
+      const before = ctx.server.stats.notFound.length;
+      const A = await ctx.open(kinds[0], 'A', { extraQuery: `&relay=${encodeURIComponent('ws://127.0.0.1:1/relay')}&room=x&stun=stun:192.0.2.9` });
+      const B = await ctx.open(kinds[1], 'B');
+      await sleep(2000);
+      for (const D of [A, B]) {
+        const n = await D.eval(`({ sockets: window.__net.sockets, es: window.__net.eventSources, foreign: window.__net.foreignFetch, pcs: window.__net.pcs })`);
+        assert.deepEqual(n, { sockets: 0, es: 0, foreign: 0, pcs: 0 }, `${D.label}: no network use before pairing`);
+      }
+      await pair(A, B);
+      const f = randomFile(`n-${ctx.id}.txt`, 3000);
+      await A.add([f]); await B.waitFiles(files(f));
+      for (const D of [A, B]) {
+        assert.equal(await D.eval('window.__net.sockets'), 0, `${D.label}: no WebSocket`);
+        assert.equal(await D.eval('window.__net.foreignFetch'), 0);
+        assert.deepEqual([...new Set(await D.eval('window.__net.ice'))], ['[]'], `${D.label}: ICE servers only from the setting (empty here)`);
+      }
+      const extra = ctx.server.stats.notFound.slice(before).filter((u) => !/favicon/.test(u));
+      assert.deepEqual(extra, [], 'no request for anything but the app\'s own files');
+      ctx.note(`connections made: A ${await A.eval('window.__net.pcs')}, B ${await B.eval('window.__net.pcs')} (B: one per renewed reply)`);
     },
   },
   {
@@ -314,6 +343,7 @@ export const scenarios = [
       const [A, B] = await devices(ctx, kinds);
       const base = randomFile(`base-${ctx.id}.txt`, 3000);
       await A.add([base]); await B.waitFiles(files(base));
+      const ids = [await connIds(A), await connIds(B)];
       await setOnline(A, false); await setOnline(B, false);
       const a = randomFile(`from-A-${ctx.id}.txt`, 4000), b = randomFile(`from-B-${ctx.id}.bin`, 90000);
       await A.add([a]); await B.add([b]);
@@ -324,6 +354,7 @@ export const scenarios = [
       await setOnline(A, true); await setOnline(B, true);
       await A.waitFiles(files(a, b)); await B.waitFiles(files(a, b));
       await expectSha(A, b.name, b); await expectSha(B, a.name, a);
+      assert.deepEqual([await connIds(A), await connIds(B)], ids, 'offline and back online on the same connection: no re-pairing');
     },
   },
   {
@@ -376,14 +407,14 @@ export const scenarios = [
     name: 'three-device-chain',
     kinds: [[CH, CH, CH], [FF, FF, FF], [CH, FF, CH]],
     async run(ctx, kinds) {
-      await admin(ctx.server, 'topology', { room: ctx.room, allow: [['A', 'B'], ['B', 'C']] });
       const [A, B, C] = await devices(ctx, kinds);
+      await pair(A, B); await pair(B, C);                // A and C are never paired
       const f = randomFile(`chain-${ctx.id}.bin`, 400000), g = randomFile(`back-${ctx.id}.txt`, 777);
       await A.add([f]);
       await C.waitFiles(files(f));                       // A -> B -> C, index and content
       await expectSha(C, f.name, f);
-      const st = await (await fetch(`${ctx.server.url}/admin/state?room=${ctx.room}`)).json();
-      assert.ok(!st.links.some((l) => (l.a === 'A' && l.b === 'C') || (l.a === 'C' && l.b === 'A')), 'A and C were never linked');
+      assert.equal((await A.connections()).length, 1, 'A is connected to B only');
+      assert.equal((await C.connections()).length, 1, 'C is connected to B only');
       await C.add([g]);
       await A.waitFiles(files(f, g));
       await expectSha(A, g.name, g);
@@ -396,14 +427,14 @@ export const scenarios = [
       const [A, B] = await devices(ctx, kinds);
       await waitPeers(A, 1);
       const big = randomFile(`big-${ctx.id}.bin`, 6 * 1024 * 1024);
-      await admin(ctx.server, 'cut', { room: ctx.room, a: 'A', b: 'B', afterBytes: 2 * 1024 * 1024 });
+      await A.eval('(window.__net.cutAfter = window.__net.sent + 2 * 1024 * 1024, true)');   // A's channel closes mid-transfer
       await A.add([big]);
       await B.waitFor(`[...document.querySelectorAll('#files tr')].some((t) => t.dataset.status !== 'complete')`, 30000, 'B sees the file, content not yet complete');
       await B.waitFiles(files(big), 90000);
       await expectSha(B, big.name, big);
-      const st = await (await fetch(`${ctx.server.url}/admin/state?room=${ctx.room}`)).json();
-      assert.ok(st.links.length === 1, 'reconnected');
-      assert.equal(st.cuts, 1, 'the link was cut mid-transfer');
+      assert.equal(await A.eval('window.__net.cuts'), 1, 'the link was cut mid-transfer');
+      assert.ok(await A.eval('window.__net.syncSeen') >= 2, 'a new link on the same connection, no re-pairing');
+      assert.equal((await A.connections()).length, 1);
       await waitFor(async () => (await incomingCount(B)) === 0, 10000, 'the partial file was discarded');
     },
   },
@@ -413,14 +444,15 @@ export const scenarios = [
     async run(ctx, kinds) {
       const [A, B] = await devices(ctx, kinds);
       await waitPeers(A, 1);
-      await admin(ctx.server, 'corrupt', { room: ctx.room, from: 'A', to: 'B' });
+      await A.eval('(window.__net.corruptNext = true)');        // flip a byte of A's next blob frame
       const f = randomFile(`c-${ctx.id}.bin`, 50000);
       await A.add([f]);
       // The corrupted copy must never show as complete: B marks the content lacking at A for this session.
       await B.waitRows((rows) => rows.length === 1 && rows[0].status === 'waiting', 30000, 'waiting after a corrupted transfer');
       await sleep(1000);
       assert.equal((await B.rows())[0].status, 'waiting');
-      await admin(ctx.server, 'garbage', { room: ctx.room, from: 'A', to: 'B' });   // Lean closes the session (protocol error)
+      assert.equal(await A.eval('window.__net.corrupted'), 1, 'the corruption was injected');
+      assert.equal(await A.eval('window.__netGarbage()'), true);                // Lean closes the session (protocol error)
       await B.waitFiles(files(f), 60000);                                        // new session: fetched again, verified
       await expectSha(B, f.name, f);
       const log = (await B.eval('window.leansync.log')).join('\n');
@@ -506,6 +538,7 @@ export const scenarios = [
       await A.add([big]);
       await B.waitFor(`[...document.querySelectorAll('#files tr')].length === 1`, 30000, 'B sees the file');
       await B.reload();                                           // reload while the content is arriving
+      await pair(A, B);                                           // a reload ends the connection: pair again
       await B.waitFiles(files(big), 60000);
       await expectSha(B, big.name, big);
       // Kill A's browser right after an add (mid-persist or just after): on restart the add is
@@ -515,6 +548,7 @@ export const scenarios = [
       await sleep(30);
       await A.kill();
       await A.reopen();
+      await pair(A, B);
       const rows = await A.waitRows((rs) => rs.some((r) => r.path === big.name), 20000, 'the file list after restart');
       for (const r of rows) assert.equal(r.status, 'complete', `${r.path} after the crash`);
       const after = randomFile(`after-${ctx.id}.txt`, 500);
@@ -558,6 +592,7 @@ export const scenarios = [
       await A.click('#confirm-ok');
       await A.waitFor(`window.leansync.phase === 'running'`, 30000);
       assert.notEqual(await A.eval('window.leansync.replica'), before, 'new identity');
+      await pair(A, B);
       await A.waitFiles(files(f));                                // refilled from B
     },
   },
@@ -575,6 +610,7 @@ export const scenarios = [
       await writeRecord(A, old);                                  // restore the backup: A's storage rolls back
       await A.page.reload();
       await A.waitFor(`window.leansync && window.leansync.phase === 'running'`, 30000);
+      await pair(A, B);                                           // a reload ends the pairing; B's state reveals the rollback
       await A.waitFor(`!!document.querySelector('#banner-rollback')`, 30000, 'rollback banner');
       assert.equal(await A.eval(`document.querySelector('#add-button').disabled`), true, 'editing blocked');
       const replicaBefore = await A.eval('window.leansync.replica');
@@ -585,7 +621,7 @@ export const scenarios = [
       await A.click('#confirm-ok');
       await A.waitFor(`window.leansync.phase === 'running' && !document.querySelector('#banner-rollback')`, 30000, 'restarted');
       assert.notEqual(await A.eval('window.leansync.replica'), replicaBefore);
-      await A.waitFiles(files(f, g));
+      await A.waitFiles(files(f, g));                             // same pairing: the restart re-links without re-pairing
       const h = randomFile(`h-${ctx.id}.txt`, 10);
       await A.add([h]);
       await B.waitFiles(files(f, g, h));
@@ -604,11 +640,12 @@ export const scenarios = [
       cpSync(A.profile, copy, { recursive: true, filter: (src) => !/Singleton(Lock|Socket|Cookie)$/.test(src) });   // a second profile restored from the same storage
       ctx.cleanup.push(async () => removeDir(copy));
       await A.reopen();
-      const A2 = await ctx.open(kinds[0], 'A2', { profile: copy });
+      const A2 = await ctx.open(kinds[0], 'A2', { profile: copy, stun: null });
+      await pair(A, A2, { linked: false });                       // the devices pair; the host HELLO check refuses the link
       for (const D of [A, A2]) await D.waitFor(`[...document.querySelectorAll('#banners .banner')].some((b) => b.textContent.includes('own identity'))`, 30000, 'refused banner');
-      const st = await (await fetch(`${ctx.server.url}/admin/state?room=${ctx.room}`)).json();
+      await sleep(1500);
       assert.equal(await A.eval(`document.querySelectorAll('#peers .peer').length`), 0, 'no session');
-      ctx.note(`relay links seen: ${st.links.length} (each closed at the host HELLO)`);
+      ctx.note(`links opened and refused at HELLO so far: ${await A.eval('window.__net.syncSeen')} (re-opened with a growing back-off)`);
     },
   },
   {
@@ -677,6 +714,272 @@ export const scenarios = [
       const msg = await A.eval(`(() => { const ev = new Event('drop', { cancelable: true }); ev.dataTransfer = { items: [{ kind: 'file', webkitGetAsEntry: () => ({ isDirectory: true, name: 'photos' }), getAsFile: () => null }] };
         document.dispatchEvent(ev); return [...document.querySelectorAll('#messages .msg.error')].map((m) => m.textContent).join('|'); })()`);
       assert.match(msg, /photos.*folder/);
+    },
+  },
+  // ------------------------------------------------------------------ pairing (docs/net-design.md §10)
+  {
+    name: 'pair-by-text',
+    kinds: [[CH, CH], [FF, FF], [CH, FF], [FF, CH], [ESR, CH], [CH, ESR], [ESR, FF]],
+    async run(ctx, kinds) {
+      const [A, B] = await devices(ctx, kinds, { paired: false });
+      const { offer, reply } = await pair(A, B);
+      const o = parseCode(offer, 'offer'), r = parseCode(reply, 'answer');
+      ctx.note(`invitation ${offer.length} chars (${o.cands.length} candidate(s)), reply ${reply.length} chars`);
+      assert.ok([...o.cands, ...r.cands].every((c) => c.type === 'host'), 'no STUN configured: host candidates only');
+      const a = randomFile(`ta-${ctx.id}.txt`, 3000), b = randomFile(`tb-${ctx.id}.bin`, 200000);
+      await A.add([a]); await B.add([b]);
+      await A.waitFiles(files(a, b)); await B.waitFiles(files(a, b));
+      await expectSha(A, b.name, b); await expectSha(B, a.name, a);
+      await A.waitFor(`[...document.querySelectorAll('#connections li .label')].some((e) => e.textContent === 'B')`, 10000, 'B listed by its name');
+      await B.waitFor(`[...document.querySelectorAll('#connections li .label')].some((e) => e.textContent === 'A')`, 10000, 'A listed by its name');
+    },
+  },
+  {
+    name: 'pair-by-qr-fake-camera',
+    kinds: [[CH, FF], [FF, CH], [CH, CH], [FF, FF]],
+    async run(ctx, kinds) {
+      const [A, B] = await devices(ctx, kinds, { paired: false });
+      // The vendored decoder reads the QR the app draws, exactly (same decoder as the scanning loop).
+      await A.click('#invite');
+      const code = await A.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 20000, 'invitation');
+      const read = await A.eval(`(async () => { const { decodeQR } = await import('./vendor/qr/decode.js'); const c = document.querySelector('#pair-qr');
+        return decodeQR(c.getContext('2d').getImageData(0, 0, c.width, c.height)); })()`);
+      assert.equal(read, code, 'the rendered QR decodes to the code shown');
+      await A.closeDialog();
+      // Both codes go through the app's camera scanning loop (fake camera showing the other screen's QR).
+      await pair(A, B, { via: 'qr' });
+      assert.ok(await A.eval('window.__fakeCamera.starts') >= 1 && await B.eval('window.__fakeCamera.starts') >= 1, 'both scanned');
+      const f = randomFile(`qr-${ctx.id}.txt`, 1000);
+      await A.add([f]); await B.waitFiles(files(f));
+    },
+  },
+  {
+    name: 'pairing-codes-rejected',
+    kinds: [[CH, FF, CH], [FF, CH, FF]],
+    async run(ctx, kinds) {
+      const [A, B, C] = await devices(ctx, kinds);
+      const tryCode = async (D, text, reason, re) => {
+        await D.eval(`(() => { const e = document.querySelector('#pair-error'); if (e) { e.hidden = true; e.dataset.reason = ''; } return true; })()`);
+        await D.pasteCode(text);
+        const e = await D.waitFor(`(() => { const e = document.querySelector('#pair-error'); return e && !e.hidden && e.dataset.reason ? { text: e.textContent, reason: e.dataset.reason } : null; })()`, 10000, `error for ${reason}`);
+        assert.equal(e.reason, reason, `${D.label}: ${e.text}`); assert.match(e.text, re);
+      };
+      await A.click('#invite');
+      const offer1 = await A.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 20000, 'invitation');
+      await B.click('#join');
+      await tryCode(B, 'hello, this is not a code', 'notCode', /not a LeanSync pairing code/);
+      await tryCode(B, offer1.slice(0, offer1.length - 7), 'damaged', /incomplete or mistyped/);           // truncated
+      const i = 20, other = offer1[i] === 'Q' ? 'R' : 'Q';
+      await tryCode(B, offer1.slice(0, i) + other + offer1.slice(i + 1), 'damaged', /incomplete or mistyped/);   // one character mistyped
+      await tryCode(B, 'LSN2' + offer1.slice(4), 'version', /different version/);
+      await tryCode(A, offer1, 'kind', /invitation code, not a reply/);                                  // A pastes its own invitation as the reply
+      await B.pasteCode(offer1);
+      const replyB1 = await B.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 20000, 'reply');
+      await C.click('#join');
+      await tryCode(C, replyB1, 'kind', /reply code, not an invitation/);
+      // A new invitation: a reply made for the old one is refused.
+      await A.closeDialog(); await B.closeDialog();
+      await A.click('#invite');
+      const offer2 = await A.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 20000, 'second invitation');
+      assert.notEqual(offer2, offer1);
+      await tryCode(A, replyB1, 'stale', /belongs to another invitation/);
+      // C joins the same invitation as B; once B's reply is used, C's is refused.
+      await C.closeDialog(); await C.click('#join'); await C.pasteCode(offer2);
+      const replyC = await C.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 20000, 'C reply');
+      await B.click('#join'); await B.pasteCode(offer2);
+      const replyB2 = await B.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 20000, 'B reply');
+      await A.pasteCode(replyB2);
+      await A.waitFor(`document.querySelector('#pair-status')?.dataset.state === 'connected'`, 40000, 'A connected to B');
+      await tryCode(A, replyC, 'used', /already used/);
+      await C.closeDialog();
+      await B.waitFor(`document.querySelector('#pair-status')?.dataset.state === 'connected'`, 20000);
+      const f = randomFile(`r-${ctx.id}.txt`, 500);
+      await A.add([f]); await B.waitFiles(files(f));
+      assert.equal((await C.connections()).length, 0, 'C was never connected');
+    },
+  },
+  {
+    name: 'reply-renewal',
+    kinds: [[CH, FF], [FF, FF], [FF, CH], [CH, CH]],
+    async run(ctx, kinds) {
+      // B is given A's invitation with unreachable addresses, so B's own checks fail (as when A is
+      // behind a NAT): the connection forms only from A's side, while B's reply attempt is still
+      // alive. A Firefox answerer gives up 11 s after it starts (measured); the reply A reads 12 s
+      // after B joined works only because B renewed it.
+      const [A, B] = await devices(ctx, kinds, { paired: false });
+      await A.click('#invite');
+      const offer = await A.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 20000, 'invitation');
+      await B.click('#join');
+      await B.pasteCode(unreachableOffer(offer));
+      const first = await B.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 20000, 'first reply');
+      const t0 = Date.now(), seen = new Set([first]);
+      let maxLive = 0;
+      while (Date.now() - t0 < 12000) { seen.add(await B.shownCode()); maxLive = Math.max(maxLive, await B.eval('window.__net.live()')); await sleep(250); }
+      assert.ok(seen.size >= 4, `the reply was renewed (${seen.size} different replies in 12 s)`);
+      assert.ok(maxLive <= 6, `at most 6 reply attempts alive (${maxLive})`);
+      await A.pasteCode(await retag(await B.shownCode(), offer));
+      await A.waitFor(`document.querySelector('#pair-status')?.dataset.state === 'connected' || !document.querySelector('#pair-error').hidden`, 45000, 'A: result');
+      const err = await A.pairError();
+      assert.equal(err, null, `pairing with a renewed reply: ${err?.text}`);
+      await B.waitFor(`document.querySelector('#pair-status')?.dataset.state === 'connected'`, 20000, 'B connected');
+      await sleep(1000);
+      assert.equal(await B.eval('window.__net.live()'), 1, 'the other attempts were closed');
+      const f = randomFile(`rr-${ctx.id}.txt`, 800);
+      await A.add([f]); await B.waitFiles(files(f));
+      ctx.note(`${seen.size} replies in 12 s, at most ${maxLive} attempts alive`);
+    },
+  },
+  {
+    name: 'peer-killed-files-recover',
+    kinds: [[CH, CH], [FF, FF], [CH, FF], [FF, CH]],
+    async run(ctx, kinds) {
+      const [A, B] = await devices(ctx, kinds);
+      await waitPeers(A, 1);
+      const f = randomFile(`k-${ctx.id}.bin`, 1024 * 1024);
+      await B.eval('(window.__holdClose = true)');                // B's copy cannot complete before A vanishes
+      await A.add([f]);
+      await B.waitRows((rows) => rows.length === 1 && rows[0].status === 'fetching', 20000, 'fetching');
+      const t0 = Date.now();
+      await A.kill();                                             // no goodbye of any kind
+      await B.waitRows((rows) => rows[0].status === 'waiting', 60000, 'waiting after the peer vanished');
+      const tDown = Date.now() - t0;
+      await B.waitFor(`window.leansync.connections.length === 0`, 60000, 'connection dropped');
+      const tGone = Date.now() - t0;
+      await B.waitFor(`[...document.querySelectorAll('#messages .msg.error')].some((m) => /Pair again/.test(m.textContent))`, 5000, 'lost-connection message');
+      ctx.note(`A killed: B's link down after ${(tDown / 1000).toFixed(1)} s, connection dropped after ${(tGone / 1000).toFixed(1)} s`);
+      await B.eval('window.__releaseCloses()');
+      await A.reopen();
+      await pair(A, B);                                           // pair again: the file in flight arrives
+      await B.waitFiles(files(f), 60000);
+      await expectSha(B, f.name, f);
+      // A closes its tab: its connections are closed on pagehide, so B learns at once.
+      await A.page.close();
+      const t1 = Date.now();
+      await B.waitFor(`window.leansync.connections.length === 0`, 40000, 'connection dropped after A closed its tab');
+      const tTab = Date.now() - t1;
+      ctx.note(`A's tab closed: B dropped the connection after ${tTab} ms`);
+      assert.ok(tTab < 5000, `B learned of the closed tab after ${tTab} ms`);
+    },
+  },
+  {
+    name: 'three-devices-pairwise',
+    kinds: [[CH, FF, CH], [FF, CH, FF]],
+    async run(ctx, kinds) {
+      const [A, B, C] = await devices(ctx, kinds);
+      await pair(A, B); await pair(B, C); await pair(C, A);
+      for (const D of [A, B, C]) assert.equal((await D.connections()).length, 2, `${D.label}: two connections`);
+      const fa = randomFile(`a-${ctx.id}.txt`, 100), fb = randomFile(`b-${ctx.id}.txt`, 200), fc = randomFile(`c-${ctx.id}.bin`, 300000);
+      await A.add([fa]); await B.add([fb]); await C.add([fc]);
+      for (const D of [A, B, C]) await D.waitFiles(files(fa, fb, fc));
+      await expectSha(A, fc.name, fc);
+      await setOnline(B, false);                                  // the triangle still syncs without B
+      const fd = randomFile(`d-${ctx.id}.txt`, 50);
+      await A.add([fd]); await C.waitFiles(files(fa, fb, fc, fd));
+      await setOnline(B, true); await B.waitFiles(files(fa, fb, fc, fd));
+    },
+  },
+  {
+    name: 'stun-settings',
+    kinds: [[CH], [FF]],
+    async run(ctx, kinds) {
+      const firefox = kinds[0] !== CH;
+      const A = await ctx.open(kinds[0], 'A', { stun: null });
+      assert.equal(await A.eval(`document.querySelector('#stun').value`), 'stun:stun.l.google.com:19302', 'default: Google\'s STUN server');
+      assert.equal(await A.setStun(['http://example.org']), 'error', 'not a STUN address: refused');
+      if (firefox) assert.equal(await A.setStun(['stun:127.0.0.1:9']), 'error', 'Firefox refuses a blocked port: caught when saving');
+      // An unreachable STUN server: the invitation is ready within the gathering cap, with a warning.
+      assert.equal(await A.setStun(['stun:192.0.2.1:3478']), 'saved');
+      const t0 = Date.now();
+      await A.click('#invite');
+      await A.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 60000, 'invitation');
+      const ms = Date.now() - t0;
+      ctx.note(`invitation ready ${ms} ms after the click, with an unreachable STUN server`);
+      assert.ok(ms < 6000, `invitation ready after ${ms} ms (Chromium reports gathering complete only after ~40 s)`);
+      assert.ok(await A.eval(`!!document.querySelector('#pair-warn')`), 'STUN warning shown');
+      assert.equal(await A.eval('window.__net.ice.at(-1)'), JSON.stringify([{ urls: 'stun:192.0.2.1:3478' }]), 'the configured server is used');
+      await A.closeDialog();
+      // An empty list: no STUN at all; the setting survives a reload.
+      assert.equal(await A.setStun([]), 'saved');
+      await A.reload();
+      assert.equal(await A.eval(`document.querySelector('#stun').value`), '');
+      await A.click('#invite');
+      const code = await A.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 20000, 'invitation');
+      assert.equal(await A.eval('window.__net.ice.at(-1)'), '[]');
+      assert.ok(parseCode(code, 'offer').cands.every((c) => c.type === 'host'));
+      assert.ok(!(await A.eval(`!!document.querySelector('#pair-warn')`)), 'no warning without STUN');
+    },
+  },
+  {
+    name: 'pairing-ui-phone-viewport',
+    kinds: [[CH, FF], [FF, CH]],
+    async run(ctx, kinds) {
+      const [A, B] = await devices(ctx, kinds, { paired: false });
+      for (const D of [A, B]) await D.page.setViewport(360, 740);
+      const fit = (D) => D.eval(`(() => { const d = document.querySelector('#pair'), r = d.getBoundingClientRect(), q = document.querySelector('#pair-qr')?.getBoundingClientRect();
+        const t = document.querySelector('#pair-code')?.getBoundingClientRect();
+        if (!d.open) return { vw: innerWidth, docW: document.documentElement.scrollWidth, left: 0, right: 0, overflow: 0, qr: null, code: null };
+        return { vw: innerWidth, docW: document.documentElement.scrollWidth, left: r.left, right: r.right, overflow: d.scrollWidth - d.clientWidth, qr: q ? Math.round(q.width) : null, code: t ? Math.round(t.right) : null }; })()`);
+      const check = (f, who) => {
+        assert.equal(f.vw, 360, `${who}: viewport`);
+        assert.ok(f.docW <= 360, `${who}: no horizontal page scroll (${f.docW})`);
+        assert.ok(f.left >= 0 && f.right <= 360, `${who}: dialog inside the screen (${f.left}..${f.right})`);
+        assert.ok(f.overflow <= 1, `${who}: no horizontal scroll inside the dialog (${f.overflow})`);
+        if (f.qr !== null) assert.ok(f.qr >= 200 && f.qr <= 340, `${who}: QR ${f.qr} px wide`);
+        if (f.code !== null) assert.ok(f.code <= 360, `${who}: code box fits`);
+      };
+      check(await fit(A), 'A main page');
+      await A.click('#invite');
+      const offer = await A.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 20000, 'invitation');
+      check(await fit(A), 'A invitation');
+      // No camera on this device: the dialog says so and offers the text path.
+      await B.eval('(window.__fakeCamera.absent = true)');
+      await B.click('#join');
+      await B.waitFor(`!document.querySelector('#pair-camera-note').hidden`, 10000, 'no-camera note');
+      assert.match(await B.eval(`document.querySelector('#pair-camera-note').textContent`), /No camera/);
+      assert.ok(await B.eval(`document.querySelector('#pair-scan').hidden`), 'no scan button without a camera');
+      await B.closeDialog();
+      // A camera whose permission is refused: a clear message, and the text path still works.
+      await B.eval('(window.__fakeCamera.absent = false, window.__fakeCamera.enabled = true, window.__fakeCamera.deny = true, true)');
+      await B.click('#join');
+      await B.waitFor(`!document.querySelector('#pair-scan').hidden`, 10000, 'scan button');
+      await B.click('#pair-scan');
+      await B.waitFor(`!document.querySelector('#pair-camera-note').hidden`, 10000, 'camera refused note');
+      assert.match(await B.eval(`document.querySelector('#pair-camera-note').textContent`), /Camera access was refused/);
+      await B.pasteCode(offer);
+      const reply = await B.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 20000, 'reply')
+        .catch(async (e) => { throw new Error(`${e.message}\ndialog: ${await B.eval('document.querySelector("#pair").innerText.slice(0, 600)')}`); });
+      check(await fit(B), 'B reply');
+      await A.pasteCode(reply);
+      await A.waitFor(`document.querySelector('#pair-status')?.dataset.state === 'connected'`, 40000, 'connected');
+      await A.closeDialog();
+      check(await fit(A), 'A main page with a device');
+    },
+  },
+  {
+    name: 'runs-from-sub-path',
+    kinds: [[CH, FF]],
+    async run(ctx, kinds) {
+      // The app is plain static files and works from any path of any static server.
+      const sub = await startServer({ port: 0, base: '/some/sub/dir/' });
+      ctx.cleanup.push(() => sub.close());
+      const A = await ctx.open(kinds[0], 'A', { server: sub }), B = await ctx.open(kinds[1], 'B', { server: sub });
+      assert.match(await A.eval('location.pathname'), /^\/some\/sub\/dir\//);
+      await pair(A, B);
+      const f = randomFile(`sub-${ctx.id}.bin`, 70000);
+      await A.add([f]); await B.waitFiles(files(f)); await expectSha(B, f.name, f);
+      assert.deepEqual(sub.stats.notFound.filter((u) => !/favicon/.test(u)), [], 'every request was for a file of the site');
+    },
+  },
+  {
+    name: 'pair-with-browser-defaults',
+    kinds: [[CH, CH], [FF, FF], [CH, FF], [FF, CH]],
+    async run(ctx, kinds) {
+      // The browsers as shipped (mDNS names instead of host addresses).
+      const [A, B] = await devices(ctx, kinds, { A: { browserDefaults: true }, B: { browserDefaults: true }, paired: false });
+      const { offer } = await pair(A, B);
+      ctx.note(`invitation candidates: ${parseCode(offer, 'offer').cands.map((c) => c.addr.endsWith('.local') ? 'mDNS name' : c.addr).join(', ')}`);
+      const f = randomFile(`d-${ctx.id}.txt`, 4000);
+      await A.add([f]); await B.waitFiles(files(f));
     },
   },
 ];

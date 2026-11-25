@@ -327,5 +327,7 @@ export function createLinks(o) {
     },
     peers: () => [...byPeer.entries()].map(([peer, c]) => ({ peer, label: c.label, replica: c.remote })),
     labelOf: (peer) => byPeer.get(peer)?.label,
+    /** The label a transport link's remote announced in its HELLO (null before). */
+    labelOfLink(linkId) { for (const c of conns) if (c.link.id === linkId) return c.remote ? c.label : null; return null; },
   };
 }

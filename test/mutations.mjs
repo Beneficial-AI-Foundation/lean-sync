@@ -2,7 +2,9 @@
 // mechanism in the app's source and check that the test the table names FAILS. Every mutant is
 // reverted in a `finally`, and at the end the app's sources must be byte-identical to before.
 //   node test/mutations.mjs [--only id,id]        (needs scripts/build-site.sh and the vectors)
-// e2e checks run in Chromium only, to keep this affordable.
+// e2e checks run in Chromium only, to keep this affordable, unless a mutant names its browsers (a
+// scenario that needs Firefox, e.g. as the answering device). A check that runs no test at all
+// (exit 3 from run.mjs) is reported as NO TEST RAN, never as caught.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
@@ -10,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const unit = (f) => ['node', ['--test', `test/unit/${f}.test.mjs`]];
-const e2e = (s) => ['node', ['test/e2e/run.mjs', '--only', s, '--browsers', 'chromium']];
+const e2e = (s, browsers = 'chromium') => ['node', ['test/e2e/run.mjs', '--only', s, '--browsers', browsers]];
 
 const M = [
   { id: 'persisted-before-commit', row: 'persist, then persisted', file: 'app/js/core.mjs',
@@ -106,8 +108,63 @@ const M = [
     to: '    if (await hasBlob(hx)) await blobsDir.removeEntry(hx);\n', check: e2e('existing-blob-kept-when-replacement-fails') },
   { id: 'no-pending-refresh-on-peer-change', row: 'UI never shows a false state', file: 'app/js/core.mjs',
     from: "    if (['peerStatus', 'peerLeft', 'peerClosed', 'pendingSummary'].includes(e.notice)) refresh('pending');\n", to: '', check: e2e('peer-leaves-mid-fetch-row-updates') },
-  { id: 'relay-from-url', row: 'transport only to the serving origin', file: 'app/js/main.mjs',
-    from: 'const relayUrl = `${location.protocol', to: "const relayUrl = params.get('relay') || `${location.protocol", check: e2e('relay-parameter-ignored') },
+  // ---- the WebRTC transport and pairing (docs/net-design.md; app-design §4)
+  { id: 'connection-failure-ignored', row: 'link down when the connection is lost', file: 'app/js/transport/webrtc.mjs',
+    from: "} else if (s === 'failed' || s === 'closed') {", to: '} else if (false) {', check: unit('webrtc') },
+  { id: 'connection-failure-ignored (e2e)', row: 'link down when the connection is lost', file: 'app/js/transport/webrtc.mjs',
+    from: "} else if (s === 'failed' || s === 'closed') {", to: '} else if (false) {', check: e2e('peer-killed-files-recover') },
+  { id: 'channel-close-only', row: 'link down when the connection is lost', file: 'app/js/transport/webrtc.mjs',
+    from: ["} else if (s === 'failed' || s === 'closed') {", "      if (!c.lossTimer && c.state !== 'pairing') c.lossTimer"], to: ['} else if (false) {', "      if (false) c.lossTimer"], check: e2e('peer-killed-files-recover') },
+  { id: 'closing-channel-kept', row: 'link down when the connection is lost', file: 'app/js/transport/webrtc.mjs',
+    from: "if (dc.readyState !== 'open') { if (L.announced) closeLink(L, `channel ${dc.readyState}`); return false; }", to: "if (dc.readyState !== 'open') return false;", check: unit('webrtc') },
+  { id: 'closing-channel-kept (e2e)', row: 'link down when the connection is lost', file: 'app/js/transport/webrtc.mjs',
+    from: "if (dc.readyState !== 'open') { if (L.announced) closeLink(L, `channel ${dc.readyState}`); return false; }", to: "if (dc.readyState !== 'open') return false;", check: e2e('disconnect-mid-transfer-and-resume', 'chromium,firefox') },
+  { id: 'stale-link-blocks-new-channel', row: 'link down when the connection is lost', file: 'app/js/transport/webrtc.mjs',
+    from: "    if (c.link) closeLink(c.link, 'replaced by a new channel from the other device');", to: '    if (c.link) { try { dc.close(); } catch {} return; }', check: unit('webrtc') },
+  { id: 'onclose-twice', row: 'onClose once per link', file: 'app/js/transport/webrtc.mjs',
+    from: '    if (!L || L.closed) return;', to: '    if (!L) return;', check: unit('webrtc') },
+  { id: 'frames-after-close', row: 'onClose once per link', file: 'app/js/transport/webrtc.mjs',
+    from: 'if (!L.closed && L.announced) L._onFrame', to: 'if (true) L._onFrame', check: unit('webrtc') },
+  { id: 'answerer-active', row: 'answerer is the DTLS server', file: 'app/js/transport/webrtc.mjs',
+    from: "sdp: ans.sdp.replace(/a=setup:(active|actpass)/g, 'a=setup:passive') }", to: 'sdp: ans.sdp }', check: unit('webrtc') },
+  { id: 'no-reply-renewal', row: 'a reply stays usable while shown', file: 'app/js/transport/webrtc.mjs',
+    from: '    renew = setInterval(attempt, t.RENEW_MS);', to: '    renew = null;', check: unit('webrtc') },
+  { id: 'no-reply-renewal (e2e)', row: 'a reply stays usable while shown', file: 'app/js/transport/webrtc.mjs',
+    from: '    renew = setInterval(attempt, t.RENEW_MS);', to: '    renew = null;', check: e2e('reply-renewal', 'chromium,firefox') },
+  { id: 'unbounded-attempts', row: 'a reply stays usable while shown', file: 'app/js/transport/webrtc.mjs',
+    from: '      while (attempts.filter((a) => !a.dropped).length > t.MAX_ATTEMPTS)', to: '      while (false)', check: unit('webrtc') },
+  { id: 'crc-unchecked', row: 'codes are checked before use', file: 'app/js/netcode.mjs',
+    from: '  if (crc32(body) !== crc) bad();\n', to: '', check: unit('netcode') },
+  { id: 'invitation-reusable', row: 'an invitation accepts one reply', file: 'app/js/transport/webrtc.mjs',
+    from: "        if (inv.state !== 'waiting') throw", to: '        if (false) throw', check: unit('webrtc') },
+  { id: 'invitation-reusable (e2e)', row: 'an invitation accepts one reply', file: 'app/js/transport/webrtc.mjs',
+    from: "        if (inv.state !== 'waiting') throw", to: '        if (false) throw', check: e2e('pairing-codes-rejected', 'chromium,firefox') },
+  { id: 'stale-reply-accepted', row: 'codes are checked before use', file: 'app/js/transport/webrtc.mjs',
+    from: '        if (!sameBytes(r.tag, tag)) throw', to: '        if (false) throw', check: e2e('pairing-codes-rejected', 'chromium,firefox') },
+  { id: 'gathering-uncapped', row: 'gathering never blocks for long', file: 'app/js/transport/webrtc.mjs',
+    from: '      const cap = setTimeout(finish, t.GATHER_CAP_MS);', to: '      const cap = null;', check: e2e('stun-settings') },
+  { id: 'restart-drops-connection', row: 'engine restart keeps the pairing', file: 'app/js/transport/webrtc.mjs',
+    from: '    if (!c.dropped) maybeOpen(c);\n    changed();', to: "    if (!c.dropped) dropConn(c, 'link closed');\n    changed();", check: e2e('trap-mid-sync-reinstantiates') },
+  { id: 'offline-drops-connection', row: 'going offline keeps the pairing', file: 'app/js/transport/webrtc.mjs',
+    from: "      if (!online) closeLink(c.link, 'offline (by you)');", to: "      if (!online) dropConn(c, 'offline');", check: e2e('offline-edits-both-sides') },
+  { id: 'send-error-swallowed', row: 'a failing send closes the link', file: 'app/js/transport/webrtc.mjs',
+    from: "closeLink(L, 'send failed'); return false; }", to: 'return false; }', check: unit('webrtc') },
+  { id: 'drain-missed', row: 'back-pressure: onDrain never waits for an event that already fired', file: 'app/js/transport/webrtc.mjs',
+    from: '        if (dc.bufferedAmount <= t.DRAIN_AT) queueMicrotask(fireDrain);\n', to: '', check: unit('webrtc') },
+  { id: 'remote-close-ignored', row: 'link down when the connection is lost', file: 'app/js/transport/webrtc.mjs',
+    from: "    c.ctl.onclose = () => { if (c.state !== 'pairing') dropConn(c, 'closed by the other device'); };\n", to: '', check: unit('webrtc') },
+  { id: 'no-close-on-pagehide', row: 'closing the page tells the other devices', file: 'app/js/main.mjs',
+    from: "  addEventListener('pagehide', () => transport.stop());\n", to: '', check: e2e('peer-killed-files-recover') },
+  { id: 'stun-setting-ignored', row: 'no transport except paired devices and STUN', file: 'app/js/main.mjs',
+    from: 'getIceServers: () => stun.map((urls) => ({ urls }))', to: 'getIceServers: () => DEFAULT_STUN.map((urls) => ({ urls }))', check: e2e('stun-settings') },
+  { id: 'other-endpoint-contacted', row: 'no transport except paired devices and STUN', file: 'app/js/main.mjs',
+    from: "  addEventListener('pagehide', () => transport.stop());\n", to: "  try { new WebSocket(`ws://${location.host}/relay`); } catch {}\n  addEventListener('pagehide', () => transport.stop());\n", check: e2e('no-network-except-paired-devices', 'chromium,firefox') },
+  { id: 'camera-refusal-silent', row: 'pairing: camera refused or absent falls back to text with a message', file: 'app/js/pairing-ui.mjs',
+    from: "        camNote.dataset.reason = e?.name ?? 'error';\n        return;", to: "        camNote.hidden = true;\n        return;", check: e2e('pairing-ui-phone-viewport', 'chromium,firefox') },
+  { id: 'scan-video-not-muted', row: 'pairing: the QR scanning loop reads the camera', file: 'app/js/pairing-ui.mjs',
+    from: '    video.muted = true; video.autoplay = true;', to: '    ;', check: e2e('pair-by-qr-fake-camera') },
+  { id: 'late-dialog-close-ends-session', row: 'pairing: the dialog shows what is happening', file: 'app/js/pairing-ui.mjs',
+    from: '    d.onclose = () => { if (!d.open) closeSession(); };', to: '    d.onclose = () => closeSession();', check: e2e('pairing-ui-phone-viewport', 'chromium,firefox') },
   { id: 'render-per-file', row: 'UI scales with the file count', file: 'app/js/ui.mjs',
     from: "for (const hx of todo) { try { state.sizes.set(hx, (await storage.blobFile(hx)).size); } catch { state.sizes.set(hx, null); } }",
     to: "for (const hx of todo) { try { state.sizes.set(hx, (await storage.blobFile(hx)).size); } catch { state.sizes.set(hx, null); } renderFiles(); }", check: e2e('cold-load-many-files') },
@@ -135,7 +192,8 @@ const M = [
 ];
 
 const only = (() => { const i = process.argv.indexOf('--only'); return i > 0 ? process.argv[i + 1].split(',') : null; })();
-const appFiles = ['app/js/core.mjs', 'app/js/storage.mjs', 'app/js/links.mjs', 'app/js/ui.mjs', 'app/js/main.mjs', 'app/js/codec.mjs', 'app/js/view.mjs'];
+const appFiles = ['app/js/core.mjs', 'app/js/storage.mjs', 'app/js/links.mjs', 'app/js/ui.mjs', 'app/js/main.mjs', 'app/js/codec.mjs', 'app/js/view.mjs',
+  'app/js/transport/webrtc.mjs', 'app/js/netcode.mjs', 'app/js/pairing-ui.mjs'];
 const pristine = Object.fromEntries(appFiles.map((f) => [f, readFileSync(join(root, f), 'utf8')]));
 const site = () => execFileSync(join(root, 'scripts/build-site.sh'), { stdio: 'ignore' });
 const results = [];
@@ -149,7 +207,7 @@ for (const m of M) {
     site();
     const [cmd, args] = m.check;
     const r = spawnSync(cmd, args, { cwd: root, encoding: 'utf8', timeout: 600000 });
-    results.push({ ...m, verdict: r.status === 0 ? 'NOT CAUGHT' : 'caught' });
+    results.push({ ...m, verdict: r.status === 0 ? 'NOT CAUGHT' : r.status === 3 ? 'NO TEST RAN' : 'caught' });
   } finally {
     writeFileSync(path, src);
   }
