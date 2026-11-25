@@ -38,22 +38,61 @@ test('first start: initFresh, and the record is acknowledged only once the save 
   assert.ok(t.storage.record);
 });
 
-test('a failed save becomes persistFailed and saveFailed; no event storm from the host', async () => {
+test('a failed save: persistFailed, saveFailed, no write on later events, retrySave after the back-off', async () => {
   const t = setup();
   await t.core.start(); await sleep(20);
-  t.storage.failSaves = 100;
+  t.storage.failSaves = 1000;
+  const attempts = () => t.storage.failSaves;            // counts down once per write attempt
   const f = new Blob([new Uint8Array([1, 2, 3])]);
   await t.core.addFiles([{ name: 'a', blob: f }]);
-  await sleep(300);
+  await sleep(100);
   assert.ok(t.seen.includes(7), 'persistFailed delivered');
   assert.ok(t.notices.some((n) => n.notice === 'saveFailed'));
   assert.equal(t.core.st.saveFailed, true);
-  const n = t.seen.length;
-  await sleep(500);
-  assert.equal(t.seen.length, n, 'no events generated while waiting for the back-off');
+  assert.equal(attempts(), 999, 'one write attempted');
+  // A storm of other events (as when files arrive from a peer while the disk is full): no write.
+  for (let i = 0; i < 150; i++) t.core.emit({ type: 'query', q: i % 2 ? 'status' : 'pending' });
+  await t.core.addFiles([{ name: 'b', blob: new Blob([new Uint8Array([4])]) }]);
+  await sleep(300);
+  assert.equal(attempts(), 999, 'no write while held, whatever the events');
+  assert.ok(!t.seen.includes(13), 'no retrySave before the back-off');
+  await sleep(800);                                    // the 1 s back-off fires: retrySave, one write
+  assert.ok(t.seen.includes(13), 'retrySave sent');
+  assert.equal(attempts(), 998, 'exactly one retry');
   t.storage.failSaves = 0;
-  await sleep(800);                                    // the 1 s nudge retries
-  assert.equal(t.core.st.saveFailed, false);
+  await sleep(2200);                                   // the next back-off is 2 s
+  assert.equal(t.core.st.saveFailed, false, 'saved after the next retry');
+  assert.equal(t.core.st.retryBackoff, 0, 'back-off reset by the successful write');
+  assert.deepEqual(t.core.st.lastSnapshot.map((x) => x.path).sort(), ['a', 'b']);
+});
+
+test('"Retry now" sends retrySave at once; harmless when nothing failed', async () => {
+  const t = setup();
+  await t.core.start(); await sleep(50);
+  const saves = t.storage.saves.length;
+  t.core.retrySave(); await sleep(50);
+  assert.ok(t.seen.includes(13), 'retrySave sent');
+  assert.equal(t.storage.saves.length, saves, 'no write when nothing was held');
+  t.storage.failSaves = 1;
+  await t.core.addFiles([{ name: 'c', blob: new Blob([new Uint8Array([9])]) }]); await sleep(50);
+  assert.equal(t.core.st.saveFailed, true);
+  t.core.retrySave(); await sleep(50);
+  assert.equal(t.core.st.saveFailed, false, 'saved at once, without waiting for the back-off');
+  assert.equal(t.core.st.retryTimer, null, 'the scheduled retry was cancelled');
+});
+
+test('a blob that could not be stored schedules a retrySave with the back-off; a stale one does not', async () => {
+  const t = setup();
+  await t.core.start(); await sleep(50);
+  t.core.emit({ type: 'blobStoreFailed', hash: new Uint8Array(32).fill(7) }, t.core.st.epoch - 1);   // stale: dropped
+  await sleep(50);
+  assert.equal(t.core.st.retryTimer, null, 'no retry for a stale failure');
+  t.core.emit({ type: 'blobStoreFailed', hash: new Uint8Array(32).fill(7) });
+  await sleep(50);
+  assert.ok(t.seen.includes(14), 'blobStoreFailed delivered');
+  assert.ok(!t.seen.includes(13), 'not retried at once');
+  await sleep(1100);
+  assert.ok(t.seen.includes(13), 'retrySave after the 1 s back-off');
 });
 
 test('the inventory is reported in chunks before peers are accepted', async () => {

@@ -8,11 +8,14 @@ Executable module (imports `Init` only).
 `step : Machine → Event → Machine × List Effect` is pure, total and deterministic. A running
 node handles the event (`handle`), then always runs the same end-of-step pass (`finish`):
 
-1. **persist**: if no persist is in flight and `current` changed, emit `persist nextTag current`;
+1. **persist**: if no persist is in flight, `current` changed, and no failed save holds the
+   machine (`holdPersist`, set by `persistFailed`, cleared only by `retrySave`), emit
+   `persist nextTag current`;
 2. **reconcile** every session: hello (once `published` exists), then on a ready session either
    the published state (if the peer announced another digest and this state was not yet sent in
    this session, and no rollback was detected) or our digest (if not yet announced);
-3. **plan** blob requests (`fetch`), per session up to `maxInflightPerPeer`;
+3. **plan** blob requests (`fetch`), per session up to `maxInflightPerPeer`, skipping blobs
+   parked by `blobStoreFailed` (until `retrySave`);
 4. **report** peer status changes and the pending summary to the UI.
 
 Save-before-send is structural: the only state ever put in a message is `published`, which is
@@ -154,10 +157,13 @@ def answer (n : Node) : Query → Reply
   | .pending =>
     let src := sourceless n.sessions
     let arr := src.2.toArray
+    let parked := n.parked.toArray
     .pending (n.missing.map (fun h =>
       match n.sessions.find? (fun s => h ∈ s.inflight) with
       | some s => (h, .requested s.peer)
-      | none => if src.1 && !binSearch arr h then (h, .queued) else (h, .waiting)))
+      | none =>
+        if binSearch parked h then (h, .localFailure)
+        else if src.1 && !binSearch arr h then (h, .queued) else (h, .waiting)))
   | .status =>
     .status n.inflight.isSome n.dirty n.rollback (n.sessions.map (fun s => (s.peer, sessionStatus n s)))
 
@@ -197,8 +203,8 @@ def handle (n : Node) : Event → Node × List Effect
     | some (t', s) => if t' = t then ({ n with published := some ⟨s, d⟩, inflight := none }, []) else (n, [])
     | none => (n, [])
   | .persistFailed t =>
-    -- never answer a failure with a new write in the same step: the retry waits for the next
-    -- event, so a host whose storage keeps failing cannot be driven into a write loop
+    -- hold: no persist on this or any later event until the host sends `retrySave`, so a host
+    -- whose storage keeps failing is never driven into a write loop, whatever events arrive
     match n.inflight with
     | some (t', _) =>
       if t' = t then ({ n with inflight := none, dirty := true, holdPersist := true }, [.notify .saveFailed])
@@ -224,11 +230,21 @@ def handle (n : Node) : Event → Node × List Effect
       ({ n with blobs := bl, missing := computeMissing n.current bl }, [.notify .blobsChanged])
     else (n, [])
   | .query q => (n, [.reply (answer n q)])
+  | .retrySave =>
+    -- end the hold (the persist pass of this step then writes the latest state, if dirty and no
+    -- persist is in flight) and request the parked blobs again
+    ({ n with holdPersist := false, parked := [] }, if n.parked.isEmpty then [] else [.notify .blobsChanged])
+  | .blobStoreFailed h =>
+    -- the bytes arrived but could not be stored here: do not blame the peer (no `lacks` entry),
+    -- stop requesting the blob anywhere until `retrySave`
+    -- (a blob no longer referenced is only taken out of flight)
+    ({ n with sessions := n.sessions.map (fun s => { s with inflight := eraseH h s.inflight }),
+              parked := if h ∈ n.missing then insertH h n.parked else n.parked }, [.notify .blobsChanged])
 
 /-! ## The end-of-step pass -/
 
 def persistPass (n : Node) : Node × List Effect :=
-  if n.holdPersist then ({ n with holdPersist := false }, [])
+  if n.holdPersist then (n, [])
   else if n.inflight.isNone && n.dirty then
     ({ n with inflight := some (n.nextTag, n.current), nextTag := n.nextTag + 1, dirty := false },
       [.persist n.nextTag n.current])
@@ -277,20 +293,23 @@ def planGo (missing : List Hash) : List Hash → List Session → List Session �
 def busyOf (sessions : List Session) : List Hash := sortDedup (sessions.flatMap (·.inflight))
 
 def planPass (n : Node) : Node × List Effect :=
-  let r := planGo n.missing (busyOf n.sessions) n.sessions [] []
+  let r := planGo (sdiff n.missing n.parked) (busyOf n.sessions) n.sessions [] []
   ({ n with sessions := r.1 }, r.2)
 
-/-- `(fetching, queued, waiting)` for the UI. Fetching: missing and requested from some peer
-(walks `missing` only as far as the small set in flight). Waiting: missing, not requested, and
-lacked by every greeted ready peer (or there is none). Queued: the rest, i.e. some greeted ready
-peer may have it but its request slots are full. -/
-def pendingCounts (n : Node) : Nat × Nat × Nat :=
+/-- `(fetching, queued, waiting, localFailure)` for the UI. Fetching: missing and requested from
+some peer (walks `missing` only as far as the small set in flight). Local failure: missing, not
+requested, parked. Waiting: missing, not requested, not parked, and lacked by every greeted
+ready peer (or there is none). Queued: the rest, i.e. some greeted ready peer may have it but
+its request slots are full. -/
+def pendingCounts (n : Node) : Nat × Nat × Nat × Nat :=
   let busy := busyOf n.sessions
   let fetching := (sdiff busy (sdiff busy n.missing)).length
-  let notInFlight := n.missing.length - fetching
+  let notInFlight := sdiff n.missing busy
+  let open_ := sdiff notInFlight n.parked
+  let parked := notInFlight.length - open_.length
   let src := sourceless n.sessions
-  let waiting := if src.1 then (sdiff src.2 (sdiff src.2 (sdiff n.missing busy))).length else notInFlight
-  (fetching, notInFlight - waiting, waiting)
+  let waiting := if src.1 then (sdiff src.2 (sdiff src.2 open_)).length else open_.length
+  (fetching, open_.length - waiting, waiting, parked)
 
 def reportPass (n : Node) : Node × List Effect :=
   let sessions := n.sessions.map (fun s => { s with reported := sessionStatus n s })
@@ -300,7 +319,7 @@ def reportPass (n : Node) : Node × List Effect :=
   let sum := pendingCounts n
   let n1 := { n with sessions := sessions }
   if sum == n.summary then (n1, effs)
-  else ({ n1 with summary := sum }, effs ++ [.notify (.pendingSummary sum.1 sum.2.1 sum.2.2)])
+  else ({ n1 with summary := sum }, effs ++ [.notify (.pendingSummary sum.1 sum.2.1 sum.2.2.1 sum.2.2.2)])
 
 def finish (n : Node) : Node × List Effect :=
   let r1 := persistPass n

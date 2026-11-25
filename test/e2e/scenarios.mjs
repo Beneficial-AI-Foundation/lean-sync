@@ -37,7 +37,6 @@ const incomingCount = (dev) => dev.eval(`navigator.storage.getDirectory().then((
 const blobsDir = `navigator.storage.getDirectory().then((r) => r.getDirectoryHandle('blobs'))`;
 
 const blobSize = (dev, hx) => dev.eval(`navigator.storage.getDirectory().then((r) => r.getDirectoryHandle('blobs')).then((d) => d.getFileHandle(${JSON.stringify(hx)})).then((h) => h.getFile()).then((f) => f.size, () => -1)`);
-const rowStatus = async (dev, path) => (await dev.rows()).find((r) => r.path === path)?.status;
 
 export const scenarios = [
   {
@@ -77,24 +76,46 @@ export const scenarios = [
     async run(ctx, kinds) {
       const [A, B] = await devices(ctx, kinds);
       await waitPeers(A, 1);
-      // 1. A write error on B stops the transfer early: reported, sender told, no more credit.
+      // 1. A write error on B stops the transfer early: reported as a local failure (the peer is not
+      //    blamed), sender told, no more credit. Every write fails until the disk is "freed".
       const big = randomFile(`w-${ctx.id}.bin`, 12 * 1024 * 1024);
-      await B.eval('(window.__failWrite = 1)');
+      await B.eval('(window.__failWrite = 1000000)');
       await A.add([big]);
-      await B.waitRows((rows) => rows.length === 1 && rows[0].status === 'waiting', 20000, 'write failure reported');
+      await B.waitRows((rows) => rows.length === 1 && rows[0].status === 'localFailure', 20000, 'write failure reported as local');
+      assert.match(await B.eval(`document.querySelector('#files td.status').textContent`), /could not be stored on this device/);
       await sleep(1000);
       const st = await (await fetch(`${ctx.server.url}/admin/state?room=${ctx.room}`)).json();
       const bytes = st.links.reduce((n, l) => n + l.bytes, 0);
-      ctx.note(`bytes relayed for a 12 MiB file whose first write failed: ${bytes}`);
-      assert.ok(bytes < 6 * 1024 * 1024, `the sender stopped early (${bytes} bytes relayed)`);
+      // the host retries with a back-off (1 s, 2 s, ...): each attempt must stop within the credit window
+      const attempts = (await B.eval('window.leansync.log')).filter((l) => /could not write it/.test(l)).length;
+      ctx.note(`bytes relayed for a 12 MiB file whose writes fail: ${bytes} over ${attempts} attempt(s)`);
+      assert.ok(attempts >= 1 && bytes < attempts * 4.5 * 1024 * 1024, `the sender stopped early each time (${bytes} bytes, ${attempts} attempts)`);
       await waitFor(async () => (await incomingCount(B)) === 0, 10000, 'temp file removed after the write failure');
+      // Space comes back: the next automatic retry fetches the file again, from the same peer, with
+      // no reconnect (the peer was never marked as lacking it).
+      // The index is saved, so no "not saved" banner; but the user who frees space can retry now
+      // instead of waiting for the back-off (up to 60 s).
+      await B.waitFor(`!!document.querySelector('#retry-store')`, 10000, 'Retry now for contents that could not be stored');
+      assert.ok(!(await B.eval(`!!document.querySelector('#banner-save')`)), 'no unsaved-changes banner: the index is saved');
+      await B.eval('(window.__failWrite = 0)');
+      const retriesBefore = (await B.eval('window.leansync.log')).filter((l) => /retrying storage/.test(l)).length;
+      await B.click('#retry-store');
+      await B.waitFor(`window.leansync.log.filter((l) => /retrying storage/.test(l)).length > ${retriesBefore}`, 500, 'retrySave sent at once by Retry now');
+      await B.waitFiles(files(big), 30000);
+      assert.ok(!(await B.eval(`!!document.querySelector('#retry-store')`)), 'the action goes away once stored');
+      await expectSha(B, big.name, big);
+      const st2 = await (await fetch(`${ctx.server.url}/admin/state?room=${ctx.room}`)).json();
+      assert.equal(st2.links.length, 1, 'same session, no reconnect');
       // 2. Publishing fails (move) after the stream completed: the temp file is removed too.
       const small = randomFile(`p-${ctx.id}.txt`, 2000);
-      await B.eval('(window.__failMove = 1)');
+      await B.eval('(window.__failMove = 1000000)');
       await A.add([small]);
-      await B.waitRows((rows) => rows.find((r) => r.path === small.name)?.status === 'waiting', 20000, 'publish failure reported');
-      assert.equal(await B.eval('window.__failMove'), 0, 'the injected move failure was exercised');
+      await B.waitRows((rows) => rows.find((r) => r.path === small.name)?.status === 'localFailure', 20000, 'publish failure reported as local');
+      assert.ok(await B.eval('window.__failMove') < 1000000, 'the injected move failure was exercised');
       await waitFor(async () => (await incomingCount(B)) === 0, 10000, 'temp file removed after the publish failure');
+      await B.eval('(window.__failMove = 0)');
+      await B.waitFiles(files(big, small), 30000);
+      await expectSha(B, small.name, small);
     },
   },
   {
@@ -119,19 +140,21 @@ export const scenarios = [
     kinds: [[CH, CH], [FF, FF]],
     async run(ctx, kinds) {
       // B cannot create the temporary file for an incoming stream larger than the initial credit
-      // window: B must report the failure (the file shows `waiting`, never stuck on `fetching`) and
-      // abort, so A serves the next file.
+      // window: B must report the failure (the file shows `localFailure`, never stuck on `fetching`)
+      // and abort, so A serves the next file. Creation fails until the disk is "freed".
       const [A, B] = await devices(ctx, kinds);
       await waitPeers(A, 1);
       const big = randomFile(`big-${ctx.id}.bin`, 6 * 1024 * 1024), small = randomFile(`small-${ctx.id}.txt`, 1000);
-      await B.eval('(window.__failCreate = 1)');
+      await B.eval('(window.__failCreate = 1000000)');
       await A.add([big]);
-      await B.waitRows((rows) => rows.length === 1 && rows[0].status === 'waiting', 15000, 'the failed transfer is reported');
+      await B.waitRows((rows) => rows.length === 1 && rows[0].status === 'localFailure', 15000, 'the failed transfer is reported');
+      assert.ok(await B.eval('window.__failCreate') < 1000000, 'the injected failure was exercised');
+      await B.eval('(window.__failCreate = 0)');
       await A.add([small]);
       await B.waitRows((rows) => rows.find((r) => r.path === small.name)?.status === 'complete', 20000, 'the next file arrives');
       await expectSha(B, small.name, small);
-      assert.equal(await B.eval('window.__failCreate'), 0, 'the injected failure was exercised');
-      assert.equal(await rowStatus(B, big.name), 'waiting');
+      await B.waitFiles(files(big, small), 30000);           // the parked file is retried with the back-off
+      await expectSha(B, big.name, big);
     },
   },
   {
@@ -446,18 +469,29 @@ export const scenarios = [
       if (!firefox) await A.click(A.rowSel(gone.name, 'delete'));
       await A.waitFor(`!!document.querySelector('#banner-save') && document.querySelector('#saving').dataset.state === 'failed'`, 30000, 'save-failed banner');
       if (firefox) await A.click(A.rowSel(gone.name, 'delete'));      // a change made while saving fails
+      const t0 = Date.now();
       await sleep(4000);                                              // several automatic retries (1 s, 2 s back-off)
       assert.ok(await A.eval(`!!document.querySelector('#banner-save') && document.querySelector('#saving').dataset.state === 'failed'`), 'banner still shown while saving fails');
       assert.ok((await B.rows()).some((r) => r.path === gone.name), 'B did not receive the unsaved deletion');
-      const failures = (await A.eval('window.leansync.log')).filter((l) => /persist \d+ failed/.test(l)).length;
+      const aLog = await A.eval('window.leansync.log');
+      const failures = aLog.filter((l) => /persist \d+ failed/.test(l)).length;
+      const retries = aLog.filter((l) => /retrying storage/.test(l)).length;
       assert.ok(failures >= 2, `the save was retried and failed again (${failures} failures)`);
-      ctx.note(`A: ${failures} failed saves before recovery`);
+      // Lean holds a failed save until the host's retrySave: one write per retry, not one per event
+      // (before, 131-139 writes failed in about a second while the 150 files arrived).
+      assert.ok(failures <= retries + 1, `no write without a retrySave (${failures} failures, ${retries} retries)`);
+      const statuses = {}; for (const r of await A.rows()) statuses[r.status] = (statuses[r.status] ?? 0) + 1;
+      ctx.note(`A: ${failures} failed saves and ${retries} retries in ${((Date.now() - t0) / 1000).toFixed(1)} s of failing storage; rows ${JSON.stringify(statuses)}`);
+      if (firefox) assert.ok(!statuses.waiting, 'contents that could not be stored are not blamed on the peer');
       // 3. Recovery.
       if (firefox) await A.eval(`(async () => { const root = await navigator.storage.getDirectory(); const names = []; for await (const n of root.keys()) if (n.startsWith('filler-')) names.push(n); for (const n of names) await root.removeEntry(n); return names.length; })()`);
       else { await A.eval('(window.__idbFail = false)'); await A.page.cdp('Storage.overrideQuotaForOrigin', { origin: ctx.server.url }); }
       await A.eval(`(document.querySelector('#retry-save')?.click(), true)`);   // an automatic retry may already have succeeded
       await A.waitFor(`!document.querySelector('#banner-save') && document.querySelector('#saving').dataset.state === 'saved'`, 30000, 'banner gone after a successful save');
       await B.waitRows((rows) => !rows.some((r) => r.path === gone.name) && rows.some((r) => r.path === keep.name), 30000, 'B gets the deletion once it is saved');
+      // Contents that could not be stored during the failure are fetched again after the retry,
+      // in the same session.
+      await A.waitRows((rows) => rows.length > 0 && rows.every((r) => r.status === 'complete'), 60000, 'every content stored after recovery');
       const failed = firefox ? null : await A.eval('window.__idbFailed');
       if (!firefox) assert.ok(failed >= 1, 'the injected failure was exercised');
     },

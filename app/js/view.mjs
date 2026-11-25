@@ -3,7 +3,8 @@
 // A file is `complete` only if Lean reports every version present, and Lean marks a blob present
 // only after the host reported it verified and durably stored (blobStored / blobsStored / the
 // local put that follows the store). Missing versions take the status of their hash in the
-// `pending` reply: requested -> fetching, queued, waiting; a hash the reply does not list yet
+// `pending` reply: requested -> fetching, queued, waiting, localFailure (it arrived but this device
+// could not store it; retried with the host's back-off); a hash the reply does not list yet
 // (the reply is a few ms older than the snapshot) shows as `pending`, never as complete.
 //
 // Names: the CRDT allows any string as a path. This version adds files by flat name only, but a
@@ -24,7 +25,7 @@ export function buildRows(files, pendingItems) {
       let status = 'complete', peer = null;
       if (!v.present) {
         const p = pend.get(hx);
-        status = !p ? 'pending' : p.status === 'requested' ? 'fetching' : p.status;   // fetching | queued | waiting
+        status = !p ? 'pending' : p.status === 'requested' ? 'fetching' : p.status;   // fetching | queued | waiting | localFailure
         peer = p?.peer ?? null;
       }
       return { hash: v.hash, hex: hx, present: v.present, status, peer };
@@ -53,6 +54,7 @@ export const STATUS_TEXT = {
   fetching: 'fetching',
   queued: 'queued',
   waiting: 'waiting: nobody reachable has it',
+  localFailure: 'could not be stored on this device',
   pending: 'not yet available',
   conflicted: 'conflict',
 };

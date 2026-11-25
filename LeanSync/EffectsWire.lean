@@ -275,7 +275,7 @@ theorem readOptRep_complete : Complete readOptRep encOptRep (fun _ => True) := b
 /-- Notices: 0 indexChanged · 1 blobsChanged · 2 peerStatus peer status:u8 optReplica ·
 3 peerClosed peer reason:u8 byPeer:bool · 4 peerLeft peer · 5 peerError peer err ·
 6 rollbackDetected · 7 opRejected str · 8 badEvent err · 9 startupFailed err ·
-10 notInitialized · 11 alreadyInitialized · 12 pendingSummary fetching queued waiting (nats) ·
+10 notInitialized · 11 alreadyInitialized · 12 pendingSummary fetching queued waiting localFailure (nats) ·
 13 saveFailed.
 `err` = code:u8 value:nat (0 truncated, 1 trailing, 2 tooLarge, 3 badVersion v, 4 badKind k,
 5 badTag t, 6 nonCanonical, 7 badUtf8); `optReplica` = 00 | 01 replica. -/
@@ -292,7 +292,7 @@ def encNotice : Notice → List UInt8
   | .startupFailed e => 9 :: encErr e
   | .notInitialized => [10]
   | .alreadyInitialized => [11]
-  | .pendingSummary f q w => 12 :: (encVar f ++ encVar q ++ encVar w)
+  | .pendingSummary f q w l => 12 :: (encVar f ++ encVar q ++ encVar w ++ encVar l)
   | .saveFailed => [13]
 
 def wNotice (acc : ByteArray) : Notice → ByteArray
@@ -312,7 +312,7 @@ def wNotice (acc : ByteArray) : Notice → ByteArray
   | .startupFailed e => wErr (acc.push 9) e
   | .notInitialized => acc.push 10
   | .alreadyInitialized => acc.push 11
-  | .pendingSummary f q w => wVar (wVar (wVar (acc.push 12) f) q) w
+  | .pendingSummary f q w l => wVar (wVar (wVar (wVar (acc.push 12) f) q) w) l
   | .saveFailed => acc.push 13
 
 theorem wNotice_toList (acc : ByteArray) (n : Notice) :
@@ -339,7 +339,8 @@ def readNotice : Parser Notice := fun b pos =>
     else if t = 9 then mapP .startupFailed readErr b p1
     else if t = 10 then .ok (.notInitialized, p1)
     else if t = 11 then .ok (.alreadyInitialized, p1)
-    else if t = 12 then mapP (fun z => .pendingSummary z.1 z.2.1 z.2.2) (seqP readNat (seqP readNat readNat)) b p1
+    else if t = 12 then mapP (fun z => .pendingSummary z.1 z.2.1 z.2.2.1 z.2.2.2)
+      (seqP readNat (seqP readNat (seqP readNat readNat))) b p1
     else if t = 13 then .ok (.saveFailed, p1)
     else .error (.badTag t.toNat)
 
@@ -409,10 +410,11 @@ theorem readNotice_complete : Complete readNotice encNotice (fun _ => True) := b
   | saveFailed =>
     obtain ⟨e0, -, -⟩ := tag_at (l := []) hpos (by simpa [encNotice] using h)
     simp [readNotice, e0, encNotice]
-  | pendingSummary f q w =>
+  | pendingSummary f q w l =>
     obtain ⟨e0, h1, hp1⟩ := tag_at hpos (by simpa [encNotice] using h)
-    have e1 := seqP_complete readNat_complete (seqP_complete readNat_complete readNat_complete)
-      b (pos + 1) (f, q, w) rest hp1 ⟨trivial, trivial, trivial⟩ (by rw [h1]; simp)
+    have e1 := seqP_complete readNat_complete (seqP_complete readNat_complete
+      (seqP_complete readNat_complete readNat_complete))
+      b (pos + 1) (f, q, w, l) rest hp1 ⟨trivial, trivial, trivial, trivial⟩ (by rw [h1]; simp)
     simp only [readNotice, e0, mapP_of_ok e1]
     simp [encNotice]; omega
 
@@ -424,11 +426,12 @@ def encPend : PendingStatus → List UInt8
   | .waiting => [0]
   | .requested p => 1 :: encPeer p
   | .queued => [2]
+  | .localFailure => [3]
 def encPendItem (x : Hash × PendingStatus) : List UInt8 := encHashE x.1 ++ encPend x.2
 def encPeerStat (x : PeerId × PeerStatus) : List UInt8 := encPeer x.1 ++ [statusByte x.2]
 
 /-- Replies: 0 snapshot k {path:str m {hash present:bool}^m}^k ·
-1 pending k {hash (00 waiting | 01 peer requested | 02 queued)}^k ·
+1 pending k {hash (00 waiting | 01 peer requested | 02 queued | 03 localFailure)}^k ·
 2 status persistInFlight:bool dirty:bool rollback:bool k {peer status:u8}^k. -/
 def encReply : Reply → List UInt8
   | .snapshot files => 0 :: encList encFile files
@@ -442,6 +445,7 @@ def wPendItem (a : ByteArray) (x : Hash × PendingStatus) : ByteArray :=
   | .waiting => (wHash a x.1).push 0
   | .requested p => wPeer ((wHash a x.1).push 1) p
   | .queued => (wHash a x.1).push 2
+  | .localFailure => (wHash a x.1).push 3
 def wPeerStat (a : ByteArray) (x : PeerId × PeerStatus) : ByteArray := (wPeer a x.1).push (statusByte x.2)
 
 def wReply (acc : ByteArray) : Reply → ByteArray
@@ -472,7 +476,8 @@ def readPend : Parser PendingStatus := fun b pos =>
   match readByte b pos with
   | .ok (x, p) =>
     if x = 0 then .ok (.waiting, p) else if x = 1 then mapP .requested readPeer b p
-    else if x = 2 then .ok (.queued, p) else .error (.badTag x.toNat)
+    else if x = 2 then .ok (.queued, p) else if x = 3 then .ok (.localFailure, p)
+    else .error (.badTag x.toNat)
   | .error e => .error e
 def readPendItem : Parser (Hash × PendingStatus) := seqP readHashE readPend
 def readPeerStat : Parser (PeerId × PeerStatus) := seqP readPeer readStatus
@@ -494,6 +499,9 @@ theorem readPend_complete : Complete readPend encPend (fun _ => True) := by
     obtain ⟨e0, -, -⟩ := tag_at (l := []) hpos (by simpa [encPend] using h)
     simp [readPend, e0, encPend]
   | queued =>
+    obtain ⟨e0, -, -⟩ := tag_at (l := []) hpos (by simpa [encPend] using h)
+    simp [readPend, e0, encPend]
+  | localFailure =>
     obtain ⟨e0, -, -⟩ := tag_at (l := []) hpos (by simpa [encPend] using h)
     simp [readPend, e0, encPend]
   | requested p =>

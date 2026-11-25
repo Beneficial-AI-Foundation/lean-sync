@@ -13,6 +13,7 @@ td.actions { white-space: nowrap; text-align: right; }
 tr.version td.name { padding-left: 28px; color: var(--muted); }
 td.status[data-status="complete"] { color: var(--ok); }
 td.status[data-status="waiting"], td.status[data-status="conflicted"] { color: var(--warn); }
+td.status[data-status="localFailure"] { color: var(--danger); }
 .banner { padding: 8px 12px; margin: 8px 0; border: 1px solid var(--line); border-radius: 6px; background: #f6f6f8; }
 .banner.danger { border-color: var(--danger); background: #fdf0ef; }
 .banner.warn { border-color: var(--warn); background: #fdf7ea; }

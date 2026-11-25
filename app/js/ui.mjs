@@ -36,7 +36,7 @@ export function createUI({ storage, getCore, transport, label }) {
     onPeers(peers) { state.peers = peers; renderPeers(); },
     onNotice(n) {
       switch (n.notice) {
-        case 'pendingSummary': state.summary = n; renderPeers(); break;
+        case 'pendingSummary': state.summary = n; renderPeers(); renderBanners(); break;
         case 'saveFailed': state.saveFailed = true; renderBanners(); renderHeader(); break;
         case 'saveRecovered': state.saveFailed = false; renderBanners(); renderHeader(); message('Changes are saved again.'); break;
         case 'rollbackDetected': state.rollback = true; renderBanners(); renderHeader(); renderFiles(); break;
@@ -111,6 +111,10 @@ export function createUI({ storage, getCore, transport, label }) {
       el('strong', {}, 'Changes could not be saved. '),
       'Recent changes on this device are not stored yet and are not sent to other devices. Retrying automatically. ',
       el('button', { id: 'retry-save', onclick: () => getCore().retrySave() }, 'Retry now')));
+    // Only received contents failed (the index is saved): same retry, without claiming unsaved changes.
+    if (!state.saveFailed && state.summary?.localFailure > 0) b.append(el('div', { class: 'banner warn', id: 'banner-store' },
+      `${state.summary.localFailure} received file content(s) could not be stored on this device. Retrying automatically. `,
+      el('button', { id: 'retry-store', onclick: () => getCore().retrySave() }, 'Retry now')));
     if (state.restarts) b.append(el('div', { class: 'banner', id: 'banner-restart' },
       `The sync engine hit an internal error and was restarted from the last saved state (${state.restarts}×).`));
     for (const r of state.refused) b.append(el('div', { class: 'banner warn' },
@@ -123,7 +127,10 @@ export function createUI({ storage, getCore, transport, label }) {
       el('span', { class: 'peer', 'data-status': x.status }, `${i ? ' · ' : ''}${x.label ?? 'peer ' + x.peer}${x.replica ? ` (${replicaKey(x.replica).slice(0, 6)})` : ''} ${x.status === 'inSync' ? 'in sync' : x.status}`))
       : [el('span', { class: 'muted' }, transport.online ? 'none connected' : 'offline')]));
     const s = state.summary;
-    $('#summary').textContent = s && (s.fetching + s.queued + s.waiting) ? `Missing file contents: ${s.fetching} fetching · ${s.queued} queued · ${s.waiting} waiting` : '';
+    $('#summary').textContent = s && (s.fetching + s.queued + s.waiting + s.localFailure)
+      ? `Missing file contents: ${s.fetching} fetching · ${s.queued} queued · ${s.waiting} waiting` +
+        (s.localFailure ? ` · ${s.localFailure} could not be stored on this device (retrying)` : '')
+      : '';
   }
 
   function renderFiles() {

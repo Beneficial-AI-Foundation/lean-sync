@@ -26,6 +26,8 @@ event   := 01 03 tag:u8 ...
   8 blobStored  hash (00 | 01 peer)        9 blobFailed peer hash
   10 blobLost   hash                       11 query (0 snapshot | 1 pending | 2 status)
   12 blobsStored k:varint {hash}^k         (start-up inventory in chunks, or any batch of stored blobs)
+  13 retrySave                             (end a failed-save hold; request parked blobs again)
+  14 blobStoreFailed hash                  (a blob arrived but could not be stored on this device)
 ```
 The effects envelope (Lean → host) is in `LeanSync/EffectsWire.lean`. Decoding of events is total
 and linear; any malformed event yields the single effect `notify (badEvent e)`.
@@ -113,6 +115,8 @@ def dEvent : Dec Event := do
   | 10 => do let h ← dHash; pure (.blobLost h)
   | 11 => do let q ← dQuery; pure (.query q)
   | 12 => do let hs ← dHashes; pure (.blobsStored hs)
+  | 13 => pure .retrySave
+  | 14 => do let h ← dHash; pure (.blobStoreFailed h)
   | n => .fail (.badTag n)
 
 def decodeEvent (b : ByteArray) : Except DecodeError Event :=
@@ -152,6 +156,8 @@ def encodeEvent (e : Event) : ByteArray :=
   | .blobLost h => wHash (acc.push 10) h
   | .query q => wQuery (acc.push 11) q
   | .blobsStored hs => wHashes (acc.push 12) hs
+  | .retrySave => acc.push 13
+  | .blobStoreFailed h => wHash (acc.push 14) h
 
 /-! ## The boundary -/
 

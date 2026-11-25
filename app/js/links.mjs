@@ -234,7 +234,7 @@ export function createLinks(o) {
     s.sink.catch((e) => {
       if (c.recv.get(hx) !== s || s.failed) return;
       o.onStorageError?.(e);
-      failStream(c, hash, `could not create a file for it (${e?.name ?? e})`);
+      failStream(c, hash, `could not create a file for it (${e?.name ?? e})`, true);
       if (c.alive) push(c, u8(T.ABORT, hash));
     });
     grant(c, s);
@@ -260,7 +260,7 @@ export function createLinks(o) {
     s.chain.catch((e) => {
       if (c.recv.get(hx) !== s || s.failed) return;
       o.onStorageError?.(e);
-      failStream(c, s.hash, `could not write it (${e?.message ?? e})`);
+      failStream(c, s.hash, `could not write it (${e?.message ?? e})`, true);
       if (c.alive) push(c, u8(T.ABORT, s.hash));
     });
   }
@@ -279,15 +279,20 @@ export function createLinks(o) {
       s.sink.then((sink) => sink.abort(), () => {});
       o.log(`peer ${peer}: could not store blob ${hx.slice(0, 8)}: ${e.message}`);
       o.onStorageError?.(e);
-      o.emit({ type: 'blobFailed', peer, hash: s.hash }, ep);
+      // Not the peer's fault. If the connection is gone, Lean has already re-planned the hash
+      // (possibly to another peer, whose transfer the peerless event would cancel): say nothing.
+      if (c.alive) o.emit({ type: 'blobStoreFailed', hash: s.hash }, ep);
     });
   }
-  function failStream(c, hash, why) {
+  /** A stream that will not end in a stored blob. `local`: the bytes were fine but this device
+   *  could not store them (quota, I/O error): `blobStoreFailed`, which does not blame the peer;
+   *  otherwise the transfer itself failed: `blobFailed`, the peer is not asked again this session. */
+  function failStream(c, hash, why, local = false) {
     const hx = hex(hash), s = c.recv.get(hx);
     o.log(`peer ${c.peer}: blob ${hx.slice(0, 8)} failed: ${why}`);
     c.recv.delete(hx); c.expected.delete(hx);
     if (s) { s.failed = true; s.sink.then((sink) => sink.abort(), () => {}); }
-    o.emit({ type: 'blobFailed', peer: c.peer, hash }, c.epoch);
+    o.emit(local ? { type: 'blobStoreFailed', hash } : { type: 'blobFailed', peer: c.peer, hash }, c.epoch);
   }
 
   // ------------------------------------------------------------ teardown

@@ -92,6 +92,8 @@ inductive Event where
   | blobStored (h : Hash) (src : Option PeerId) | blobFailed (p : PeerId) (h : Hash) | blobLost (h : Hash)
   | blobsStored (hs : List Hash)                                        -- a batch, e.g. the start-up inventory in chunks
   | query (q : Query)                                                   -- snapshot | pending | status
+  | retrySave                                                           -- end a failed-save hold, release parked blobs
+  | blobStoreFailed (h : Hash)                                          -- h arrived intact but could not be stored here
 
 inductive Effect where
   | send (p : PeerId) (msg : Message) | close (p : PeerId) (reason : CloseReason)
@@ -105,9 +107,11 @@ The `Node` holds:
 - `self` and `current`, the latest state, which may carry dots not yet persisted;
 - `published`, the last acknowledged state together with its digest, and `inflight`, the one
   persist in flight;
-- `nextTag` and `dirty`;
+- `nextTag`, `dirty` and `holdPersist` (a save failed and no `retrySave` came since, §3);
 - `blobs`, the sorted set of present blobs, and `missing`, a sorted cache of the hashes referenced
   by `current` that are not present;
+- `parked`, the sorted set of blobs that arrived but could not be stored here (`blobStoreFailed`),
+  requested from nobody until the next `retrySave` (§5);
 - `sessions`, sorted by peer;
 - `rollback` and the last pending summary.
 
@@ -119,15 +123,16 @@ A `Session` holds:
 Notices for the UI:
 - `indexChanged` and `blobsChanged`: re-query;
 - `peerStatus p (handshaking|syncing|inSync) replica`, `peerClosed`, `peerLeft`, `peerError`;
-- `pendingSummary fetching queued waiting`, which separates "being fetched", "queued behind a
-  peer whose request slots are full", and "nobody reachable has it" (§5);
+- `pendingSummary fetching queued waiting localFailure`, which separates "being fetched", "queued
+  behind a peer whose request slots are full", "nobody reachable has it", and "arrived but could not
+  be stored on this device" (§5);
 - `saveFailed`: the host could not store the state; changes are not durable yet (§3);
 - `rollbackDetected`, `opRejected`, `badEvent`, `startupFailed`, `notInitialized`,
   `alreadyInitialized`.
 
 Replies:
 - `snapshot`: each path with its versions, each marked present or not;
-- `pending`: each missing hash, `requested p`, `queued` or `waiting`;
+- `pending`: each missing hash, `requested p`, `queued`, `waiting` or `localFailure`;
 - `status`.
 
 Changes since stage 1:
@@ -140,6 +145,14 @@ Changes made after the review of the stage-2 branch:
 - `PendingStatus.queued` is new, and `pendingSummary` has three counts instead of two (§5);
 - `Node.summary` is a triple.
 
+Changes for storage failures (app-design §11, proposals A and B, accepted). All are host↔Lean
+envelope changes; the peer wire format is unchanged.
+- `retrySave` (event tag 13) is new: a failed save now holds the node until the host sends it (§3).
+- `blobStoreFailed h` (event tag 14) is new: a blob that arrived but could not be stored is parked,
+  without blaming the peer (§5).
+- `PendingStatus.localFailure` (pending reply tag 3) is new, and `pendingSummary` has a fourth
+  count; `Node.summary` is a quadruple; `Node.parked` is new.
+
 ## 3. Save-before-send, made structural
 
 The only state ever put on the wire is `published`: the state of the last persist the host
@@ -150,12 +163,26 @@ acknowledged.
   or duplicate, are ignored.
 - `persistFailed tag` clears the in-flight persist, keeps the state `dirty`, and notifies
   `saveFailed`: recent changes are not durable, and nothing newer is sent to peers.
-  - **No retry in the same step** (proved: `persistFailed_no_retry_in_step`). Any `persistFailed`
-    event sets `holdPersist`, and the persist pass of that step only clears it. The retry, with
-    the latest state, comes on the next event.
-  - So a host whose storage keeps failing cannot be driven into a write loop by failure events
-    alone. It decides when to try again, by sending any event after its back-off; `query .status`
-    works as a no-op nudge.
+  - **Held until `retrySave`.** Any `persistFailed` (also a stale one) sets `holdPersist`; while
+    it is set the persist pass emits nothing, on every event of every kind. Only `retrySave` clears
+    it; the persist pass of that same step then writes the latest state, if it is dirty and no
+    persist is in flight. Proved: `held_no_persist` (a held node emits no persist on any event but
+    `retrySave`, and stays held) and its trace form `persistFailed_no_persist_until_retry` (no step
+    from a `persistFailed` up to the next `retrySave` emits a persist);
+    `persistFailed_no_retry_in_step` is unchanged.
+  - So nothing a peer or the UI does can drive a host with failing storage into a write loop: the
+    host owns the back-off. Before this change the hold lasted only for the failing step, and in
+    the Firefox quota test 131–139 writes failed in about a second while 150 files arrived; now it
+    is one write per `retrySave` (3–4 in the same test, app-design §11).
+  - **Liveness** (proved): `retrySave_releases` — after a `retrySave` the node is not held, nothing
+    is parked, and either a persist is in flight or nothing is dirty; `retrySave_persists` — a
+    `retrySave` while dirty with no persist in flight emits `persist nextTag current`. The local
+    settling argument therefore needs one host hypothesis: after a failed save the host eventually
+    sends `retrySave` (it does, on its back-off timer).
+  - **`retrySave` when not held** is a no-op for saving: after every step an unheld node has a
+    persist in flight or nothing dirty, so the retry adds no write (proved: `retrySave_not_held`).
+    Its only other effect is to release parked blobs (§5). The host may therefore send it at any
+    time, e.g. from a "Retry now" button.
 
 **At most one persist is ever in flight.** Later changes are folded into the next persist. The
 host therefore never has two writes racing, and an earlier write can never overtake a later one.
@@ -277,25 +304,46 @@ simulation.
   missing hashes that are neither in flight anywhere nor listed as lacking at that peer.
   - The simulator found that requesting before our own hello makes the peer reject the session.
     This was a real bug, now fixed; `step_plans_blobs` changed with it (§9).
-  - Proved, `step_plans_blobs`: after every step, each missing hash is in flight somewhere, or
-    every greeted ready session either lacks it or is full.
+  - Proved, `step_plans_blobs`: after every step, each missing hash is in flight somewhere, or is
+    parked, or every greeted ready session either lacks it or is full.
 - **Chains** (A has a blob, B is fetching it, C asks B). B answers `noBlob` and records the hash
   in `toldNo`. When B stores the blob it sends `have` to C, and C asks again.
   - Proved, `step_no_owed_have`: no `have` is owed after any step.
   - `toldNo` is capped at 4096 per session; past that, C retries on its next session with B.
 - `blobFailed p h` marks `h` as lacked at `p` for that session, so a peer serving corrupt data
   cannot cause a retry loop.
-- **Three kinds of pending blob** (user decision: no clock, wait indefinitely; the review asked
+- **`blobStoreFailed h`**: the bytes arrived (or were arriving) intact, but this device could not
+  store them (quota, I/O error). That is not the peer's fault, so no `lacks` entry is made. `h` is
+  taken out of flight everywhere and, if it is missing, added to `parked`; the planner skips parked
+  hashes. **Retry rule:** the next `retrySave` empties `parked` (and a restart starts with it
+  empty), and the hashes are planned again in that step, from the same peers. The host sends
+  `retrySave` on its back-off after any storage failure, so a parked blob cannot stay parked for
+  good; one `retrySave` covers both kinds of failure. Proved: `blobStoreFailed_parks` (the hash is
+  parked, in flight nowhere, and every session keeps exactly its `lacks`), `retrySave_releases`
+  (nothing is parked after a `retrySave`).
+
+  **Known limitation (not fixed, by decision).** `blobStoreFailed h` names no peer, so Lean cannot
+  tell a stale report from a current one: a report that arrives after `h` was re-planned to another
+  peer clears that peer's request and parks `h` while its transfer may still be running. The host
+  must therefore not send `blobStoreFailed` for a connection that is no longer alive (covered by
+  the unit test in `test/unit/links.test.mjs` "a store that fails after the link closed (END already received): no failure event, sink aborted; a late success is still reported", and the mutant `late-store-failure-after-close` in `test/mutations.mjs`). Other stale-report races, e.g. a reconnect before a slow failure, have not been analysed.
+  The possible fix is `blobStoreFailed p h`, acting only when `h` is in flight at `p` (as `blobFailed
+  p h` does): one more varint in event tag 14; `handle` takes the `blobFailed` shape, so its proof
+  cases follow the existing `blobFailed` ones; `blobStoreFailed_parks` gains the hypothesis "`h` is in
+  flight at `p`"; about an hour of work. Not doing it now was a deliberate decision by the user.
+- **Four kinds of pending blob** (user decision: no clock, wait indefinitely; the review asked
   that a blob queued behind a busy peer not be reported as unreachable):
   - **fetching**: requested from a peer now;
   - **queued**: not requested yet, but some greeted ready peer has not said it lacks it, so it
     will be requested as soon as that peer's 32 request slots free up (by `step_plans_blobs`, such
     a peer is full);
   - **waiting**: every greeted ready peer said it lacks it, or no peer is connected: nobody
-    reachable has it.
-  - `pendingSummary fetching queued waiting` is emitted whenever the triple changes, and the
-    `pending` query lists each hash with `requested p`, `queued` or `waiting`. A unit test checks
-    exactly the review's case: 33 missing blobs and one peer give (32, 1, 0).
+    reachable has it;
+  - **localFailure**: parked: it arrived but could not be stored on this device (until `retrySave`).
+  - `pendingSummary fetching queued waiting localFailure` is emitted whenever the four counts
+    change, and the `pending` query lists each hash with `requested p`, `queued`, `waiting` or
+    `localFailure`. A unit test checks exactly the review's case: 33 missing blobs and one peer
+    give (32, 1, 0, 0); another, 150 blobs that could not be stored, gives (0, 0, 0, 150).
   - A waiting hash is asked for again when a new session is greeted or a `have` arrives.
   - If the device that wrote it later superseded it, the next index sync removes the reference.
   - If that device is gone for good, the file stays pending until the user deletes or overwrites
@@ -321,7 +369,8 @@ message := 01 02 tag ...  0 hello maxVersion:u8 hi lo digest:32 | 1 digest diges
                           2 state digest:32 <state without its 2-byte header>
                           3 want | 4 noBlob | 5 have   k∈[1,1024] {hash:32}^k (strictly increasing)
                           6 bye reason:u8
-event   := 01 03 tag ...  (layout in the header of LeanSync/Envelope.lean; 12 = blobsStored)
+event   := 01 03 tag ...  (layout in the header of LeanSync/Envelope.lean; 12 = blobsStored,
+                          13 = retrySave, 14 = blobStoreFailed hash)
 effects := 01 04 k:nat {effect}^k                    (layout in the header of LeanSync/EffectsWire.lean)
            0 send peer msg:bytes | 1 close peer reason | 2 persist tag:nat state:bytes
            3 fetch peer {hash} want:bytes | 4 serveBlob peer hash | 5 notify | 6 reply
@@ -396,9 +445,10 @@ synced; blobs on disk are kept. The same event is used for a first start on empt
 1. **The record.** Store `{replicaId, stateBytes}` in **one** atomic IndexedDB transaction for each
    `persist tag stateBytes`, replacing the previous record.
    - Only after the transaction commits, send `persisted tag SHA-256(stateBytes)`.
-   - If it fails, send `persistFailed tag`. Lean will not retry in that step; after your back-off,
-     send any event (for example `query .status`) and Lean issues the retry with the latest
-     state. Show the `saveFailed` notice to the user until a later persist succeeds.
+   - If it fails, send `persistFailed tag`. Lean then issues no persist, whatever events follow,
+     until you send `retrySave`; send it after your back-off (and when the user asks), and Lean
+     issues the retry with the latest state. Show the `saveFailed` notice to the user until a
+     later persist succeeds. `retrySave` when nothing failed is harmless.
    - Lean never has two persists outstanding. Do not reorder writes.
 2. **Blobs.** Store a blob durably, after verifying its SHA-256, *before* sending `blobStored`.
    For a local edit, store the blob *before* sending the `localOp` that refers to it.
@@ -433,7 +483,11 @@ synced; blobs on disk are kept. The same event is used for a first start on empt
   hashes.
   - Verify each blob's SHA-256 and its size against the host's own limit, store it, and report
     `blobStored h (some p)`.
-  - Report `blobFailed p h` on a mismatch, an abort, or the size limit.
+  - Report `blobFailed p h` on a mismatch, an abort, or the size limit: the peer is not asked for
+    `h` again in this session.
+  - Report `blobStoreFailed h` when the stream was fine but *this device* could not store it (the
+    temporary file cannot be created, a write or the final move fails). Then send `retrySave`
+    after a back-off, as for a failed save: Lean requests the blob again only after it.
   - If the connection drops mid-stream, discard the partial blob and report nothing more for it.
 - `serveBlob p h`: stream blob `h` to `p`. If it cannot be read, send an abort frame for `h` and
   report `blobLost h`.
@@ -446,6 +500,9 @@ synced; blobs on disk are kept. The same event is used for a first start on empt
 - `persisted` and `persistFailed`: only for a `persist` the host was given.
 - `blobStored` and `blobsStored`: the blobs are durably stored and verified.
 - `blobLost`: a blob previously reported present is gone.
+- `blobStoreFailed h`: a stream for `h` this device asked for could not be stored locally.
+- `retrySave`: may be sent at any time; the host sends it after a back-off whenever a save or a
+  blob store failed since the last one.
 
 **Framing.** On a data channel the host multiplexes fragments of Lean messages and blob-stream
 frames. That framing belongs to the host and is invisible to Lean.
@@ -472,6 +529,10 @@ All of these are proved in `LeanSync/Laws.lean`, with lemmas in `StepProofs.lean
 | Step | `step_received_state`, `step_putMany` | exact merge and `putMany` semantics |
 | Step | `step_settles`, `step_plans_blobs`, `step_no_owed_have` | §4 and §5 |
 | Step | `step_detects_rollback`, `rollback_no_state`, `rollback_rejects_local` | rollback mode (§4) |
+| Storage | `persistFailed_no_retry_in_step` | the step handling `persistFailed` emits no persist |
+| Storage | `held_no_persist`, `persistFailed_no_persist_until_retry` | a held node emits no persist on any event but `retrySave`; trace form: none from a `persistFailed` (machine running) up to the next `retrySave` |
+| Storage | `retrySave_releases`, `retrySave_persists`, `retrySave_not_held` | liveness: after `retrySave` nothing is held or parked and a persist is in flight or nothing is dirty; when dirty and idle it persists `current`; when not held it issues no persist |
+| Storage | `blobStoreFailed_parks` | the hash is parked, in flight nowhere, and no session's `lacks` changes |
 
 **Statements changed since stage 1**, each marked in `Laws.lean`:
 1. **`step_putMany`** gains `n.rollback = false`. Local edits are refused after a rollback. The
@@ -482,6 +543,10 @@ All of these are proved in `LeanSync/Laws.lean`, with lemmas in `StepProofs.lean
 3. **`step_plans_blobs`** restricts the "no peer can take it" disjunct to sessions with
    `helloSent`. This follows the hello-first bug fix (§5): a ready session we have not greeted yet
    cannot be asked.
+4. **`step_plans_blobs`** (storage-failure change B) gains the disjunct `hb ∈ n'.parked`. This is a
+   deliberate weakening: a blob this device could not store is not requested until `retrySave`.
+   `retrySave_releases` shows the parked set is empty after every `retrySave`, so from that step
+   on the original disjuncts hold again for it.
 
 **Definitions refined.**
 - `Node.Inv` gained fields (the `missing` cache, per-session facts), which makes `step_inv`
@@ -503,6 +568,13 @@ All of these are proved in `LeanSync/Laws.lean`, with lemmas in `StepProofs.lean
 - `Notice.saveFailed` is new, effects notice tag 13.
 - `persistFailed_no_retry_in_step` is new.
 
+**For the storage-failure change (no other statement changed):**
+- `Node` gains `parked`, and `Node.Inv` gains `parkedSorted` (stronger `step_inv`).
+- `persistPass` no longer clears `holdPersist`; `handle retrySave` does.
+- `planPass` plans `sdiff missing parked`; `planPass_spec` says so.
+- `held_no_persist`, `persistFailed_no_persist_until_retry`, `retrySave_releases`,
+  `retrySave_persists`, `retrySave_not_held` and `blobStoreFailed_parks` are new.
+
 **Re-run the no-placeholder claim:** `scripts/check-proofs.sh`.
 - **Forbidden constructs.** `scripts/check-forbidden.sh` looks for `sorry`, `axiom`,
   `native_decide`, `implemented_by`, `unsafe` and `partial` as whole words anywhere outside
@@ -515,7 +587,7 @@ All of these are proved in `LeanSync/Laws.lean`, with lemmas in `StepProofs.lean
   file that uses `sorry`. `test-crdt.sh` checks the build log the same way.
   - A `sorry` planted in `Laws.lean` was caught by both the scanner and the build-log check, then
     removed.
-- **Axioms.** It runs `#print axioms` on every theorem listed in `scripts/Axioms.lean` (27). Each
+- **Axioms.** It runs `#print axioms` on every theorem listed in `scripts/Axioms.lean` (33). Each
   must report, and the only axioms allowed are `propext`, `Classical.choice` and `Quot.sound`.
   Fewer, or none, is accepted.
 
@@ -536,7 +608,7 @@ All of these are proved in `LeanSync/Laws.lean`, with lemmas in `StepProofs.lean
 All of these passed in the final run, both with the default stack and with
 `LEAN_STACK_SIZE_KB=256`.
 
-**`unit`** (61 checks) covers every flow of §4 to §7:
+**`unit`** (71 checks) covers every flow of §4 to §7:
 - the persist-before-send ordering;
 - stale and duplicate acknowledgements;
 - protocol errors: before hello, bad version, own id;
@@ -546,13 +618,20 @@ All of these passed in the final run, both with the default stack and with
 - rollback mode;
 - `startupFailed`, then `initFresh`;
 - the pending summary and the queries;
-- **queued versus waiting:** 33 missing blobs and one peer give summary (32, 1, 0), and the
+- **queued versus waiting:** 33 missing blobs and one peer give summary (32, 1, 0, 0), and the
   `pending` reply lists 32 requested, 1 queued, 0 waiting;
 - **failed persist:**
-  - a `saveFailed` notice, and no persist in the same step;
-  - five stale failure events trigger no write;
-  - the next event writes the latest state;
+  - a `saveFailed` notice, no persist in the same step, the node held;
+  - five stale failure events, a local edit, a query, a connect and disconnect, `blobsStored`,
+    `blobLost` and `blobStoreFailed` trigger no write;
+  - `retrySave` writes the latest state, once; two more `retrySave`s, not held, emit nothing;
 - **always-failing host:** the failure loop ends after one round;
+- **storage-full storm** (the Firefox case of app-design §11): device B's storage is full while
+  150 files arrive from A, each write failure reported before the next event. Lean asks for
+  **1** write (with the old step function, emulated by a mutant: **151**); all 150 blobs are
+  parked, none blamed on A (no `lacks`, nothing in flight), the summary is (0, 0, 0, 150) and the
+  `pending` reply says `localFailure` for all 150; after space is freed, one `retrySave` writes
+  the state and re-fetches from the same session, and the devices converge;
 - **no-op operations** (empty batch, delete of an absent path): no persist, no `indexChanged`,
   not dirty;
 - **late inventory:** a restart with an empty `init` inventory and a peer connecting early. The
@@ -565,36 +644,51 @@ All of these passed in the final run, both with the default stack and with
   `sendAgain`.
 - **P1 regression:** a 20,000-entry state (1,010,391 bytes) sent to 32 peers, plus its persist,
   gives a 2,020,890-byte envelope that decodes back to the 33 effects.
-- **Truncation:** every proper prefix of six encodings (6,937 prefixes) must be rejected. The six
-  are a state with 28 entries and 3 replicas, a state message, a 20-hash `want`, a `hello`, an
-  `init` event and an effect list.
+- **Truncation:** every proper prefix of six encodings (6,542 prefixes in the last run) must be
+  rejected. The six are a random state (26 entries and 3 replicas in the last run), a state
+  message, a 20-hash `want`, a `hello`, an `init` event and an effect list.
 - **Mutation fuzz:** 24,000 mutants of states, messages and events, made by bit flips, overwrites,
   inserts, deletes, duplicated spans and huge varint counts. Each must fail to decode or re-encode
   to exactly the mutated bytes; there were no crashes.
-  - States: 7,331 rejected, 669 accepted.
-  - Messages: 7,244 rejected, 756 accepted.
-  - Events: 6,729 rejected, 1,271 accepted.
-- **Random bytes:** 18,000 random inputs, all rejected.
+  - States: 7,344 rejected, 656 accepted.
+  - Messages: 7,248 rejected, 752 accepted.
+  - Events: 6,713 rejected, 1,287 accepted.
+- **Random bytes:** 18,000 random inputs: 17,999 rejected, 1 accepted (it re-encodes to itself,
+  as required; a three-byte input `01 03 0d` is now a complete event, `retrySave`).
 
 **`sim 1 200`**: 200 seeds × 4 devices × 400 random steps, then quiescence.
-- **Faults injected over the 200 seeds:**
-  - 2,116 connection drops at arbitrary points and 798 crash/restarts from the persisted record;
+- **Faults injected over the 200 seeds** (last run):
+  - 2,162 connection drops at arbitrary points and 823 crash/restarts from the persisted record;
     half of all start-ups report the blob inventory in `blobsStored` chunks;
-  - 589 persist failures and delayed acknowledgements;
-  - 99 blob-transfer failures and 443 blob losses (only when another copy exists);
-  - 365 garbage, 187 truncated and 189 duplicated messages.
-- **Volume:** 84,427 events, of which 21,092 went through `process` and the byte envelopes, and
-  15,708 state sends.
+  - 1,727 persist failures, and delayed acknowledgements;
+  - **storage-full periods** (568): while a device's storage is full every write of its record
+    fails and every blob that reaches it is reported `blobStoreFailed` (972 in all); the model
+    host sends `retrySave` on a random schedule standing in for its back-off (2,718 in all, some
+    on devices that owed none), and 14,706 events were handled by held devices;
+  - 73 blob-transfer failures and 375 blob losses (only when another copy exists);
+  - 349 garbage, 123 truncated and 108 duplicated messages.
+- **Volume:** 78,457 events, of which 19,668 went through `process` and the byte envelopes, and
+  10,506 state sends.
 - **Checked after every event:**
   - save-before-send, through a global **dot registry**: no dot is ever seen on the wire with two
     different contents;
   - every sent state equals a state its host acknowledged;
   - every effect is executable in `HostView`;
   - the node invariants;
-  - hello-first order on every connection.
-- **At quiescence:** all connections are rebuilt as a full mesh, a chain, or sequential pairs
-  (by seed). The run then requires equal states, `published = current`, no persist in flight, and
-  every referenced blob present on every device.
+  - hello-first order on every connection;
+  - **storage failures**, against the model host: no `persist` while the device is held (a save
+    failed and no `retrySave` since); no persist from a `retrySave` on an unheld device; no
+    `fetch` of a hash parked since the last `retrySave`; after `blobStoreFailed h` the hash is in
+    flight nowhere, is parked if missing, and no session's `lacks` gained it.
+- **At quiescence:** storage is freed on every device, the model host sends each device that
+  owes one a `retrySave`, and all connections are rebuilt as a full mesh, a chain, or sequential
+  pairs (by seed). The run then requires equal states, `published = current`, no persist in
+  flight, and every referenced blob present on every device.
+  - The sequential-pairs variant now runs forward, backward and forward again (it ran forward and
+    backward). The new random sequences produced 2 seeds (of 200) in which an index entry made on
+    the last device of the chain referred to bytes held only by the first devices: one round trip
+    carries the entry back but cannot bring the bytes forward again. That is a limit of the
+    quiescence schedule, not of the protocol.
 - **Result:** 0 failing seeds.
 - **Not injected:** bit corruption that still decodes. The transport has integrity, and the trust
   model excludes it.
@@ -612,6 +706,9 @@ plus a **directed chain scenario**:
 | no `have` sent | 30/30 (was 8/30 with the random simulator alone, whose quiescence phase reconnects and so retries) |
 | received states ignored | 30/30 |
 | a send after disconnect | 30/30 |
+| the hold lasts only for the failing step (the behaviour before `retrySave`) | 30/30 (a persist while held) |
+| `retrySave` does not release parked blobs | 7/30 (a blob still missing at quiescence) |
+| `blobStoreFailed` blames the peer (as `blobFailed`) | 19/30 (a `lacks` entry after `blobStoreFailed`) |
 
 The real step function is clean on 30/30 seeds. Earlier, the simulator caught the real
 want-before-hello bug on 83 of 200 seeds.

@@ -23,11 +23,12 @@ closure (build/c and build/obj are shared caches). `scripts/wasm/check-engine.sh
 | 20k files: `putMany` + persist / full sync of a fresh device (index + 20k blobs) | 54 ms / 11.8 s wall, of which ~10 s inside the receiving engine (~0.5 ms per `blobStored`, about 2× the native figure) |
 
 **Same behaviour as native: yes, as far as tested.** `sync-tests trace 1 200` (new test subcommand
-in `Tests/Sync.lean`; libraries untouched) records 200 simulator worlds — 83,729 events with every
-injected fault (crashes, drops, garbage, truncation, persist and blob failures) — with the native
-output of `process` on each Lean-encoded event. `test/wasm-replay.mjs` feeds each device's events
-to its own wasm instance (a fresh instance after each simulated crash: 1,601 instances) and
-compares: **0 byte mismatches**, and all 83,729 outputs decode with the JS decoder. The Node smoke
+in `Tests/Sync.lean`; libraries untouched) records 200 simulator worlds — 78,457 events with every
+injected fault (crashes, drops, garbage, truncation, persist and blob failures, storage-full
+periods with `blobStoreFailed` and `retrySave`) — with the native output of `process` on each
+Lean-encoded event. `test/wasm-replay.mjs` feeds each device's events to its own wasm instance (a
+fresh instance after each simulated crash: 1,623 instances) and compares: **0 byte mismatches**,
+and all 78,457 outputs decode with the JS decoder (numbers of the storage-failure branch). The Node smoke
 test (`test/wasm-smoke.mjs`) runs `initFresh` → `persisted` → `putMany` → `persisted` → `snapshot`
 through the JS encoder, wasm and the JS decoder and checks the exact record bytes; the browser smoke
 (`test/browser-smoke.mjs`) does the same in Chromium 154, Firefox 146 and Firefox ESR 140, each run
@@ -78,8 +79,10 @@ log), which the tests read.
 `codec.mjs` is hand-written (the format is small and version-tagged; a generator would be more,
 unverified, code). It is kept in step by tests that regenerate their inputs from the current Lean
 build on every run (`scripts/test-app.sh`):
-- `sync-tests vectors` writes 636 cases: one sample of **every** event, local op, query, effect,
-  notice (all 14), reply (all 3), pending status, peer status, close reason and decode error, with
+- `sync-tests vectors` writes 639 cases: one sample of **every** event (`retrySave` and
+  `blobStoreFailed` included), local op, query, effect, notice (all 14; `pendingSummary` with four
+  counts), reply (all 3), pending status (`localFailure` included), peer status, close reason and
+  decode error, with
   edge values (u64-max replica halves, 2^40 tags, peer 2^32−1, empty lists, Unicode and quotes in
   paths, `sendAgain`), plus 600 random ones. JS must encode each event to identical bytes and
   decode each envelope to the same values; every proper prefix must be rejected, and a trailing
@@ -87,7 +90,7 @@ build on every run (`scripts/test-app.sh`):
 - `scripts/wasm/Ctors.lean` prints the constructor lists of the ten boundary types from the Lean
   environment; the JS test fails unless the codec's tables cover exactly those constructors, and
   unless the vectors exercise every one of them.
-- The 83,729 real envelopes of the trace replay (§0) all decode.
+- The 78,457 real envelopes of the trace replay (§0) all decode.
 
 ## 3. Event loop (as built)
 
@@ -119,10 +122,15 @@ Rules found necessary while building or in review:
   to the core before any await. A version that arrives later — e.g. a peer's edit during an upload —
   is not superseded and becomes a conflict. *(Review P1: the add read the versions after storing
   and hashing, so a peer's edit arriving meanwhile was silently removed.)*
-- **No host-generated events while saves fail.** Every event makes Lean retry the write, and the
-  UI's refresh queries are events; the first version therefore spun at 16 failed writes per second.
-  While `saveFailed` holds, UI queries are deferred to the back-off nudge (1, 2, 4 … 60 s, growing
-  only with the nudges). Real events still cause retries (§11, protocol consequence A).
+- **The host owns the storage back-off.** After `persistFailed` Lean issues no write, and after
+  `blobStoreFailed` it requests that blob from nobody, until the host sends `retrySave` (§11 A, B;
+  sync-design §3, §5). The core keeps one timer: any `persistFailed` or `blobStoreFailed` of the
+  current epoch schedules a `retrySave` (1 s, then doubling per retry up to 60 s; reset when a
+  write succeeds — a record save or a blob stored from a peer); "Retry now" sends it at once. UI
+  queries are ordinary events again: while a save is held they cause no write. *(History: before
+  Lean held failed saves, every event retried the write; the UI's refresh queries made the first
+  version spin at 16 failed writes per second, and queries had to be deferred to a nudge timer;
+  peer events still caused 131–139 failed writes in about a second in the Firefox quota test.)*
 - **A restart cancels pending refreshes** (a stale debounced query of the old epoch was dropped
   and the new machine's file list was never requested).
 
@@ -133,14 +141,15 @@ never reach the new machine (its tags restart at 0).
 ## 4. Host obligations
 
 Audited by mutation (`node test/mutations.mjs`): for each row the mechanism was removed or broken
-in the app's source and the named test was run (e2e in Chromium); **46 of 46 mutants were caught** (the final run is reported in the branch's last hand-back).
+in the app's source and the named test was run (e2e in Chromium); **55 of 55 mutants were caught** (the final run is reported in the branch's last hand-back).
 "Mutant" names the break that was tried.
 
 | Obligation (sync-design §8, decision 7) | Mechanism | Test (fails when the mechanism is broken) | Mutant |
 |---|---|---|---|
 | Persist atomically, then `persisted tag SHA-256(bytes)` | one strict `readwrite` transaction; resolved only from `complete`; digest of exactly those bytes | unit `core` (no `persisted` while the save is held) | ack without awaiting the save |
 | Never acknowledge a failed write | request errors abort the transaction (not prevented); `abort`/exception → reject → `persistFailed` | e2e `record-request-error-not-acknowledged` (request-level fault: no ack, record unchanged, peer unaffected); unit `core`; e2e `storage-failure` | `preventDefault` on request errors; `persistFailed` dropped |
-| Retry after back-off; surface `saveFailed` until resolved | nudge timer; no host events while failing; banner + "not saved" until a later save completes | unit `core` (no event storm); e2e `storage-failure` | host refresh while failing; banner removed |
+| Retry after back-off; surface `saveFailed` until resolved | `retrySave` from the back-off timer (1 s doubling to 60 s), and from "Retry now"; banner + "not saved" until a later save completes | unit `core` (no write on 150 other events while held; one write per retry; Retry now); e2e `storage-failure` (failed writes ≤ retries + 1) | retry with no back-off; retry never sent; banner removed |
+| A blob this device could not store: not the peer's fault, retried | receive-side storage failures (file creation, write, final move) report `blobStoreFailed`, not `blobFailed`; it schedules `retrySave` like a failed save; the row says "could not be stored on this device"; a banner offers "Retry now" (without claiming unsaved changes); a store that fails after its connection closed reports nothing (Lean has re-planned the hash, maybe to another peer, and the peerless event would cancel that transfer; known limitation, §11: the event names no peer, other stale-report races not analysed) | unit `links` (incl. late failure after close, late success still reported), `core`, `view`; e2e `incoming-write-or-publish-failure` (Retry now sends `retrySave` at once; recovers in the same session), `incoming-file-creation-fails-then-next-file` | `blobFailed` instead (sink and write errors; final move); not retried (unit and e2e); shown as `waiting`; late failure reported after close; no Retry now for store failures |
 | One persist in flight; a restart waits for it | Lean issues one; the host slot is cleared only by its own write | unit `core` (back-to-back persists, then a trap) | slot cleared after the emit |
 | Blob verified and durable before `blobStored`; local blob before `localOp` | `incoming/` → hash of the stored bytes → `move()` (replacing a damaged copy) → emit | unit `links`; e2e `damaged-or-missing-blob-recovers`, `corrupted-blob…` | finish without hash; keep the damaged copy |
 | Supersede only what the user was shown | versions captured by the UI at the click, before any await | unit `core`; e2e `peer-edit-during-upload-becomes-conflict` | versions read after the upload |
@@ -161,7 +170,7 @@ in the app's source and the named test was run (e2e in Chromium); **46 of 46 mut
 | A blob is replaced only by a verified copy, never deleted first | an intact existing copy is kept; a damaged one is overwritten by one `move()` | e2e `existing-blob-kept-when-replacement-fails` | delete, then move |
 | Row statuses follow request planning | `pending` re-queried on peer changes and on `pendingSummary` | e2e `peer-leaves-mid-fetch-row-updates` | refresh removed |
 | Transport only to the serving origin | no URL parameter selects the relay | e2e `relay-parameter-ignored` (a second relay that accepts any origin sees no connection) | `?relay=` honoured |
-| A storage failure on receive stops the transfer | the first failed write rejects; no more credit; `blobFailed` + ABORT; the temp file is removed (also after a failed publish, and when a write still pending at END fails) | unit `links`; e2e `incoming-write-or-publish-failure` (a 12 MiB transfer stops after ~1 MiB) | write errors swallowed (storage or links); temp kept |
+| A storage failure on receive stops the transfer | the first failed write rejects; no more credit; `blobStoreFailed` + ABORT; the temp file is removed (also after a failed publish, and when a write still pending at END fails) | unit `links`; e2e `incoming-write-or-publish-failure` (each attempt of a 12 MiB transfer stops after ~1 MiB) | write errors swallowed (storage or links); temp kept |
 | Bounded reassembly | a continuation fragment must be exactly 16 KiB (our framing), so fragments are bounded by the message limit | unit `links` | size unchecked |
 | Paths round-trip byte for byte | `TextDecoder(fatal, ignoreBOM)`; vectors include a leading U+FEFF | unit `codec` | BOM stripped |
 | An edit is applied only to the machine the user saw | the add captures the epoch; across a restart it is dropped, and its blobs are queued as `blobsStored` for the new machine even while it is still starting | unit `core` (two tests) | epoch not checked; blobs dropped while starting |
@@ -235,11 +244,11 @@ transfer that never ends blocks every later file for every peer. Every way out, 
 |---|---|---|
 | normal | END after the last DATA | e2e (every sync) |
 | empty blob (no credit will ever come) | END right after START | unit `links`; e2e `empty-file-then-normal-file` *(review P1)* |
-| receiver cannot create the file | receiver: `blobFailed` + ABORT; sender: releases on ABORT | unit `links`; e2e `incoming-file-creation-fails-then-next-file` *(review P1)* |
+| receiver cannot create the file | receiver: `blobStoreFailed` + ABORT; sender: releases on ABORT | unit `links`; e2e `incoming-file-creation-fails-then-next-file` *(review P1)* |
 | receiver aborts for another reason (bad size, over credit, unexpected) | sender releases on ABORT | unit `links` |
 | receiving link closes mid-transfer (or ABORT lost with it) | link close releases the slot | unit `links` |
 | blob gone or unreadable on the sender | ABORT + `blobLost`, release | unit `links`; e2e `damaged-or-missing-blob-recovers` |
-| receiver cannot write (disk full, I/O error) | receiver: `blobFailed` + ABORT at the first failed write, no more credit | unit `links`; e2e `incoming-write-or-publish-failure` *(review)* |
+| receiver cannot write (disk full, I/O error) | receiver: `blobStoreFailed` + ABORT at the first failed write, no more credit | unit `links`; e2e `incoming-write-or-publish-failure` *(review)* |
 | receiver stops granting credit without saying why | sender aborts after 60 s without credit | unit `links` (short timeout) |
 
 A lost ABORT on a live link cannot happen (links are reliable and ordered); if a link breaks, its
@@ -262,7 +271,9 @@ working manual retry.
 
 As in the wireframe of the plan, plus a "saving… / saved / not saved" indicator. Rules: a file is
 "complete" only when Lean reports every version present, i.e. verified and stored; a missing version
-shows fetching (from whom), queued, waiting ("nobody reachable has it") or "not yet available";
+shows fetching (from whom), queued, waiting ("nobody reachable has it"), "could not be stored on
+this device" (the content arrived but this device's storage refused it; retried automatically) or
+"not yet available"; the summary line adds the count of the last kind;
 conflicts list their versions with Keep / Download, and Keep both for two versions (the other one
 becomes `name (2).ext`). Adding under an existing name supersedes the versions shown; Delete
 supersedes the versions shown. Flat names only: folder drops are refused with a message; a name
@@ -276,8 +287,8 @@ device) creates a second path rather than replacing it. Files over
 
 ## 10. Tests and results
 
-Unit (`node --test test/unit/*.test.mjs`): 45 tests — codec vs Lean (6), links (22), core with the
-real engine (12), relay access (2), view (3), plus the mutation audit of §4. Engine checks: §0.
+Unit (`node --test test/unit/*.test.mjs`): 47 tests — codec vs Lean (6), links (22), core with the
+real engine (14), relay access (2), view (3), plus the mutation audit of §4. Engine checks: §0.
 End-to-end (`node test/e2e/run.mjs`): 27 scenarios, 66 runs; browsers per run in the table below (Chromium 154.0.8037.92, Firefox 146.0, Firefox ESR
 140.16.0esr, all headless, each device its own browser process and profile).
 
@@ -352,36 +363,47 @@ Deviations from sync-design §8 / the plan forced by the browser:
 3. **`storage.persist()`** is requested without waiting (Firefox prompts the user).
 4. **Chromium storage-failure test** injects the IndexedDB failure (above).
 
-Consequences of the protocol design, not host bugs (left as they are in the host; proposals for the
-user):
+Consequences of the protocol design found here, both **done** (branch `protocol-retry-store`):
 
-**A. A failed save is retried on every event.** `step` sets `holdPersist` on `persistFailed` and
-clears it at the end of the same step (sync-design §3, `persistFailed_no_retry_in_step`), so the
-*next* event of any kind issues a new `persist` with the latest state. The host can delay only its
-own events; peer messages and blob completions keep arriving. Observed: in the Firefox quota test,
-while 150 files arrived from a peer, 131–139 writes were attempted and failed within about a
-second. Each is cheap (the write is refused), but the host cannot apply a back-off.
-*Possible `LeanSync` change:* keep `holdPersist` set across events until the host sends a new event
-`retrySave` (event tag 13). `persistFailed` would then mean "stop saving until told", and the host
-would own the back-off (it already has the timer and the "Retry now" button). Effects on the
-proofs: `persistFailed_no_retry_in_step` generalises to "no `persist` between `persistFailed` and the
-next `retrySave`"; `save_before_send`, `persist_one_in_flight` and executability are unaffected,
-because nothing new is published while held; the local-settling statements need the hypothesis that
-the host eventually sends `retrySave`. The event envelope changes, which is host↔Lean only (no peer
-compatibility issue).
+**A. A failed save was retried on every event — done.** `step` used to clear `holdPersist` at the
+end of the step that handled `persistFailed`, so the *next* event of any kind issued a new
+`persist`; in the Firefox quota test, while 150 files arrived from a peer, 131–139 writes were
+attempted and failed within about a second, and the host could not apply a back-off. Now
+`persistFailed` holds the node until the host sends the new event `retrySave` (event tag 13), and
+the host owns the back-off (§3). Measured in the same test (`storage-failure`, about 4 s of failing
+storage, two runs each): on `main` 132 and 134 failed writes in Firefox 146, 141 and 138 in Firefox
+ESR 140; on this branch 3 or 4 in Firefox 146 and 3 or 4 in ESR 140 over the final runs (one per retry,
+1 s and 2 s back-off, plus the first). Chromium,
+where the record failure is injected and no peer events arrive meanwhile, had 3 before and after. `retrySave` when
+nothing is held issues no write (proved), so "Retry now" is always safe. Proofs:
+`persistFailed_no_retry_in_step` is unchanged and generalises to `held_no_persist` and the trace
+form `persistFailed_no_persist_until_retry` (no `persist` from a `persistFailed` up to the next
+`retrySave`); liveness is `retrySave_releases` / `retrySave_persists`; `save_before_send`,
+`persist_one_in_flight` and executability are unchanged (sync-design §3, §9).
 
-**B. A local storage failure looks like a peer failure.** The only event for a transfer that did
-not end in a stored blob is `blobFailed p h`, which records `h` as lacking at `p` for the rest of
-the session (sync-design §5). When the bytes arrived intact but *this* device could not store them
-(quota, I/O error), the host must still send `blobFailed`; after space is freed the blob is fetched
-again only in a later session (reconnect, or toggling "online"). The file shows "waiting: nobody
-reachable has it", which is not true.
-*Possible `LeanSync` change:* a distinct event `blobStoreFailed h` (tag 14) that removes `h` from
-the session's `inflight` without adding it to `lacks`, and parks it in a node-level `localFailed`
-set that the planner skips until `retrySave` (A) or a new event `storageAvailable`; a pending
-status `localFailure` (and a fourth `pendingSummary` count) would let the UI say "could not be
-stored on this device". Effects: `step_plans_blobs` gains a disjunct for parked hashes; the
-effects envelope (pending reply, summary notice) changes, again host↔Lean only.
+**B. A local storage failure looked like a peer failure — done.** The host could only report
+`blobFailed p h`, which records `h` as lacking at `p` for the session, so the file showed "waiting:
+nobody reachable has it" and was fetched again only in a later session. Now receive-side storage
+failures (temporary file, write, final move) report `blobStoreFailed h` (event tag 14): Lean takes
+`h` out of flight without blaming the peer and parks it; the planner skips parked hashes until the
+next `retrySave`, which the host sends on the same back-off (and a restart starts with nothing
+parked), so a parked blob always gets another chance in the same session. The `pending` reply has
+a fourth status `localFailure` and `pendingSummary` a fourth count; the UI says "could not be
+stored on this device". Proofs: `blobStoreFailed_parks` (parked, in flight nowhere, no session's
+`lacks` changes); `step_plans_blobs` gains the disjunct "parked" (a deliberate weakening,
+sync-design §9). E2e: `incoming-write-or-publish-failure` and
+`incoming-file-creation-fails-then-next-file` now show the new status and recover without a
+reconnect once storage works again.
+
+**Known limitation (not fixed, by decision).** `blobStoreFailed h` names no peer, so Lean cannot
+tell a stale report from a current one: a report that arrives after `h` was re-planned to another
+peer clears that peer's request and parks `h` while its transfer may still be running. The host
+must therefore not send `blobStoreFailed` for a connection that is no longer alive (covered by
+the unit test in `test/unit/links.test.mjs` "a store that fails after the link closed (END already received): no failure event, sink aborted; a late success is still reported", and the mutant `late-store-failure-after-close` in `test/mutations.mjs`). Other stale-report races, e.g. a reconnect before a slow failure, have not been analysed.
+The possible fix is `blobStoreFailed p h`, acting only when `h` is in flight at `p` (as `blobFailed
+p h` does): one more varint in event tag 14; `handle` takes the `blobFailed` shape, so its proof
+cases follow the existing `blobFailed` ones; `blobStoreFailed_parks` gains the hypothesis "`h` is in
+flight at `p`"; about an hour of work. Not doing it now was a deliberate decision by the user.
 
 Planned in the stage-1 note and not done:
 - Relay faults are injected at the relay, not by a "corrupting relay mode" per link direction for

@@ -10,10 +10,12 @@ scale [n] | control [n] | deep [n] | debug seed | trace seed count file | vector
 
 * `unit`      hand-written flows: handshake, state exchange, persist-before-send, stale events,
               protocol errors, blob re-planning, the `noBlob` → `have` chain, rollback mode,
-              start-up errors, pending summary, queries;
+              start-up errors, pending summary, queries, failed saves held until `retrySave`,
+              blobs parked by `blobStoreFailed` (a storage-full storm of 150 files);
 * `codec`     round trips (states, messages, events, effects) and a fuzz of the decoders:
               every prefix truncation of several encodings, random mutations, random bytes;
-* `sim`       a seeded multi-device simulator with a model host and network, fault injection,
+* `sim`       a seeded multi-device simulator with a model host and network, fault injection
+              (including storage-full periods: failed writes, `blobStoreFailed`, `retrySave`),
               per-step checks (save-before-send, a global dot registry, executability of every
               effect, node invariants) and a convergence check after a quiescence phase;
 * `mutation`  the simulator run on deliberately broken step functions, each of which must be caught;
@@ -128,6 +130,15 @@ structure Dev where
   pending : Option (Nat × ByteArray) := none
   acked : Array ByteArray := #[]
   inc : Nat := 0
+  /-- Storage is full: every write of the record and every blob store fails. -/
+  full : Bool := false
+  /-- The host reported `persistFailed` and has not sent `retrySave` since: Lean must not ask
+  for a write (checked on every persist effect). -/
+  held : Bool := false
+  /-- The host owes Lean a `retrySave` (a save or a blob store failed since the last one). -/
+  owesRetry : Bool := false
+  /-- Blobs Lean parked after `blobStoreFailed` (since the last `retrySave`): never fetched. -/
+  parked : List Hash := []
 
 instance : Inhabited Dev := ⟨{ replica := ⟨0, 0⟩ }⟩
 
@@ -149,6 +160,10 @@ structure Stats where
   viaProcess : Nat := 0
   closes : Nat := 0
   stepNanos : Nat := 0
+  storeFails : Nat := 0
+  retries : Nat := 0
+  fullPeriods : Nat := 0
+  heldEvents : Nat := 0
 
 structure World where
   devs : Array Dev
@@ -163,6 +178,7 @@ structure World where
   violations : Array String := #[]
   registry : Std.HashMap (UInt64 × UInt64 × Nat) (String × Hash) := {}
   log : Array (Nat × Effect) := #[]
+  evlog : Array (Nat × Event) := #[]
   keepLog : Bool := false
   work : Array (Nat × Event) := #[]
   stats : Stats := {}
@@ -295,9 +311,13 @@ def runEffect (d : Nat) (e : Effect) : WM Unit := do
   | .persist t s =>
     let dev ← getDev d
     if dev.pending.isSome then violate s!"device {d}: second persist while one is pending"
+    if dev.held then violate s!"device {d}: persist while held (a save failed and no retrySave since)"
     setDev d { dev with pending := some (t, encodeState s) }
   | .fetch p hs =>
     modStats fun s => { s with fetches := s.fetches + 1 }
+    let dev ← getDev d
+    if hs.any (dev.parked.contains ·) then
+      violate s!"device {d}: fetched a blob it parked (blobStoreFailed) before any retrySave"
     addExpect p.val.toNat d hs
     checkOrder p.val.toNat d (.want hs)
     let _ ← pushItem p.val.toNat d (.msg (encodeMessage (.want hs)))
@@ -325,6 +345,7 @@ def traceRec (kind : UInt8) (d : Nat) (ev out : ByteArray) : WM Unit := do
 effect against the host view, carry the effects out, check the node. -/
 def processEvent (d : Nat) (ev : Event) : WM Unit := do
   modStats fun s => { s with events := s.events + 1 }
+  if (← get).keepLog then modify fun w => { w with evlog := w.evlog.push (d, ev) }
   let dev ← getDev d
   let w ← get
   if w.keepTrace then
@@ -356,6 +377,24 @@ def processEvent (d : Nat) (ev : Event) : WM Unit := do
       match view.exec e with
       | some v => view := v
       | none => violate s!"device {d}: effect not executable: {showEff e} (after event)"
+  -- the storage-failure protocol (retrySave / blobStoreFailed), checked against the model host
+  let mut dev := dev
+  if dev.held then modStats fun s => { s with heldEvents := s.heldEvents + 1 }
+  match ev, dev.m, m' with
+  | .persistFailed _, .running _, .running _ => dev := { dev with held := true, owesRetry := true }
+  | .retrySave, .running _, .running _ =>
+    if !dev.held && effs.any (fun | .persist .. => true | _ => false) then
+      violate s!"device {d}: retrySave while not held issued a persist"
+    dev := { dev with held := false, owesRetry := false, parked := [] }
+  | .blobStoreFailed h, .running n, .running n' =>
+    for x in n'.sessions do
+      if x.lacks.contains h && !(n.sessions.any (fun y => y.peer == x.peer && y.lacks.contains h)) then
+        violate s!"device {d}: blobStoreFailed blamed peer {x.peer.val} (lacks)"
+      if x.inflight.contains h then violate s!"device {d}: blob still in flight after blobStoreFailed"
+    if n.missing.contains h then
+      if n'.parked.contains h then dev := { dev with parked := h :: dev.parked, owesRetry := true }
+      else violate s!"device {d}: blobStoreFailed did not park a missing blob"
+  | _, _, _ => pure ()
   setDev d { dev with m := m', view := view }
   for e in effs do runEffect d e
   checkNode d
@@ -398,18 +437,26 @@ def connect (i j : Nat) : WM Nat := do
   drainWork
   return id
 
-def ackPersist (d : Nat) : WM Unit := do
-  let dev ← getDev d
-  if let some (t, bytes) := dev.pending then
-    setDev d { dev with record := some bytes, acked := dev.acked.push bytes, pending := none }
-    feed d (.persisted t (digestOf bytes))
-
 def failPersist (d : Nat) : WM Unit := do
   let dev ← getDev d
   if let some (t, _) := dev.pending then
     modStats fun s => { s with persistFails := s.persistFails + 1 }
     setDev d { dev with pending := none }
     feed d (.persistFailed t)
+
+/-- Complete the pending write: it succeeds, unless the device's storage is full. -/
+def ackPersist (d : Nat) : WM Unit := do
+  let dev ← getDev d
+  if dev.full then failPersist d
+  else if let some (t, bytes) := dev.pending then
+    setDev d { dev with record := some bytes, acked := dev.acked.push bytes, pending := none }
+    feed d (.persisted t (digestOf bytes))
+
+/-- The host's back-off fired (or the user pressed "Retry now"). -/
+def retrySave (d : Nat) : WM Unit := do
+  if ← (do match (← getDev d).m with | .running _ => pure true | .uninit => pure false) then
+    modStats fun s => { s with retries := s.retries + 1 }
+    feed d .retrySave
 
 /-- Deliver the head of one direction of a connection. `failBlob` turns a blob into a failure. -/
 def deliver (id : Nat) (fromA : Bool) (failBlob : Bool := false) : WM Unit := do
@@ -439,6 +486,10 @@ def deliver (id : Nat) (fromA : Bool) (failBlob : Bool := false) : WM Unit := do
         if failBlob then
           modStats fun s => { s with blobFails := s.blobFails + 1 }
           feed dst (.blobFailed p h)
+        else if (← getDev dst).full then
+          -- the bytes arrived intact, but this device cannot store them: not the peer's fault
+          modStats fun s => { s with storeFails := s.storeFails + 1 }
+          feed dst (.blobStoreFailed h)
         else
           let dev ← getDev dst
           setDev dst { dev with store := dev.store.insert h }
@@ -480,6 +531,7 @@ def crash (d : Nat) : WM Unit := do
   let record := match dev.pending with
     | some (_, b) => if completes then some b else dev.record
     | none => dev.record
+  let dev := { dev with held := false, owesRetry := false, parked := [] }
   setDev d { dev with m := .uninit, view := {}, pending := none, record, inc := dev.inc + 1 }
   traceRec 1 d .empty .empty
   let ids := (← get).conns.filter (fun c => c.a == d || c.b == d) |>.map (·.id)
@@ -600,6 +652,17 @@ def randomStep : WM Unit := do
   else if r < 90 then crash (← rand nd)
   else if r < 92 then injectFault
   else if r < 93 then loseBlob
+  else if r < 96 then
+    -- the host's back-off fires on a device that owes a retry; sometimes on one that does not
+    let owing := (List.range nd).filter (fun i => w.devs[i]!.owesRetry)
+    if !owing.isEmpty && (← rand 4) != 0 then retrySave owing[← rand owing.length]!
+    else retrySave (← rand nd)
+  else if r < 97 then
+    -- storage fills up or is freed (while full, every write and every blob store fails)
+    let d ← rand nd
+    let dev ← getDev d
+    unless dev.full do modStats fun s => { s with fullPeriods := s.fullPeriods + 1 }
+    setDev d { dev with full := !dev.full }
   else pure ()
 
 /-- Deliver everything and acknowledge every persist until nothing moves. -/
@@ -613,7 +676,11 @@ partial def drainAll (fuel : Nat) : WM Bool := do
     let w ← get
     match w.devs.findIdx? (·.pending.isSome) with
     | some d => ackPersist d; drainAll (fuel - 1)
-    | none => return true
+    | none =>
+      -- the host's back-off timers: every device that owes a retry gets one
+      match w.devs.findIdx? (fun x => x.owesRetry && !x.full) with
+      | some d => retrySave d; drainAll (fuel - 1)
+      | none => return true
 
 def dropAll : WM Unit := do
   for c in (← get).conns do dropConn c.id
@@ -635,12 +702,18 @@ def checkConverged : WM Unit := do
       | some P => unless P.state.beq n.current do violate s!"device {d}: published ≠ current at quiescence"
       | none => violate s!"device {d}: nothing published at quiescence"
       if n.inflight.isSome || dev.pending.isSome then violate s!"device {d}: persist in flight at quiescence"
-      unless n.missing.isEmpty do violate s!"device {d}: {n.missing.length} blob(s) still missing at quiescence"
+      unless n.missing.isEmpty do
+        let holders := (List.range w.devs.size).filter (fun i => n.missing.any (w.devs[i]!.store.contains ·))
+        violate s!"device {d}: {n.missing.length} blob(s) still missing at quiescence (parked {n.parked.length}, held {n.holdPersist}, owes retry {dev.owesRetry}, devices holding one: {holders})"
       for e in n.current.entries do
         unless dev.store.contains e.hash do violate s!"device {d}: blob of {e.path} absent from the host store"
 
 /-- Quiescence: no more operations or faults; fresh sessions in a connected topology; drain. -/
 def quiesce (variant : Nat) (ackFirst : Bool := false) : WM Unit := do
+  -- storage is freed everywhere
+  for d in [0:(← get).devs.size] do
+    let dev ← getDev d
+    setDev d { dev with full := false }
   dropAll
   if ackFirst then
     unless ← drainAll 2000000 do violate "did not quiesce"
@@ -655,8 +728,11 @@ def quiesce (variant : Nat) (ackFirst : Bool := false) : WM Unit := do
     for i in [0:nd-1] do let _ ← connect i (i + 1)
     unless ← drainAll fuel do violate "chain: did not quiesce"
   | _ =>   -- sequential pairwise sessions, only two devices online at a time
-    let pairs := (List.range (nd - 1)).map (fun i => (i, i + 1)) ++
-      ((List.range (nd - 1)).reverse.map (fun i => (i + 1, i)))
+    -- forward, backward, forward again: an index entry that starts at the last device and whose
+    -- bytes exist only at the first ones needs the backward pass for the index and a second
+    -- forward pass for the bytes
+    let fwd := (List.range (nd - 1)).map (fun i => (i, i + 1))
+    let pairs := fwd ++ ((List.range (nd - 1)).reverse.map (fun i => (i + 1, i))) ++ fwd
     for (i, j) in pairs do
       let id ← connect i j
       unless ← drainAll fuel do violate "pairwise: did not quiesce"
@@ -694,12 +770,15 @@ def simTests (c : Ctx) (seed count : Nat) (nd steps : Nat := 4) (steps' : Nat :=
              persistFails := tot.persistFails + st.persistFails, blobFails := tot.blobFails + st.blobFails,
              blobLosses := tot.blobLosses + st.blobLosses, garbage := tot.garbage + st.garbage,
              truncs := tot.truncs + st.truncs, dups := tot.dups + st.dups,
-             viaProcess := tot.viaProcess + st.viaProcess, closes := tot.closes + st.closes }
+             viaProcess := tot.viaProcess + st.viaProcess, closes := tot.closes + st.closes,
+             storeFails := tot.storeFails + st.storeFails, retries := tot.retries + st.retries,
+             fullPeriods := tot.fullPeriods + st.fullPeriods, heldEvents := tot.heldEvents + st.heldEvents }
     check c s!"sim seed {s}" vs.isEmpty (fun _ => s!"(seed {s}) {vs.size} violation(s), first: {vs.toList.take 2}")
     unless vs.isEmpty do bad := bad + 1
   IO.println s!"sim: seeds {seed}..{seed + count - 1}, {nd} devices, {steps'} random steps + quiescence per seed; {bad} failing seed(s)"
   IO.println s!"  totals: events {tot.events} (via byte boundary {tot.viaProcess}), local ops {tot.localOps}, state sends {tot.stateSends}, fetches {tot.fetches}, blobs delivered {tot.blobsDelivered}, connects {tot.connects}"
   IO.println s!"  faults: drops {tot.drops}, crashes {tot.crashes}, persist failures {tot.persistFails}, blob failures {tot.blobFails}, blob losses {tot.blobLosses}, garbage {tot.garbage}, truncated {tot.truncs}, duplicated {tot.dups}, sessions closed by Lean {tot.closes}"
+  IO.println s!"  storage: full periods {tot.fullPeriods}, blob store failures {tot.storeFails}, retrySave events {tot.retries}, events handled while held {tot.heldEvents} (no persist issued while held: checked)"
 
 /-! ## Mutation check: broken step functions must be caught -/
 
@@ -734,6 +813,32 @@ def mutSendAfterClose (m : Machine) (ev : Event) : Machine × List Effect :=
   match ev with
   | .disconnected p => (m', effs ++ [.send p (.digest (digestOf ByteArray.empty))])
   | _ => (m', effs)
+
+/-- (e) the behaviour before `retrySave`: the hold lasts only for the failing step, so the next
+event of any kind issues a new persist (a write storm while storage is full). -/
+def mutRetryEveryEvent (m : Machine) (ev : Event) : Machine × List Effect :=
+  match m, ev with
+  | .running n, .persistFailed _ => step (.running n) ev
+  | .running n, _ => step (.running { n with holdPersist := false }) ev
+  | _, _ => step m ev
+
+/-- (f) `retrySave` does not release parked blobs (they would stay parked for the session). -/
+def mutKeepParked (m : Machine) (ev : Event) : Machine × List Effect :=
+  match m, ev with
+  | .running n, .retrySave =>
+    match step m ev with
+    | (.running n', effs) => (.running { n' with parked := n.parked }, effs)
+    | r => r
+  | _, _ => step m ev
+
+/-- (g) a local storage failure blames the peer, as the host had to before `blobStoreFailed`. -/
+def mutBlameOnStore (m : Machine) (ev : Event) : Machine × List Effect :=
+  match m, ev with
+  | .running n, .blobStoreFailed h =>
+    match n.sessions.find? (fun s => h ∈ s.inflight) with
+    | some s => step m (.blobFailed s.peer h)
+    | none => step m ev
+  | _, _ => step m ev
 
 /-! ## Unit tests -/
 
@@ -810,7 +915,9 @@ def mutRun (s : Nat) (f : Machine → Event → Machine × List Effect) : IO (Ar
 def mutationTests (c : Ctx) (budget : Nat := 30) : IO Unit := do
   let muts : List (String × (Machine → Event → Machine × List Effect)) :=
     [("state sends carry current", mutCurrent), ("no have", mutNoHave),
-     ("ignore received states", mutIgnoreState), ("send after disconnect", mutSendAfterClose)]
+     ("ignore received states", mutIgnoreState), ("send after disconnect", mutSendAfterClose),
+     ("persist retried on every event", mutRetryEveryEvent), ("retrySave keeps blobs parked", mutKeepParked),
+     ("local store failure blames the peer", mutBlameOnStore)]
   for (name, f) in muts do
     let mut caught := 0
     let mut firstMsg := ""
@@ -1028,13 +1135,13 @@ def unitTests (c : Ctx) : IO Unit := do
   -- device 1 knows "x" but nobody reachable has the blob
   let n1 := (nodeOr w 1).get!
   check c "pending: one missing blob" (n1.missing == [h32 11])
-  check c "pendingSummary: waiting" (n1.summary == (0, 0, 1)) (fun _ => toString n1.summary)
+  check c "pendingSummary: waiting" (n1.summary == (0, 0, 1, 0)) (fun _ => toString n1.summary)
   let (_, w) ← runW { w with log := #[] } do
     let _ ← connect 1 0
     deliverMsgs
   let n1 := (nodeOr w 1).get!
-  check c "pendingSummary: fetching" (n1.summary == (1, 0, 0)) (fun _ => toString n1.summary)
-  check c "pendingSummary notice emitted" (hasNotice (logOf w 1) (fun | .pendingSummary 1 0 0 => true | _ => false))
+  check c "pendingSummary: fetching" (n1.summary == (1, 0, 0, 0)) (fun _ => toString n1.summary)
+  check c "pendingSummary notice emitted" (hasNotice (logOf w 1) (fun | .pendingSummary 1 0 0 0 => true | _ => false))
   let (_, w) ← runW { w with log := #[] } do
     feed 1 (.query .snapshot); feed 1 (.query .pending); feed 1 (.query .status)
   let replies := (logOf w 1).filterMap (fun | .reply r => some r | _ => none)
@@ -1064,7 +1171,7 @@ def unitTests (c : Ctx) : IO Unit := do
     clearLog
     feed 1 (.query .pending)
   let n1 := (nodeOr w 1).get!
-  check c "queued: summary is 32 fetching, 1 queued, 0 waiting" (n1.summary == (32, 1, 0))
+  check c "queued: summary is 32 fetching, 1 queued, 0 waiting" (n1.summary == (32, 1, 0, 0))
     (fun _ => toString n1.summary)
   let pend := (logOf w 1).filterMap (fun | .reply (.pending items) => some items | _ => none)
   let items := pend.headD []
@@ -1089,7 +1196,7 @@ def unitTests (c : Ctx) : IO Unit := do
     let _ ← connect 0 1
     syncMsgs
   let n1 := (nodeOr w 1).get!
-  check c "late inventory: the peer was told noBlob, so the blob is waiting" (n1.summary == (0, 0, 1))
+  check c "late inventory: the peer was told noBlob, so the blob is waiting" (n1.summary == (0, 0, 1, 0))
     (fun _ => toString n1.summary)
   let (_, w) ← runW { w with log := #[] } do
     feed 0 (.blobsStored [h32 600])
@@ -1099,7 +1206,8 @@ def unitTests (c : Ctx) : IO Unit := do
     | .send _ (.have [h]) => h == h32 600 | _ => false)
   check c "late inventory: converges once the inventory arrives" w.violations.isEmpty
     (fun _ => toString w.violations)
-  -- 11d. a failed persist: notice, no retry in the same step, retry with the latest state later
+  -- 11d. a failed persist: notice, then held (no persist on any event) until `retrySave`, which
+  -- writes the latest state
   let (_, w) ← runW (unitWorld 1) do
     boot 0; ackPersist 0
     putOp 0 "f" (h32 700)
@@ -1108,16 +1216,35 @@ def unitTests (c : Ctx) : IO Unit := do
   let effs := logOf w 0
   check c "persistFailed: saveFailed notice" (hasNotice effs (fun | .saveFailed => true | _ => false))
   check c "persistFailed: no persist in the same step" (!effs.any (fun | .persist _ _ => true | _ => false))
+  check c "persistFailed: the node is held" ((nodeOr w 0).any (·.holdPersist))
   let (_, w) ← runW { w with log := #[] } do
     for t in [0:5] do feed 0 (.persistFailed (100 + t))   -- stale or duplicated failures
-    putOp 0 "g" (h32 701)              -- the next real event
+    putOp 0 "g" (h32 701)              -- real events of every other kind
+    feed 0 (.query .status); feed 0 (.connected ⟨90⟩); feed 0 (.disconnected ⟨90⟩)
+    let dev ← getDev 0
+    setDev 0 { dev with store := dev.store.insert (h32 702) }
+    feed 0 (.blobsStored [h32 702])
+    let dev ← getDev 0
+    setDev 0 { dev with store := dev.store.erase (h32 702) }
+    feed 0 (.blobLost (h32 702)); feed 0 (.blobStoreFailed (h32 703))
   let effs := logOf w 0
-  let persists := effs.filterMap (fun | .persist _ s => some s | _ => none)
-  check c "stale failures alone trigger no write" (persists.length == 1)
-    (fun _ => s!"{persists.length} persists")
-  check c "the next event retries with the latest state" (match persists, nodeOr w 0 with
+  check c "held: no event other than retrySave issues a write"
+    (!effs.any (fun | .persist _ _ => true | _ => false)) (fun _ => toString (effs.map showEff))
+  check c "held: still held and dirty" ((nodeOr w 0).any (fun n => n.holdPersist && n.dirty))
+  let (_, w) ← runW { w with log := #[] } do
+    feed 0 .retrySave
+  let persists := (logOf w 0).filterMap (fun | .persist _ s => some s | _ => none)
+  check c "retrySave writes the latest state, once" (match persists, nodeOr w 0 with
     | [s], some n => s.beq n.current && (n.current.versions "f").length == 1 && (n.current.versions "g").length == 1
-    | _, _ => false)
+      && !n.holdPersist
+    | _, _ => false) (fun _ => s!"{persists.length} persists")
+  let (_, w) ← runW { w with log := #[] } do
+    ackPersist 0
+    clearLog
+    feed 0 .retrySave; feed 0 .retrySave          -- not held, nothing parked: no-ops
+  check c "retrySave when not held: no persist, no effect"
+    ((logOf w 0).isEmpty) (fun _ => toString ((logOf w 0).map showEff))
+  check c "no violations (11d)" w.violations.isEmpty (fun _ => toString w.violations)
   -- 11e. a host whose storage always fails: failure events alone end the exchange
   let (_, w) ← runW (unitWorld 1) do
     boot 0; ackPersist 0
@@ -1134,6 +1261,56 @@ def unitTests (c : Ctx) : IO Unit := do
     rounds := rounds + 1
   check c "always-failing host: the failure loop ends after one round" (pending.isEmpty && rounds == 1)
     (fun _ => s!"{rounds} rounds")
+  -- 11g. storage full while 150 files arrive (the storm of app-design §11 A and B): count the
+  -- writes Lean asks for, with this step function and with the old one (retry on every event)
+  let storm (f : Machine → Event → Machine × List Effect) : IO (Nat × Nat × World) := do
+    let (_, w) ← runW { unitWorld 2 with stepFn := f } do
+      for d in [0:2] do boot d; ackPersist d
+      let items := (List.range 150).map (fun i => ({ path := s!"s/{i}", hash := h32 (800 + i), supersedes := [] } : PutItem))
+      let dev ← getDev 0
+      setDev 0 { dev with store := items.foldl (fun st it => st.insert it.hash) dev.store }
+      feed 0 (.localOp (.putMany items)); ackPersist 0
+      let dev ← getDev 1
+      setDev 1 { dev with full := true }
+      clearLog
+      let _ ← connect 0 1
+      -- deliver everything (messages and blob streams); every write and store on device 1 fails
+      for _ in [0:100000] do
+        let dirs ← busyDirs
+        -- a write to a full disk fails at once, so each failure is reported before the next event
+        if (← getDev 1).pending.isSome then ackPersist 1
+        else if (← getDev 0).pending.isSome then ackPersist 0
+        else if let some (id, fromA) := dirs[0]? then deliver id fromA
+        else break
+    let effs := logOf w 1
+    return ((effs.filter (fun | .persist .. => true | _ => false)).length,
+      (effs.filter (fun | .fetch .. => true | _ => false)).length, w)
+  let (wNew, fNew, w) ← storm step
+  let (wOld, _, _) ← storm mutRetryEveryEvent
+  IO.println s!"storage full while 150 files arrive: {wNew} write(s) requested (old behaviour: {wOld}); {fNew} fetch(es)"
+  check c "storm: one failed write, then held (was one per event)" (wNew == 1 && wOld > 100)
+    (fun _ => s!"{wNew} vs {wOld}")
+  let n1 := (nodeOr w 1).get!
+  check c "storm: every blob parked, none blamed on the peer" (n1.parked.length == 150 &&
+    n1.sessions.all (fun x => x.lacks.isEmpty && x.inflight.isEmpty)) (fun _ => s!"{n1.parked.length}")
+  check c "storm: summary counts 150 blobs that could not be stored" (n1.summary == (0, 0, 0, 150))
+    (fun _ => toString n1.summary)
+  let (_, w) ← runW { w with log := #[] } do
+    feed 1 (.query .pending)
+  let st := ((logOf w 1).filterMap (fun | .reply (.pending items) => some items | _ => none)).headD []
+  check c "storm: pending reply says localFailure for all 150" (st.length == 150 &&
+    st.all (fun x => match x.2 with | .localFailure => true | _ => false))
+  -- space is freed, the host's back-off fires: the latest state is written and the blobs are
+  -- fetched again from the same peer, which was never marked as lacking them
+  let (_, w) ← runW { w with log := #[] } do
+    let dev ← getDev 1
+    setDev 1 { dev with full := false }
+    retrySave 1
+    let _ ← drainAll 100000
+    checkConverged
+  check c "storm: after retrySave, one write and re-fetch from the same peer"
+    ((logOf w 1).any (fun | .persist .. => true | _ => false) && (logOf w 1).any (fun | .fetch .. => true | _ => false))
+  check c "storm: converges after retrySave" w.violations.isEmpty (fun _ => toString w.violations)
   -- 11f. operations that change nothing schedule no write and no notice
   let (_, w) ← runW (unitWorld 1) do
     boot 0; ackPersist 0
@@ -1202,7 +1379,7 @@ def randomMessage (st : State) : RM Message := do
 
 def randomEvent (st : State) : RM Event := do
   let p : PeerId := ⟨(← rr 70000).toUInt32⟩
-  match ← rr 14 with
+  match ← rr 16 with
   | 0 => return .init ⟨1, (← rr 99).toUInt64⟩ (encodeState st) (← randomHashes (← rr 5))
   | 1 => return .initFresh ⟨2, 3⟩ (← randomHashes (← rr 5))
   | 2 => return .connected p
@@ -1217,6 +1394,8 @@ def randomEvent (st : State) : RM Event := do
   | 10 => return .blobStored (h32 (← rr 9)) (if (← rr 2) == 0 then none else some p)
   | 11 => return .blobFailed p (h32 7)
   | 12 => return .blobLost (h32 8)
+  | 13 => return .retrySave
+  | 14 => return .blobStoreFailed (h32 (← rr 9))
   | _ => return .query #[Query.snapshot, .pending, .status][← rr 3]!
 
 def randomEffects (st : State) : RM (List Effect) := do
@@ -1233,9 +1412,10 @@ def randomEffects (st : State) : RM (List Effect) := do
     let notices : Array Notice := #[Notice.indexChanged, .blobsChanged, .peerStatus p .inSync (some ⟨1, 2⟩),
       .peerClosed p .incompatible true, .peerLeft p, .peerError p (.badVersion 7), .rollbackDetected,
       .opRejected "nope é", .badEvent .trailing, .startupFailed .nonCanonical, .notInitialized,
-      .alreadyInitialized, .pendingSummary 3 5 4, .saveFailed]
+      .alreadyInitialized, .pendingSummary 3 5 4 2, .saveFailed]
     let replies : Array Reply := #[Reply.snapshot [("a", [⟨h32 1, true⟩, ⟨h32 2, false⟩]), ("b", [])],
-      .pending [(h32 3, .waiting), (h32 4, .requested p), (h32 5, .queued)], .status true false true [(p, .syncing)]]
+      .pending [(h32 3, .waiting), (h32 4, .requested p), (h32 5, .queued), (h32 6, .localFailure)],
+      .status true false true [(p, .syncing)]]
     let e : Effect :=
       if k == 0 then .send p m
       else if k == 1 then .close p .stateTooLarge
@@ -1473,6 +1653,8 @@ def jEvent : Event → String
   | .blobFailed p h => jObj [("type", jStr "blobFailed"), ("peer", jPeer p), ("hash", jHash h)]
   | .blobLost h => jObj [("type", jStr "blobLost"), ("hash", jHash h)]
   | .query q => jObj [("type", jStr "query"), ("q", jStr (match q with | .snapshot => "snapshot" | .pending => "pending" | .status => "status"))]
+  | .retrySave => jObj [("type", jStr "retrySave")]
+  | .blobStoreFailed h => jObj [("type", jStr "blobStoreFailed"), ("hash", jHash h)]
 
 def jReason : CloseReason → String
   | .protocolError => jStr "protocolError" | .incompatible => jStr "incompatible"
@@ -1501,13 +1683,15 @@ def jNotice : Notice → List (String × String)
   | .badEvent e => [("notice", jStr "badEvent")] ++ jErr e
   | .saveFailed => [("notice", jStr "saveFailed")]
   | .startupFailed e => [("notice", jStr "startupFailed")] ++ jErr e
-  | .pendingSummary f q w => [("notice", jStr "pendingSummary"), ("fetching", toString f), ("queued", toString q), ("waiting", toString w)]
+  | .pendingSummary f q w l => [("notice", jStr "pendingSummary"), ("fetching", toString f), ("queued", toString q),
+      ("waiting", toString w), ("localFailure", toString l)]
   | .notInitialized => [("notice", jStr "notInitialized")]
   | .alreadyInitialized => [("notice", jStr "alreadyInitialized")]
 def jPend : Hash × PendingStatus → String
   | (h, .requested p) => jObj [("hash", jHash h), ("status", jStr "requested"), ("peer", jPeer p)]
   | (h, .queued) => jObj [("hash", jHash h), ("status", jStr "queued")]
   | (h, .waiting) => jObj [("hash", jHash h), ("status", jStr "waiting")]
+  | (h, .localFailure) => jObj [("hash", jHash h), ("status", jStr "localFailure")]
 def jReply : Reply → List (String × String)
   | .snapshot files => [("reply", jStr "snapshot"), ("files", jArr (files.map fun (p, vs) =>
       jObj [("path", jStr p), ("versions", jArr (vs.map fun v => jObj [("hash", jHash v.hash), ("present", jBool v.present)]))]))]
@@ -1539,7 +1723,8 @@ def sampleEvents (st : State) : List Event :=
     .blobStored (h32 10) none, .blobStored (h32 11) (some p),
     .blobsStored [], .blobsStored ((List.range 300).map h32),
     .blobFailed ⟨5⟩ (h32 12), .blobLost (h32 13),
-    .query .snapshot, .query .pending, .query .status ]
+    .query .snapshot, .query .pending, .query .status,
+    .retrySave, .blobStoreFailed (h32 14) ]
 
 def sampleEffectLists (st : State) : List (List Effect) :=
   let p : PeerId := ⟨77⟩
@@ -1555,11 +1740,12 @@ def sampleEffectLists (st : State) : List (List Effect) :=
     [.notify .indexChanged, .notify .blobsChanged, .notify (.peerStatus p .handshaking none),
      .notify (.peerStatus p .syncing (some ⟨0xFFFFFFFFFFFFFFFF, 0⟩)), .notify (.peerStatus p .inSync (some ⟨3, 4⟩)),
      .notify (.peerLeft p), .notify .rollbackDetected, .notify (.opRejected "path too long: é"), .notify .notInitialized,
-     .notify .alreadyInitialized, .notify (.pendingSummary 0 0 0), .notify (.pendingSummary 32 1 4096), .notify .saveFailed],
+     .notify .alreadyInitialized, .notify (.pendingSummary 0 0 0 0), .notify (.pendingSummary 32 1 4096 300),
+     .notify (.pendingSummary 0 0 0 1099511627776), .notify .saveFailed],
     reasons.map (fun r => .notify (.peerClosed p r (r == .incompatible))),
     errs.map (fun e => .notify (.peerError p e)) ++ errs.map (fun e => .notify (.badEvent e)) ++ errs.map (fun e => .notify (.startupFailed e)),
     [.reply (.snapshot []), .reply (.snapshot [("a", [⟨h32 1, true⟩, ⟨h32 2, false⟩]), ("b/ü", []), ("c", [⟨h32 3, false⟩]), ("\uFEFFbom", [⟨h32 4, true⟩])]),
-     .reply (.pending []), .reply (.pending [(h32 3, .waiting), (h32 4, .requested p), (h32 5, .queued)]),
+     .reply (.pending []), .reply (.pending [(h32 3, .waiting), (h32 4, .requested p), (h32 5, .queued), (h32 6, .localFailure)]),
      .reply (.status false false false []), .reply (.status true true true [(p, .handshaking), (⟨78⟩, .syncing), (⟨79⟩, .inSync)])] ]
 
 def vectorsCmd (file : String) (randomCount : Nat := 300) : IO Unit := do
@@ -1678,6 +1864,32 @@ def main (args : List String) : IO UInt32 := do
       | .notify (.peerClosed p r b) => IO.println s!"LOG dev {d} peerClosed {p.val} {repr r} byPeer {b}"
       | .persist t _ => IO.println s!"LOG dev {d} persist {t}"
       | e => if (match e with | .send p _ => decide (p.val ≥ 18) | .fetch p _ => decide (p.val ≥ 18) | _ => false) then IO.println s!"LOG dev {d} {showEff e}" else pure ()
+    -- the life of every blob still missing somewhere
+    let lost : List Hash := (List.range 4).foldl (fun acc d => match w.devs[d]!.m with
+      | .running n => acc ++ n.missing | .uninit => acc) []
+    for h in lost do
+      IO.println s!"missing blob {h.bytes.toList.drop 30}:"
+      for (d, ev) in w.evlog do
+        let hit := match ev with
+          | .blobStored x _ | .blobFailed _ x | .blobLost x | .blobStoreFailed x => x == h
+          | .blobsStored xs => xs.contains h
+          | .localOp (.putMany items) => items.any (·.hash == h)
+          | .localOp (.resolve _ x) => x == h
+          | .retrySave => true
+          | .init .. | .initFresh .. => true
+          | _ => false
+        if hit then
+          let k := match ev with
+            | .retrySave => "retrySave" | .init .. => "init" | .initFresh .. => "initFresh"
+            | .blobStored _ p => s!"blobStored from {p.map (fun (q : PeerId) => q.val)}" | .blobFailed p _ => s!"blobFailed {p.val}"
+            | .blobLost _ => "blobLost" | .blobStoreFailed _ => "blobStoreFailed" | .blobsStored _ => "blobsStored"
+            | _ => "localOp"
+          IO.println s!"  EV dev {d} {k}"
+      for (d, e) in w.log do
+        match e with
+        | .fetch p hs => if hs.contains h then IO.println s!"  EFF dev {d} fetch {p.val}"
+        | .serveBlob p x => if x == h then IO.println s!"  EFF dev {d} serve {p.val}"
+        | _ => pure ()
     for d in [0:4] do
       match w.devs[d]!.m with
       | .running n =>
