@@ -1,7 +1,8 @@
 // Minimal headless-browser driver for the end-to-end tests, on Node built-ins only:
 // Chromium over the Chrome DevTools Protocol, Firefox over WebDriver BiDi (Node's global WebSocket).
 //
-//   const b = await launch('chromium' | 'firefox' | 'firefox-esr', { profile, prefs });
+//   const b = await launch('chromium' | 'firefox' | 'firefox-esr', { profile, prefs, args });
+//     prefs: Firefox user.js prefs; args: extra Chromium command-line flags
 //   const p = await b.newPage(url);          // a tab
 //   await p.eval('expr')                     // evaluates `expr` (awaited), returns JSON-decoded value
 //   await p.reload(); await p.close(); await b.close();  // b.kill() = SIGKILL (crash)
@@ -47,18 +48,18 @@ const unwrapJson = (s) => (s === undefined || s === 'undefined' ? undefined : JS
 // Evaluate `expr`, await it, return JSON.stringify of the result (strings cross both protocols cleanly).
 const wrap = (expr) => `(async () => { const __v = await (${expr}); return __v === undefined ? 'undefined' : JSON.stringify(__v); })()`;
 
-export async function launch(kind, { profile, prefs = {}, keepProfile = false } = {}) {
+export async function launch(kind, { profile, prefs = {}, args = [], keepProfile = false } = {}) {
   const dir = profile ?? tempDir(`e2e-${kind}-`);
   let proc = null;
-  try { return await launchIn(kind, dir, prefs, profile, keepProfile, (p) => { proc = p; }); }
+  try { return await launchIn(kind, dir, prefs, args, profile, keepProfile, (p) => { proc = p; }); }
   catch (e) { if (proc) await killGroup(proc.pid); if (!profile && !keepProfile) removeDir(dir); throw e; }
 }
 
-async function launchIn(kind, dir, prefs, profile, keepProfile, onSpawn) {
+async function launchIn(kind, dir, prefs, args, profile, keepProfile, onSpawn) {
   let proc, send, close;
   if (kind === 'chromium') {
     proc = spawnTracked('chromium', ['--headless=new', '--no-sandbox', `--user-data-dir=${dir}`, '--no-first-run',
-      '--no-default-browser-check', '--remote-debugging-port=0', '--remote-allow-origins=*', 'about:blank'],
+      '--no-default-browser-check', '--remote-debugging-port=0', '--remote-allow-origins=*', ...args, 'about:blank'],
     { stdio: ['ignore', 'pipe', 'pipe'] });
     onSpawn(proc);
     const [, wsUrl] = await waitLine(proc, /DevTools listening on (ws:\/\/\S+)/);
