@@ -10,6 +10,10 @@ import { randomFile, sleep, sha, pair } from './lib.mjs';
 import { parseCode, encodePayload, formatCode, offerTag } from '../../app/js/netcode.mjs';
 
 const CH = 'chromium', FF = 'firefox', ESR = 'firefox-esr';
+// A person copying a reply, switching to the other device and pasting it (docs/net-design.md §6):
+// different networks (simulated: B cannot reach A) and same network. Measured on the same network:
+// 30 s works except with a Chromium inviting and a Firefox joining device (10 and 20 s work, 30 s fails).
+const PASTE_CROSS_MS = 5000, PASTE_LAN_MS = 15000;
 const files = (...fs) => Object.fromEntries(fs.map((f) => [f.name, f.sha]));
 
 /** Open the devices A, B, ...; two devices are paired (A invites, B joins) unless `paired: false`. */
@@ -735,25 +739,6 @@ export const scenarios = [
     },
   },
   {
-    name: 'pair-by-qr-fake-camera',
-    kinds: [[CH, FF], [FF, CH], [CH, CH], [FF, FF]],
-    async run(ctx, kinds) {
-      const [A, B] = await devices(ctx, kinds, { paired: false });
-      // The vendored decoder reads the QR the app draws, exactly (same decoder as the scanning loop).
-      await A.click('#invite');
-      const code = await A.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 20000, 'invitation');
-      const read = await A.eval(`(async () => { const { decodeQR } = await import('./vendor/qr/decode.js'); const c = document.querySelector('#pair-qr');
-        return decodeQR(c.getContext('2d').getImageData(0, 0, c.width, c.height)); })()`);
-      assert.equal(read, code, 'the rendered QR decodes to the code shown');
-      await A.closeDialog();
-      // Both codes go through the app's camera scanning loop (fake camera showing the other screen's QR).
-      await pair(A, B, { via: 'qr' });
-      assert.ok(await A.eval('window.__fakeCamera.starts') >= 1 && await B.eval('window.__fakeCamera.starts') >= 1, 'both scanned');
-      const f = randomFile(`qr-${ctx.id}.txt`, 1000);
-      await A.add([f]); await B.waitFiles(files(f));
-    },
-  },
-  {
     name: 'pairing-codes-rejected',
     kinds: [[CH, FF, CH], [FF, CH, FF]],
     async run(ctx, kinds) {
@@ -804,11 +789,14 @@ export const scenarios = [
     async run(ctx, kinds) {
       // B is given A's invitation with unreachable addresses, so B's own checks fail (as when A is
       // behind a NAT): the connection forms only from A's side, while B's reply attempt is still
-      // alive. A Firefox answerer gives up 11 s after it starts (measured); the reply A reads 12 s
-      // after B joined works only because B renewed it.
+      // alive. A Firefox answerer gives up ~11 s after it starts (measured, docs/net-design.md §1.2);
+      // the reply copied 12 s after B joined works only because B renewed it. Copy must copy the
+      // reply on screen (not the first one), and stop the renewal: the reply stays as copied while
+      // a person switches to the other device and pastes it.
       const [A, B] = await devices(ctx, kinds, { paired: false });
       await A.click('#invite');
-      const offer = await A.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 20000, 'invitation');
+      await A.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 20000, 'invitation');
+      const offer = await A.copyCode();
       await B.click('#join');
       await B.pasteCode(unreachableOffer(offer));
       const first = await B.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 20000, 'first reply');
@@ -817,16 +805,35 @@ export const scenarios = [
       while (Date.now() - t0 < 12000) { seen.add(await B.shownCode()); maxLive = Math.max(maxLive, await B.eval('window.__net.live()')); await sleep(250); }
       assert.ok(seen.size >= 4, `the reply was renewed (${seen.size} different replies in 12 s)`);
       assert.ok(maxLive <= 6, `at most 6 reply attempts alive (${maxLive})`);
-      await A.pasteCode(await retag(await B.shownCode(), offer));
+      const copied = await B.copyCode();
+      assert.notEqual(copied, first, 'Copy copies the renewed reply, not the first one');
+      assert.equal(copied, await B.shownCode(), 'Copy copies the reply on screen');
+      await sleep(PASTE_CROSS_MS);                                // switching to the other device
+      assert.equal(await B.shownCode(), copied, 'no renewal once copied');
+      await A.pasteCode(await retag(copied, offer));
       await A.waitFor(`document.querySelector('#pair-status')?.dataset.state === 'connected' || !document.querySelector('#pair-error').hidden`, 45000, 'A: result');
       const err = await A.pairError();
-      assert.equal(err, null, `pairing with a renewed reply: ${err?.text}`);
+      assert.equal(err, null, `pairing with the copied reply ${PASTE_CROSS_MS} ms after Copy: ${err?.text}`);
       await B.waitFor(`document.querySelector('#pair-status')?.dataset.state === 'connected'`, 20000, 'B connected');
       await sleep(1000);
       assert.equal(await B.eval('window.__net.live()'), 1, 'the other attempts were closed');
       const f = randomFile(`rr-${ctx.id}.txt`, 800);
       await A.add([f]); await B.waitFiles(files(f));
-      ctx.note(`${seen.size} replies in 12 s, at most ${maxLive} attempts alive`);
+      ctx.note(`${seen.size} replies in 12 s, at most ${maxLive} attempts alive; pasted ${PASTE_CROSS_MS} ms after Copy`);
+    },
+  },
+  {
+    name: 'copied-reply-pasted-later',
+    kinds: [[CH, CH], [FF, FF], [CH, FF], [FF, CH]],
+    async run(ctx, kinds) {
+      // Same network (B reaches A): a person copies the reply (after renewals), switches device
+      // and pastes it PASTE_LAN_MS later.
+      const [A, B] = await devices(ctx, kinds, { paired: false });
+      const { first, reply } = await pair(A, B, { replyAfterMs: 6000, pasteAfterMs: PASTE_LAN_MS });
+      assert.notEqual(reply, first, 'a renewed reply was copied');
+      const f = randomFile(`cl-${ctx.id}.txt`, 500);
+      await A.add([f]); await B.waitFiles(files(f));
+      ctx.note(`reply copied after renewals, pasted ${PASTE_LAN_MS} ms later: connected`);
     },
   },
   {
@@ -915,36 +922,23 @@ export const scenarios = [
     async run(ctx, kinds) {
       const [A, B] = await devices(ctx, kinds, { paired: false });
       for (const D of [A, B]) await D.page.setViewport(360, 740);
-      const fit = (D) => D.eval(`(() => { const d = document.querySelector('#pair'), r = d.getBoundingClientRect(), q = document.querySelector('#pair-qr')?.getBoundingClientRect();
+      const fit = (D) => D.eval(`(() => { const d = document.querySelector('#pair'), r = d.getBoundingClientRect();
         const t = document.querySelector('#pair-code')?.getBoundingClientRect();
-        if (!d.open) return { vw: innerWidth, docW: document.documentElement.scrollWidth, left: 0, right: 0, overflow: 0, qr: null, code: null };
-        return { vw: innerWidth, docW: document.documentElement.scrollWidth, left: r.left, right: r.right, overflow: d.scrollWidth - d.clientWidth, qr: q ? Math.round(q.width) : null, code: t ? Math.round(t.right) : null }; })()`);
+        if (!d.open) return { vw: innerWidth, docW: document.documentElement.scrollWidth, left: 0, right: 0, overflow: 0, code: null };
+        return { vw: innerWidth, docW: document.documentElement.scrollWidth, left: r.left, right: r.right, overflow: d.scrollWidth - d.clientWidth, code: t ? Math.round(t.right) : null }; })()`);
       const check = (f, who) => {
         assert.equal(f.vw, 360, `${who}: viewport`);
         assert.ok(f.docW <= 360, `${who}: no horizontal page scroll (${f.docW})`);
         assert.ok(f.left >= 0 && f.right <= 360, `${who}: dialog inside the screen (${f.left}..${f.right})`);
         assert.ok(f.overflow <= 1, `${who}: no horizontal scroll inside the dialog (${f.overflow})`);
-        if (f.qr !== null) assert.ok(f.qr >= 200 && f.qr <= 340, `${who}: QR ${f.qr} px wide`);
         if (f.code !== null) assert.ok(f.code <= 360, `${who}: code box fits`);
       };
       check(await fit(A), 'A main page');
       await A.click('#invite');
       const offer = await A.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 20000, 'invitation');
       check(await fit(A), 'A invitation');
-      // No camera on this device: the dialog says so and offers the text path.
-      await B.eval('(window.__fakeCamera.absent = true)');
-      await B.click('#join');
-      await B.waitFor(`!document.querySelector('#pair-camera-note').hidden`, 10000, 'no-camera note');
-      assert.match(await B.eval(`document.querySelector('#pair-camera-note').textContent`), /No camera/);
-      assert.ok(await B.eval(`document.querySelector('#pair-scan').hidden`), 'no scan button without a camera');
-      await B.closeDialog();
-      // A camera whose permission is refused: a clear message, and the text path still works.
-      await B.eval('(window.__fakeCamera.absent = false, window.__fakeCamera.enabled = true, window.__fakeCamera.deny = true, true)');
-      await B.click('#join');
-      await B.waitFor(`!document.querySelector('#pair-scan').hidden`, 10000, 'scan button');
-      await B.click('#pair-scan');
-      await B.waitFor(`!document.querySelector('#pair-camera-note').hidden`, 10000, 'camera refused note');
-      assert.match(await B.eval(`document.querySelector('#pair-camera-note').textContent`), /Camera access was refused/);
+      await B.click('#join'); await B.closeDialog();               // closed and opened again at once:
+      await B.click('#join');                                       // the late close event must not end the new dialog
       await B.pasteCode(offer);
       const reply = await B.waitFor(`document.querySelector('#pair-code')?.dataset.code`, 20000, 'reply')
         .catch(async (e) => { throw new Error(`${e.message}\ndialog: ${await B.eval('document.querySelector("#pair").innerText.slice(0, 600)')}`); });

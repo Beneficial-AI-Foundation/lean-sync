@@ -76,13 +76,48 @@ test('the reply is renewed while shown; at most MAX_ATTEMPTS stay alive; an olde
   assert.equal(new Set(codes).size, codes.length, 'each reply is a new one');
   const answerers = () => w.pcs.filter((p) => p.remoteDescription?.type === 'offer' && !p.closedHere);
   assert.ok(answerers().length <= 3, `${answerers().length} live attempts (max 3)`);
-  const older = codes.at(-2);                                    // scanned just before a renewal
+  const older = codes.at(-2);                                    // copied just before a renewal
   await inv.accept(older);
   await resp.done;
   await until(() => answerers().length === 1, 1000, 'other attempts closed');
   await until(() => A.live().length === 1 && B.live().length === 1);
   const n = codes.length; await sleep(150);
   assert.equal(codes.length, n, 'no renewal after connecting');
+});
+
+test('a copied reply (keep) stops renewal and stays alive; if it fails, renewal resumes with a new reply', async () => {
+  const w = fakeRTC(), A = device(w, 'A'), B = device(w, 'B');
+  const inv = await A.t.invite();
+  const resp = B.t.respond(inv.code), codes = [];
+  resp.onCode((c) => codes.push(c));
+  await until(() => codes.length >= 2, 2000, 'a renewed reply');
+  resp.keep();
+  const copied = resp.code, n = codes.length;
+  await sleep(FAST.RENEW_MS * (FAST.MAX_ATTEMPTS + 3));
+  assert.equal(codes.length, n, 'no renewal once copied');
+  assert.equal(resp.code, copied);
+  // the copied attempt's connection fails (as a browser's ICE agent gives up): a new reply comes
+  const kept = w.pcs.filter((p) => p.remoteDescription?.type === 'offer' && !p.closedHere).at(-1);
+  kept._state('failed');
+  await until(() => codes.length > n + 1, 2000, 'renewal resumed');
+  assert.notEqual(resp.code, copied);
+  await assert.rejects(inv.accept(copied), /could not connect/);
+  resp.cancel();
+});
+
+test('stop() cancels a reply in progress: no renewal afterwards', async () => {
+  const w = fakeRTC(), A = device(w, 'A'), B = device(w, 'B');
+  const inv = await A.t.invite();
+  const resp = B.t.respond(inv.code), codes = [];
+  resp.onCode((c) => codes.push(c));
+  await until(() => codes.length >= 1, 1000, 'reply');
+  B.t.stop();
+  assert.equal(resp.state, 'cancelled');
+  const n = codes.length, pcs = w.pcs.length;
+  await sleep(FAST.RENEW_MS * 4);
+  assert.equal(codes.length, n, 'no reply after stop');
+  assert.equal(w.pcs.length, pcs, 'no connection made after stop');
+  inv.cancel();
 });
 
 test('a reply that nobody accepts: renewal stops after RESPOND_MS with a message', async () => {

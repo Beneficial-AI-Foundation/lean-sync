@@ -4,9 +4,11 @@
 //   transport.start({ onLink(link), onStatus(text) })    transport.setOnline(bool)    transport.stop()
 //   link: { id, remoteLabel, send(frame) → bool, close(), bufferedAmount,
 //           onFrame(cb(frame)), onClose(cb()), onDrain(cb()) }
-// plus pairing (manual signalling: the codes travel through the user, by QR or text):
+// plus pairing (manual signalling: the codes travel through the user, as text):
 //   invite() → Invitation { code, expiresAt, state, noSrflx, accept(replyText) → Promise, cancel() }
-//   respond(inviteText) → Response { code, state, noSrflx, onCode(cb), done: Promise, cancel() }
+//   respond(inviteText) → Response { code, state, noSrflx, onCode(cb), done: Promise, keep(), cancel() }
+//     keep(): the user copied the current reply: stop renewing and keep that attempt; if it fails
+//     (the browser's ICE agent gives up), renewal resumes and onCode reports a new reply.
 //   connections() → [{ id, role, state, since, linkId }]    disconnect(id)    onChange(cb)
 //
 // One pairing = one RTCPeerConnection ("connection") with
@@ -26,7 +28,7 @@
 import { extractSdp, selectCandidates, rebuildSdp, encodePayload, formatCode, parseCode, offerTag, sameBytes, CodeError } from '../netcode.mjs';
 
 export const T = {
-  RENEW_MS: 2500,            // a reply is renewed this often while shown (measured: a Firefox answerer
+  RENEW_MS: 2500,            // a reply is renewed this often while shown and not yet copied (measured: a Firefox answerer
                              // gives up 5 s after it starts if it cannot reach the offerer's candidates)
   MAX_ATTEMPTS: 6,           // live reply attempts kept (the newest shown)
   RESPOND_MS: 120000,        // the joining device stops making replies after this
@@ -45,6 +47,7 @@ export function createWebRTCTransport({ getIceServers = () => [], log = () => {}
   let nextLink = 1, nextConn = 1;
   const conns = new Map();            // id -> connection (paired; attempts and open invitations are not listed)
   const pending = new Set();          // connections of open invitations and reply attempts
+  const responses = new Set();        // replies still being made or waiting
   const changeListeners = new Set();
   const changed = () => { for (const f of changeListeners) { try { f(); } catch {} } };
   const status = (s) => handlers?.onStatus?.(s);
@@ -245,24 +248,36 @@ export function createWebRTCTransport({ getIceServers = () => [], log = () => {}
     if (stopped) throw new Error('transport stopped');
     const r = parseCode(text, 'offer');                     // throws CodeError before anything starts
     const listeners = new Set(), attempts = [];
-    let renew = null, giveUp = null, resolveDone, rejectDone;
+    let renew = null, giveUp = null, resolveDone, rejectDone, current = null, kept = null;
     const resp = {
       code: null, noSrflx: false, state: 'preparing', attempts: 0,
       onCode(cb) { listeners.add(cb); if (resp.code) cb(resp.code); return () => listeners.delete(cb); },
       done: new Promise((res, rej) => { resolveDone = res; rejectDone = rej; }),
+      keep() {
+        if (resp.state !== 'waiting' || !current || current.dropped || kept) return;
+        const k = kept = current;
+        clearInterval(renew); renew = null;
+        log(`reply ${attempts.indexOf(k) + 1} copied: renewal stopped`);
+        k.onDown.push(() => {
+          if (kept !== k || resp.state !== 'waiting') return;
+          log('the copied reply failed: renewal resumes');
+          kept = null; attempt(); renew = setInterval(attempt, t.RENEW_MS);
+        });
+      },
       cancel() { finish('cancelled'); },
     };
+    responses.add(resp);
     resp.done.catch(() => {});
     const finish = (state, winner = null) => {
       if (resp.state === 'connected' || resp.state === 'failed' || resp.state === 'cancelled') return;
-      resp.state = state; clearInterval(renew); clearTimeout(giveUp);
+      resp.state = state; clearInterval(renew); clearTimeout(giveUp); responses.delete(resp);
       for (const a of attempts) if (a !== winner) dropConn(a, state === 'connected' ? 'another reply was used' : `reply ${state}`);
       if (winner) resolveDone({ connId: winner.id });
       else rejectDone(new Error(state === 'failed' ? 'The other device did not answer. Start again on the device that made the invitation.' : 'cancelled'));
     };
     let tag = null;
     const attempt = async () => {
-      if (resp.state !== 'preparing' && resp.state !== 'waiting') return;
+      if ((resp.state !== 'preparing' && resp.state !== 'waiting') || kept) return;
       const c = makeConn('answerer');
       pending.add(c); attempts.push(c);
       // keep at most MAX_ATTEMPTS replies alive: the oldest are dropped
@@ -283,7 +298,9 @@ export function createWebRTCTransport({ getIceServers = () => [], log = () => {}
         await c.pc.setLocalDescription({ type: 'answer', sdp: ans.sdp.replace(/a=setup:(active|actpass)/g, 'a=setup:passive') });
         await gather(c.pc);
         if (c.dropped || (resp.state !== 'preparing' && resp.state !== 'waiting')) return;
+        if (kept) { dropConn(c, 'not needed: a reply was copied'); return; }
         const d = describe(c.pc, 'answer', tag);
+        current = c;
         resp.code = d.code; resp.noSrflx = d.noSrflx; resp.attempts = attempts.length;
         if (resp.state === 'preparing') resp.state = 'waiting';
         for (const f of listeners) { try { f(d.code); } catch (e) { log(`reply display failed: ${e.message}`); } }
@@ -314,6 +331,7 @@ export function createWebRTCTransport({ getIceServers = () => [], log = () => {}
     start(h) { handlers = h; stopped = false; },
     stop() {
       stopped = true;
+      for (const r of [...responses]) r.cancel();
       for (const c of [...conns.values(), ...pending]) dropConn(c, 'stopped');
     },
     setOnline,

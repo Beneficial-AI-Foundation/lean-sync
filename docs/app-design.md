@@ -60,8 +60,7 @@ app/                         the shipped static site (scripts/build-site.sh copi
   js/hash.mjs                WebCrypto SHA-256
   js/transport/webrtc.mjs    the transport: WebRTC data channels between paired devices (interface in its header)
   js/netcode.mjs             pairing codes: base32 text, CRC-32, SDP extract/rebuild (pure)
-  js/pairing-ui.mjs          Devices panel, pairing dialog, QR drawing and camera scanning, STUN setting
-  vendor/qr/                 `qr` 0.7.2 (Paul Miller, MIT OR Apache-2.0), encoder + decoder, unmodified (README there)
+  js/pairing-ui.mjs          Devices panel, pairing dialog (text codes, Copy, paste), STUN setting
   lean/lean_sync.{mjs,wasm}  (in build/site only) the engine
 dev/serve.mjs                dev/test only: a static server (optional base path); 127.0.0.1 only
 test/unit/                   node --test: codec vs Lean vectors, links, core (real engine), view
@@ -145,7 +144,7 @@ never reach the new machine (its tags restart at 0).
 ## 4. Host obligations
 
 Audited by mutation (`node test/mutations.mjs`): for each row the mechanism was removed or broken
-in the app's source and the named test was run (e2e in Chromium, or Chromium and Firefox where the row's test needs Firefox); **82 of 82 mutants are caught** on the final commit of the WebRTC stage (run reported in its hand-back). A check that runs no test counts as not caught.
+in the app's source and the named test was run (e2e in Chromium, or Chromium and Firefox where the row's test needs Firefox); the table has **81 mutants**. The last full run (82 of 82 caught) was on the final commit of the WebRTC stage and predates the removal of QR pairing: its two camera/QR mutants are gone and one was added (`copy-first-reply`, not yet run in an audit). A check that runs no test counts as not caught.
 "Mutant" names the break that was tried.
 
 | Obligation (sync-design §8, decision 7) | Mechanism | Test (fails when the mechanism is broken) | Mutant |
@@ -179,13 +178,13 @@ in the app's source and the named test was run (e2e in Chromium, or Chromium and
 | A failing `send` closes the link | exception → close | unit `webrtc` | exception swallowed |
 | Back-pressure never waits for an event that already fired | `onDrain` fires at once if the buffer is already below the threshold | unit `webrtc` | check removed |
 | Answerer is the DTLS server | the reply is edited to `a=setup:passive` before `setLocalDescription` | unit `webrtc` (the answering device's own description); e2e `pair-by-text` (with Firefox in the pairing; C+C tolerates two DTLS clients) | default role (unit, e2e) |
-| A reply stays usable while shown | reply attempts renewed every 2.5 s, at most 6 alive, the others closed on success | unit `webrtc`; e2e `reply-renewal` (B cannot reach A first; A reads the current reply 12 s after B joined; Firefox answerer) | no renewal (unit, e2e with Firefox); unbounded attempts |
+| A reply stays usable while shown | reply attempts renewed every 2.5 s until copied, at most 6 alive, the others closed on success; Copy copies the reply on screen, stops renewal and keeps that attempt (renewal resumes if it fails) | unit `webrtc`; e2e `reply-renewal` (B cannot reach A first; B's Copy 12 s after B joined copies the current reply, pasted 5 s later; Firefox answerer), `copied-reply-pasted-later` | no renewal (unit, e2e with Firefox); unbounded attempts; Copy copies the first reply |
 | Codes are checked before use | prefix, version, kind, base32, structure, CRC-32, offer tag | unit `netcode` (every prefix and every single-character change rejected); e2e `pairing-codes-rejected` | CRC skipped; tag unchecked |
 | An invitation accepts one reply | state per invitation | unit `webrtc`; e2e `pairing-codes-rejected` | second reply accepted (unit, e2e) |
 | Gathering never blocks for long | code finished on gathering complete, first srflx + 300 ms, or 2 s | e2e `stun-settings` (unreachable STUN: invitation within 6 s; Chromium alone takes ~40 s) | cap removed |
 | Engine restart and "offline" keep the pairing | a closed link is reopened on the live connection (back-off 0.5 s → 30 s); offline closes links, not connections, and tells the other device over the control channel | e2e `trap-mid-sync-reinstantiates`, `offline-edits-both-sides` (same connection ids after offline/online); unit `webrtc` | connection dropped on a link close / on offline |
 | Closing the page tells the other devices | `pagehide` closes every connection | e2e `peer-killed-files-recover` (tab closed: dropped in < 5 s) | handler removed |
-| Pairing UI: camera refused or absent → text path with a message; the scanning loop reads the camera | messages per error; the video is muted by property | e2e `pairing-ui-phone-viewport` (360 px wide), `pair-by-qr-fake-camera` | message hidden; video not muted; a late `close` event ends the next dialog |
+| Pairing UI: a closed dialog never acts on a newer one | the dialog's `close` handler ignores a late event while the dialog is open; a pending `accept` checks the session's closed flag | e2e `pairing-ui-phone-viewport` (360 px wide; Join closed and reopened at once) | a late `close` event ends the next dialog |
 | A storage failure on receive stops the transfer | the first failed write rejects; no more credit; `blobStoreFailed` + ABORT; the temp file is removed (also after a failed publish, and when a write still pending at END fails) | unit `links`; e2e `incoming-write-or-publish-failure` (each attempt of a 12 MiB transfer stops after ~1 MiB) | write errors swallowed (storage or links); temp kept |
 | Bounded reassembly | a continuation fragment must be exactly 16 KiB (our framing), so fragments are bounded by the message limit | unit `links` | size unchecked |
 | Paths round-trip byte for byte | `TextDecoder(fatal, ignoreBOM)`; vectors include a leading U+FEFF | unit `codec` | BOM stripped |
@@ -346,9 +345,9 @@ private network namespace with a dummy interface (`docs/net-design.md` §10).
 | `repeated-edits-heap-bound` | Chromium 154; Firefox 146 |
 | `file-size-limit-and-folder-drop` | Chromium 154; Firefox 146 |
 | `pair-by-text` | C+C; F+F; C+F; F+C; ESR+C; C+ESR; ESR+F (C = Chromium 154, F = Firefox 146, ESR = Firefox ESR 140) |
-| `pair-by-qr-fake-camera` | C+F; F+C; C+C; F+F |
 | `pairing-codes-rejected` | C+F+C; F+C+F |
 | `reply-renewal` | C+F; F+F; F+C; C+C |
+| `copied-reply-pasted-later` | C+C; F+F; C+F; F+C |
 | `peer-killed-files-recover` | C+C; F+F; C+F; F+C |
 | `three-devices-pairwise` | C+F+C; F+C+F |
 | `stun-settings` | C; F |

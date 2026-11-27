@@ -49,10 +49,10 @@ any query reply.
 
 **C-shim change, for the host task.** Do not apply it here, since `wasm/` is not touched.
 Checked against the C that Lean 4.36 generates (`.lake/build/ir/LeanSync/Envelope.c`):
-- **Declarations.** Declare `lean_object *initialize_lean_x2dcrdt_LeanSync_Envelope(uint8_t builtin);`
+- **Declarations.** Declare `lean_object *initialize_lean_x2dsync_LeanSync_Envelope(uint8_t builtin);`
   and `lean_object *lean_sync_process(lean_object *input);`. The second takes **one** argument (no
   world token) and returns an **IO result**.
-- **`lw_init`.** Call `initialize_lean_x2dcrdt_LeanSync_Envelope(1)` instead of the demo's
+- **`lw_init`.** Call `initialize_lean_x2dsync_LeanSync_Envelope(1)` instead of the demo's
   initializer.
   - Its import closure is `Init`, `LeanCrdt.{Types,SortedList,VersionVector,State}` and
     `LeanSync.{Types,Bytes,Wire,Sets,Step,EffectsWire,Envelope}`. It imports no `Std`, and none of the

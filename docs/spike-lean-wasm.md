@@ -143,7 +143,7 @@ None of them affects the Lean/wasm build itself, but a harness pass is less stro
   startup: 30–50 ms in Node and Chromium, single-digit ms in Firefox. It is also most of the 1.6 MB. Importing
   narrower modules is the lever for both. The shim must call `lean_initialize_runtime_module()` first and
   `lean_io_mark_end_initialization()` last.
-- **Package name leaks into symbols.** The exported init function is `initialize_lean_x2dcrdt_WasmDemo`, derived
+- **Package name leaks into symbols.** The exported init function is `initialize_lean_x2dsync_WasmDemo` (`..._x2dcrdt_...` when the package was named lean-crdt), derived
   from the Lake package name. `@[export]` names (`lean_wasm_demo_process`) are stable.
 - **Exceptions.** The runtime is C++ and uses exceptions internally, so the build uses `-fwasm-exceptions`
   (legacy EH by default in Emscripten 6.0.5).

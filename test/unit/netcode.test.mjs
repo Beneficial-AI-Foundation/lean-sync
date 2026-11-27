@@ -28,7 +28,7 @@ test('real SDPs from Chromium and Firefox: code round trip, sizes, rebuilt SDP k
     const x = extractSdp(s.sdp);
     assert.ok(x.ufrag && x.pwd && x.fp && x.mid !== null && x.cands.length >= 1, s.name);
     const code = codeOf(s);
-    assert.match(code, /^LS[NR]1[0-9A-HJKMNP-TV-Z]+$/, 'QR alphanumeric characters only');
+    assert.match(code, /^LS[NR]1[0-9A-HJKMNP-TV-Z]+$/, 'upper-case letters and digits only');
     assert.ok(code.length <= 210, `${s.name}: ${code.length} characters`);
     const r = parseCode(code, s.kind);
     assert.equal(r.ufrag, x.ufrag); assert.equal(r.pwd, x.pwd); assert.equal(r.fp, x.fp.toUpperCase());

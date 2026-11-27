@@ -1,4 +1,4 @@
-# lean-crdt
+# lean-sync
 
 A file-sync app for one user's devices: the sync logic is a CRDT and a pure step-function protocol
 written and proved in Lean 4 (`LeanCrdt/`, `LeanSync/`), compiled to WebAssembly (wasm64) and run
@@ -22,7 +22,7 @@ scripts/build-site.sh        # app/ + engine -> build/site/
 ```
 
 **Serve** `build/site/` with any static web server, over HTTPS in real use (the app needs a secure
-context: OPFS, Web Locks, camera). It works from any path; `.mjs` must be served as JavaScript.
+context: OPFS, Web Locks, clipboard). It works from any path; `.mjs` must be served as JavaScript.
 For development, `dev/serve.mjs` is a minimal static server on 127.0.0.1 (`http://127.0.0.1` is a
 secure context):
 
@@ -38,8 +38,9 @@ firefox --no-remote --profile "$(mktemp -d)" 'http://127.0.0.1:8000/?device=phon
 ```
 
 **Pair them** (docs/net-design.md): on one device choose *Invite a device*; on the other *Join a
-device* and scan the invitation's QR code with the camera, or paste its text; then let the first
-device scan (or paste) the reply. Devices connect directly over WebRTC; nothing goes through a
+device* and paste the invitation's text (copy it with *Copy*, send it any way you like); the
+second device then shows a reply: press *Copy* (the reply stops changing) and paste it on the
+first device within a few seconds. Devices connect directly over WebRTC; nothing goes through a
 server except the STUN query (default `stun:stun.l.google.com:19302`, editable under *Connection
 settings*, may be empty). Pairing lasts while both pages stay open: after a reload, pair again.
 Add files with the button or by dropping them; untick "online" to edit offline (the pairing is

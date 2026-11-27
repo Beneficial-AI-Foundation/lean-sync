@@ -1,7 +1,7 @@
-# lean-crdt: overview and demo guide
+# lean-sync: overview and demo guide
 
 Status on 2026-11-25: the CRDT, the sync protocol and the browser app are on `main`. Peer-to-peer
-networking (WebRTC with QR pairing) is on the branch `webrtc-transport`, not yet merged or
+networking (WebRTC, paired by copying text codes) is on the branch `webrtc-transport`, not yet merged or
 reviewed. This guide describes that branch.
 
 ## What it is
@@ -71,14 +71,17 @@ firefox --no-remote --profile "$(mktemp -d)" 'http://127.0.0.1:8000/?device=phon
 
 ### Pair them
 
-1. On the first device choose **Invite a device**. It shows a QR code and the same code as text.
-2. On the second device choose **Join a device**. Scan the QR code, or paste the text.
-3. The second device now shows a reply code. Scan or paste it on the first device.
+1. On the first device choose **Invite a device**. It shows an invitation code as text. Press
+   **Copy** and get the text to the second device (on one machine, just switch windows; between
+   machines, any message, note or e-mail to yourself).
+2. On the second device choose **Join a device** and paste the invitation.
+3. The second device now shows a reply code, which changes every few seconds until you copy it.
+   Press **Copy** (the reply then stays as it is) and paste it on the first device without delay.
 4. Both say "Connected".
 
-On one machine, pasting is the practical route. If only one device has a camera, start the
-invitation on the device that has it: the invitation can be sent as text, and the reply is then
-the code that gets scanned.
+The invitation does not age (it is valid for 10 minutes). The reply does: see the limitations
+below. If the copied reply expires before it is used, the second device says so and shows a new
+one to copy.
 
 ### Try it
 
@@ -141,11 +144,12 @@ three standard ones.
 | `node test/mutations.mjs` | Breaks each host rule in turn and checks that a test fails |
 
 The end-to-end scenarios drive the real UI in separate browser profiles, including mixed
-Chromium–Firefox pairs. They cover pairing by text and by QR with a fake camera, rejected codes,
+Chromium–Firefox pairs. They cover pairing with the Copy button and the paste field (also a reply pasted 15 s after
+it was copied), reply renewal, rejected codes,
 conflicts, deletes, storage failures, a killed peer, offline and online, three devices, and large
 and empty files.
 
-Not tested: real phones, real cameras, real home routers and mobile networks, sleeping or
+Not tested: real phones, real home routers and mobile networks, sleeping or
 backgrounded phones.
 
 ## Known limitations
@@ -161,8 +165,11 @@ backgrounded phones.
 **Pairing and networking**
 
 - Pairing is manual and is needed again after every reload, crash or sleep.
-- Across different networks the reply code goes stale in about 10 seconds, so it renews itself
-  while shown and should be scanned, not typed.
+- The reply code must be pasted soon after it is copied: copy, switch window, paste. Measured on
+  one machine: pasted 15–20 s after Copy works in every browser pair; at 30 s it fails when a
+  Chromium device invites and a Firefox device joins (start again). Across different networks a
+  reply made by Firefox is good for only about 10 seconds after it was made (tested: pasted 5 s
+  after Copy); if the copied reply expires, the joining device shows a new one to copy.
 - There is no relay server. Devices behind some restrictive networks cannot connect at all.
 - The default STUN server is Google's; it sees each device's IP address. The list can be emptied
   for same-network use.

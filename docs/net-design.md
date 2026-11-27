@@ -1,23 +1,25 @@
 # Peer-to-peer transport (WebRTC data channels): design, measurements, and what was built
 
 Branch `webrtc-transport`. **Stage 1** (probe and design, §1 and the first version of §2–§13) and
-**stage 2** (built: `app/js/transport/webrtc.mjs`, `app/js/netcode.mjs`, `app/js/pairing-ui.mjs`,
-`app/vendor/qr/`; the relay is gone). §2–§11 now describe what was built; each deviation from the
+**stage 2** (built: `app/js/transport/webrtc.mjs`, `app/js/netcode.mjs`, `app/js/pairing-ui.mjs`;
+the relay is gone). **Later change: pairing is by text only.** QR codes and camera scanning were
+built in stage 2 and then removed (with the vendored `qr` library and their tests); §1 still
+reports the QR measurements of the probe, as history. §2–§11 now describe what was built; each deviation from the
 stage-1 design is marked **Deviation** with its reason, and every number is marked measured or
 designed. `LeanCrdt/` and `LeanSync/` are unchanged. Companion notes: `docs/app-design.md` (host,
 links, tests, host-obligations table §4), `docs/sync-design.md` §8 (host obligations).
 
 Decisions taken by the user, and the constraints this note works within:
-- **Manual signalling at every connection, no server of ours.** Device A shows an offer as a QR
-  code; device B scans it and shows an answer QR; A scans that. A copy-paste text code is the
-  fallback when there is no camera. Automatic reconnect (pair once, rendezvous, device keys) comes
+- **Manual signalling at every connection, no server of ours.** Device A shows an offer as a text
+  code; the user copies it to device B, which shows an answer code; the user copies that back to
+  A. (Stage 1 planned QR codes with text as the fallback; QR was later dropped.) Automatic reconnect (pair once, rendezvous, device keys) comes
   later: the signalling is an interface so that it can be added (§3), and it is not built.
 - **A public STUN server**, default Google's, configurable, and the app must work with none. No TURN.
 - Trust model unchanged: all devices are the user's; robust to corruption and disconnects, not to
   malicious peers. The manual code exchange is the authentication (the codes carry the DTLS
   fingerprints).
 - **The app is served as static files over HTTPS** by an ordinary web server (§8). Every device is
-  a secure context, so the camera is available wherever a camera exists. No hosting setup,
+  a secure context (needed for OPFS, Web Locks and the clipboard). No hosting setup,
   certificates or service worker in this project for now; this stage is built and tested between
   browsers on one machine.
 
@@ -98,6 +100,8 @@ Consequences for the design (§5, §6): the answerer's code is **live** — B ma
 every ~5 s and shows the newest, so the QR that A scans is at most ~5 s old plus the scan time;
 the slow manual leg (paste, send-to-self) should carry the **offer**, which does not age (A's
 connection waited 300 s without harm); the fast leg (QR scan) should carry the answer.
+(As built, both legs are text: the reply stops renewing when copied, §6, and its limit is the
+answerer's ICE timeout above.)
 
 ### 1.3 Data channel limits and back-pressure
 
@@ -257,7 +261,7 @@ would carry the same strings; it would also need persistent certificates (§1.7)
 
 **Text:** `LSN1` (invitation) or `LSR1` (reply) + the payload in Crockford base32 (digits and
 capitals without I, L, O, U). Reading ignores case, spaces, line breaks and `-`, and reads O as 0
-and I/L as 1 in the payload. The QR holds the text in alphanumeric mode. Shown in groups of four.
+and I/L as 1 in the payload. Shown in groups of four.
 **Deviation:** prefix `LSN1`/`LSR1` instead of `LS1O`/`LS1A` (the letter O in a prefix would
 collide with the O→0 rule).
 
@@ -283,15 +287,17 @@ its dialog is closed, the page reloads, after the first accepted reply, or after
 second reply is refused ("already used"); a reply made for another invitation is refused ("belongs
 to another invitation"). B keeps renewing its reply for **2 minutes**, then says "The other device
 did not answer. Start again on the device that made the invitation." **Deviation:** 2 min instead
-of 30 s: B cannot tell a void invitation from one not yet scanned.
+of 30 s: B cannot tell a void invitation from one not yet used.
 
 ## 5. Connection lifecycle (as built)
 
 ```
 A invite()                                   B respond(invitation)
-  pc + ctl; offer; gather (≤ 2 s)              every 2.5 s while waiting (≤ 6 alive, oldest closed; 2 min max):
+  pc + ctl; offer; gather (≤ 2 s)              every 2.5 s while waiting and not copied (≤ 6 alive, oldest closed; 2 min max):
   show the invitation                            pc + ctl; offer rebuilt; answer with a=setup:passive;
                                                  gather (≤ 2 s); show the newest reply
+                                               Copy: renewal stops, that attempt is kept; if it fails
+                                                 (ICE gives up), renewal resumes with a new reply
   accept(reply): checks; rebuild; setRemote  → ICE, DTLS (A client), SCTP → ctl open on both
   30 s without ctl open → "could not connect"   the attempt whose ctl opens wins; the others are closed
 A opens the sync channel → link on both sides → links.mjs HELLO → Lean `connected p`
@@ -307,30 +313,37 @@ A **Devices** panel (connected devices with their label and state — connected,
 reconnecting…, paired (you are offline / the other device is offline) — and *Disconnect*),
 *Invite a device*, *Join a device*, the *online* box, and *Connection settings* (STUN list).
 The pairing dialog:
-- **Invite:** the invitation QR, its text with *Copy* (and *Share…* where available), "valid for
-  one device, until HH:MM", a STUN warning if a STUN server was configured but unreachable; then
-  "read the reply": *Scan the reply with the camera* and a paste field.
-- **Join:** *Scan the invitation* / paste; then the reply QR and text, renewed every 2.5 s, with
-  "Sending it as text instead? Paste it on the first device right away: when the devices are on
-  different networks a reply is good for only about 10 seconds."; the no-camera rule ("If one of
-  your two devices has no camera, start the invitation on the device that has one") is stated on
-  the Join screen.
-- **Camera:** no `videoinput` → "No camera found on this device: paste the code instead." and no
-  scan button; permission refused → "Camera access was refused: paste the code instead."; other
-  errors named. The scanning loop draws the video into a canvas (≤ 640 px wide) every 200 ms and
-  decodes it with the vendored `qr` decoder.
+- **Invite:** the invitation text with *Copy*, "valid for one device, until HH:MM", a STUN
+  warning if a STUN server was configured but unreachable; then "paste the reply" (a paste field).
+- **Join:** a paste field for the invitation; then the reply text with *Copy*. The reply is renewed
+  every 2.5 s **until it is copied** (*Copy*, or a copy from the text box). **Copy copies the
+  reply on screen** at the moment it is pressed. Once copied, the reply stays as it is and its
+  attempt is kept (no renewal, not evicted), so a person can switch to the other device and paste
+  it; if that attempt fails (the answerer's ICE agent gives up: Firefox ~11 s after the reply was
+  made when it cannot reach A, §1.2), renewal resumes and the dialog says "The copied reply expired
+  before it was used. Copy this new one." **Measured (e2e, one machine, network
+  namespace):** same network, a reply copied after renewals and pasted **30 s** later connects
+  with C+C, F+F and F+C (inviting + joining device); with a Chromium inviting device and a Firefox
+  joining device it connects at 10 s and 20 s and **fails at 30 s and 60 s** (also with a single
+  attempt alive; A reports "connection failed" at once when it applies the reply; cause not
+  identified, B's connection stays `connecting`, so B does not renew). The scenario
+  `copied-reply-pasted-later` pastes 15 s after Copy in all four pairings. Simulated different
+  networks (B cannot reach A): pasted **5 s** after Copy connects in all four pairings
+  (`reply-renewal`). So copy, switch window and paste (a few seconds) works; a reply left for half
+  a minute may not. The renewal period stays 2.5 s so that the reply on screen is fresh
+  when it is copied.
 - **Results:** "Connecting…", "Connected. You can close this window." (the dialog stays open until
   the user closes it: **Deviation**, so that a mistaken second reply still gets its message), the
   connection-failure help of stage 1 §6, and a message when a connection ends ("…ended (lost, or
   closed by the other device). Pair again to reconnect.").
 - **Phone size (measured, e2e `pairing-ui-phone-viewport` at 360×740):** no horizontal scroll of
-  the page or the dialog, dialog inside the screen, QR 200–340 px wide, code box inside.
+  the page or the dialog, dialog inside the screen, code box inside.
 
-Two browser behaviours found while building (both fixed in the app, both caught by tests): a
-`<video>` made by script must be muted by **property** (the attribute does not mute it, `play()`
-is then refused and the frame stays frozen: the camera never scanned); a dialog's `close` event
-is queued, and in Chromium a late one arrived after the next dialog had opened and cancelled its
-reply (the handler now ignores it while the dialog is open).
+A browser behaviour found while building (fixed in the app, caught by a test): a dialog's `close`
+event is queued, and in Chromium a late one arrived after the next dialog had opened and cancelled
+its reply (the handler now ignores it while the dialog is open). Likewise a closed invitation
+dialog's pending `accept` never updates a newer dialog (both completion paths check the session's
+closed flag), and `transport.stop()` cancels replies in progress (no renewal after it).
 
 ## 7. STUN configuration (as built)
 
@@ -374,15 +387,15 @@ address, else it stops with an explanation. Devices launch with mDNS off (Chromi
 pref) except in `pair-with-browser-defaults`.
 
 **Pairing in tests** goes through the real UI: `pair(A, B)` in `test/e2e/lib.mjs` clicks *Invite* and
-*Join*, pastes the codes into the paste fields, or shows each side's QR (the canvas, as an image)
-to the other side's fake camera (init script `CAMERA`: `enumerateDevices` and `getUserMedia`
-replaced by a canvas stream; also "absent" and "refused" modes).
+*Join*, presses *Copy* and pastes what it copied into the other device's paste field (init script
+`CLIPBOARD` records what the app hands to `navigator.clipboard.writeText`).
 
-**Scenarios added:** `pair-by-text` (C+C, F+F, C+F, F+C, E+C, C+E, E+F), `pair-by-qr-fake-camera`
-(C+F, F+C, C+C, F+F; also decodes the drawn QR directly), `pairing-codes-rejected` (C+F+C, F+C+F:
+**Scenarios added:** `pair-by-text` (C+C, F+F, C+F, F+C, E+C, C+E, E+F), `pairing-codes-rejected` (C+F+C, F+C+F:
 foreign, truncated, one character changed, wrong version, wrong kind both ways, stale, reused),
-`reply-renewal` (C+F, F+F, F+C, C+C: B given unreachable candidates, reply read 12 s after B
-joined; measured 5 replies in 12 s, at most 5 attempts alive), `peer-killed-files-recover` (C+C,
+`reply-renewal` (C+F, F+F, F+C, C+C: B given unreachable candidates, reply copied 12 s after B
+joined, checked to be the one on screen and not the first, pasted 5 s later; measured 5 replies
+in 12 s, at most 5 attempts alive), `copied-reply-pasted-later` (C+C, F+F, C+F, F+C: pasted 15 s
+after Copy), `peer-killed-files-recover` (C+C,
 F+F, C+F, F+C), `three-devices-pairwise` (C+F+C, F+C+F), `stun-settings` (C, F),
 `pairing-ui-phone-viewport` (C+F, F+C), `runs-from-sub-path` (C+F), `pair-with-browser-defaults`
 (C+C, F+F, C+F, F+C), `no-network-except-paired-devices` (C+F, F+C; replaces
@@ -390,14 +403,16 @@ F+F, C+F, F+C), `three-devices-pairwise` (C+F+C, F+C+F), `stun-settings` (C, F),
 relay room; a page reload or a killed browser is followed by pairing again; `three-device-chain`
 pairs A–B and B–C only. None had to be dropped.
 
-**Unit:** `netcode` (7 tests, real SDP fixtures of both browsers) and `webrtc` (13 tests, the
+**Unit:** `netcode` (7 tests, real SDP fixtures of both browsers) and `webrtc` (15 tests, including
+`keep()` after Copy and `stop()` cancelling a reply; the
 transport against an in-memory fake `RTCPeerConnection` that keeps a vanished peer's channel open
 as Chromium does).
 
-**Not testable automatically here:** real cameras and screens (glare, distance, focus); phones
+**Not testable automatically here:** phones
 (Chrome on Android, Firefox on Android; Safari is unsupported: Memory64); real NATs and networks
 (the cross-NAT case is simulated by unreachable candidates); Google's STUN; mDNS between
-separate machines; background tabs and sleeping phones; `navigator.share` and the clipboard.
+separate machines; background tabs and sleeping phones; the real system clipboard (the tests
+record what Copy hands to it).
 
 ## 11. Host obligations
 
@@ -408,10 +423,8 @@ The rows are in `docs/app-design.md` §4, each with its mechanism, test and muta
 
 1. A reload, crash or sleep means pairing again; nothing about pairings is persisted.
 2. Codes as base32 text.
-3. `qr` (Paul Miller) vendored unmodified (`app/vendor/qr/`, README with version, source, integrity
-   and file hashes), no `BarcodeDetector` path; its round trip is tested in Chromium and Firefox
-   through the app's scanning loop (`pair-by-qr-fake-camera`).
-4. The reply renews itself while shown (2.5 s, §1.9); no-camera rule and text-path warning shown.
+3. (Later) Pairing by text only: QR codes, camera scanning and the vendored `qr` library removed.
+4. The reply renews itself while shown (2.5 s, §1.9) until it is copied; then it is kept.
 5. Going offline closes links and keeps connections.
 6. No heartbeat; loss from the connection state (and the channel treated as dead).
 7. Relay removed; faults injected by init scripts; `dev/serve.mjs` a static server.
@@ -421,17 +434,17 @@ The rows are in `docs/app-design.md` §4, each with its mechanism, test and muta
 
 Serve `build/site/` over HTTPS from any static host; open it on the desktop (Chrome or Firefox) and
 on the phone (Chrome or Firefox for Android; Safari is unsupported, it lacks WebAssembly Memory64).
-1. **QR, desktop invites:** desktop *Invite*, phone *Join* → *Scan*, then the desktop scans the
-   phone's reply with its webcam. Both say "Connected"; add a file on each side; both lists show
-   both files complete.
-2. **QR, phone invites:** the same with roles swapped.
-3. **Desktop without camera** (or camera permission refused): invite on the phone; send the
-   invitation text to the desktop (mail/chat to yourself), paste it in *Join*; the phone scans the
-   desktop's reply. Check the "No camera found" / "Camera access was refused" messages.
-4. **Text both ways:** copy the reply and paste it on the other device at once (expect success);
-   on different networks, also wait 30 s before pasting (expect the "Could not connect" help: the
-   documented limit, §1.2).
-5. **Different networks:** phone on mobile data, desktop on Wi-Fi, default STUN; pair by QR.
+1. **Desktop invites:** desktop *Invite* → *Copy*, send the text to the phone (mail/chat to
+   yourself), phone *Join* → paste; phone *Copy* on the reply, send it back, paste on the desktop.
+   Both say "Connected"; add a file on each side; both lists show both files complete. Note how
+   long the reply took from Copy to paste.
+2. **Phone invites:** the same with roles swapped.
+3. **Slow reply:** on the same Wi-Fi wait 30 s between Copy and paste (expect success); on
+   different networks, wait 30 s (expect "Could not connect" on the inviting device, and "The
+   copied reply expired" with a new reply on the joining device when it is Firefox: §1.2).
+4. **Clipboard refused:** if *Copy* says "Select the text and copy it", copy by hand; the reply
+   must stop changing as soon as it is copied.
+5. **Different networks:** phone on mobile data, desktop on Wi-Fi, default STUN; pair.
    Record whether it connects (it cannot when both sides are behind symmetric NATs: no TURN).
 6. **Same Wi-Fi, STUN list emptied on both:** pair; expect a connection over the LAN (mDNS names).
 7. **Sleep and background:** lock the phone or switch apps for 1–2 minutes during a transfer; on
@@ -439,6 +452,6 @@ on the phone (Chrome or Firefox for Android; Safari is unsupported, it lacks Web
    transfer completes.
 8. **Closing:** close the desktop tab; the phone lists the connection as ended within a second.
 9. **Offline toggle:** untick and tick *online* on the phone; the devices re-link without pairing.
-10. **Phone UI:** portrait and landscape; the dialog fits, buttons are reachable, the QR scans from
-    20–40 cm, the code text can be copied.
+10. **Phone UI:** portrait and landscape; the dialog fits, buttons are reachable, the code text
+    can be copied and pasted.
 11. **Volume:** a 100 MB file phone ↔ desktop over Wi-Fi; note the time and that it completes.

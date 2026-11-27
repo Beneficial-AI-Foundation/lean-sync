@@ -1,9 +1,9 @@
-// Pairing codes (docs/net-design.md §4): what one device shows and the other scans or pastes.
+// Pairing codes (docs/net-design.md §4): what one device shows and the other pastes.
 // Pure functions, no DOM and no WebRTC (unit-tested in Node).
 //
 // Text form: 'LS' + kind ('N' invitation = offer, 'R' reply = answer) + format version ('1') +
-// the payload in Crockford base32. Upper-case letters and digits only, so a QR code holds it in
-// alphanumeric mode. The reader ignores case, spaces, line breaks and '-', and reads O as 0 and
+// the payload in Crockford base32. Upper-case letters and digits only (easy to read back and
+// to type). The reader ignores case, spaces, line breaks and '-', and reads O as 0 and
 // I/L as 1 in the payload.
 //
 // Payload (version 1):
@@ -29,9 +29,9 @@ export class CodeError extends Error {
 const MSG = {
   notCode: 'This is not a LeanSync pairing code.',
   version: 'This code was made by a different version of the app. Use the same version on both devices.',
-  wantOffer: 'This is a reply code, not an invitation. On this device, paste or scan the invitation shown by the other device.',
-  wantAnswer: 'This is an invitation code, not a reply. Paste or scan the reply that the other device shows after it joined.',
-  damaged: 'This code is incomplete or mistyped. Copy it again in full, or scan it.',
+  wantOffer: 'This is a reply code, not an invitation. On this device, paste the invitation shown by the other device.',
+  wantAnswer: 'This is an invitation code, not a reply. Paste the reply that the other device shows after it joined.',
+  damaged: 'This code is incomplete or mistyped. Copy it again in full.',
 };
 
 // ------------------------------------------------------------------ base32 (Crockford) and CRC-32
@@ -195,13 +195,13 @@ export const formatCode = (kind, payload) => `${PREFIX[kind]}${FORMAT_VERSION}${
 /** For display: groups of four characters. */
 export const groupCode = (code) => code.match(/.{1,4}/g).join(' ');
 /**
- * Read a code typed, pasted or scanned. `expect`: 'offer' or 'answer'. Returns the decoded fields
+ * Read a code typed or pasted. `expect`: 'offer' or 'answer'. Returns the decoded fields
  * plus `payload` (the bytes, for the offer tag). Throws CodeError with a message for the user.
  */
 export function parseCode(text, expect) {
   if (typeof text !== 'string' || text.length > MAX_TEXT) throw new CodeError('damaged', MSG.damaged);
   const t = text.replace(/[\s-]/g, '').toUpperCase();
-  if (!t) throw new CodeError('empty', 'Paste or scan a code first.');
+  if (!t) throw new CodeError('empty', 'Paste a code first.');
   if (!/^LS[NR]/.test(t)) throw new CodeError('notCode', MSG.notCode);
   const kind = t[2] === 'N' ? 'offer' : 'answer';
   if (t.length < 4) throw new CodeError('damaged', MSG.damaged);
