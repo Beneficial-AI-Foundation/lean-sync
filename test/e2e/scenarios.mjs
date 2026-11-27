@@ -364,6 +364,7 @@ export const scenarios = [
   {
     name: 'conflict-keep-one-and-keep-both',
     kinds: [[CH, CH], [FF, FF], [CH, FF]],
+    quick: [FF, FF],                // the one run of the default (smoke) set
     async run(ctx, kinds) {
       const [A, B] = await devices(ctx, kinds);
       await setOnline(A, false); await setOnline(B, false);
@@ -393,6 +394,7 @@ export const scenarios = [
   {
     name: 'edit-vs-delete',
     kinds: [[CH, CH], [FF, FF], [FF, CH]],
+    quick: [CH, CH],                // the one run of the default (smoke) set
     async run(ctx, kinds) {
       const [A, B] = await devices(ctx, kinds);
       const x = randomFile(`x-${ctx.id}.txt`, 1000);
@@ -535,6 +537,7 @@ export const scenarios = [
   {
     name: 'reload-and-kill-mid-session',
     kinds: [[CH, CH], [FF, FF], [CH, FF]],
+    quick: [CH, CH],                // the one run of the default (smoke) set
     async run(ctx, kinds) {
       const [A, B] = await devices(ctx, kinds);
       await waitPeers(A, 1);
@@ -724,6 +727,7 @@ export const scenarios = [
   {
     name: 'pair-by-text',
     kinds: [[CH, CH], [FF, FF], [CH, FF], [FF, CH], [ESR, CH], [CH, ESR], [ESR, FF]],
+    quick: [CH, FF],                // the one run of the default (smoke) set
     async run(ctx, kinds) {
       const [A, B] = await devices(ctx, kinds, { paired: false });
       const { offer, reply } = await pair(A, B);
@@ -741,6 +745,7 @@ export const scenarios = [
   {
     name: 'pairing-codes-rejected',
     kinds: [[CH, FF, CH], [FF, CH, FF]],
+    quick: [FF, CH, FF],                // the one run of the default (smoke) set
     async run(ctx, kinds) {
       const [A, B, C] = await devices(ctx, kinds);
       const tryCode = async (D, text, reason, re) => {
@@ -786,6 +791,7 @@ export const scenarios = [
   {
     name: 'reply-renewal',
     kinds: [[CH, FF], [FF, FF], [FF, CH], [CH, CH]],
+    quick: [CH, FF],                // the one run of the default (smoke) set
     async run(ctx, kinds) {
       // B is given A's invitation with unreachable addresses, so B's own checks fail (as when A is
       // behind a NAT): the connection forms only from A's side, while B's reply attempt is still

@@ -139,11 +139,11 @@ three standard ones.
 |---|---|
 | `scripts/test-crdt.sh` | CRDT unit tests and random simulation, natively |
 | `scripts/test-sync.sh` | Protocol tests and a multi-device simulator with random disconnects and storage failures |
-| `scripts/wasm/check-engine.sh` | The wasm engine gives byte-identical output to the native one over about 80,000 recorded events; memory leak check; 20,000-file scale run |
-| `scripts/test-app.sh` | JS unit tests, the JS codec against vectors produced by Lean, and end-to-end scenarios in headless Chromium and Firefox |
-| `node test/mutations.mjs` | Breaks each host rule in turn and checks that a test fails |
+| `scripts/test-app.sh` | Quick smoke (about 2 minutes): JS unit tests, the JS codec against vectors produced by Lean, a Node smoke of the wasm engine, and six end-to-end scenarios (pair by text, Copy after reply renewal, a rejected code, conflict, edit vs delete, reload and pair again), one browser pair each |
+| `scripts/test-app.sh --full` (optional) | Also: the wasm engine byte-identical to the native one over about 80,000 recorded events, memory leak check, 20,000-file scale run, and every end-to-end scenario in every browser pair |
+| `node test/mutations.mjs` (optional) | Breaks each host rule in turn and checks that a test fails |
 
-The end-to-end scenarios drive the real UI in separate browser profiles, including mixed
+The full set of end-to-end scenarios drive the real UI in separate browser profiles, including mixed
 Chromium–Firefox pairs. They cover pairing with the Copy button and the paste field (also a reply pasted 15 s after
 it was copied), reply renewal, rejected codes,
 conflicts, deletes, storage failures, a killed peer, offline and online, three devices, and large

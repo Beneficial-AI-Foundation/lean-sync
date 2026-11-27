@@ -1,3 +1,8 @@
+# Disclaimer
+
+This is an AI generated experiment, not reviewed by any human.
+It is just for demostration and should not be used for anything else in its current form.
+
 # lean-sync
 
 A file-sync app for one user's devices: the sync logic is a CRDT and a pure step-function protocol
@@ -52,12 +57,14 @@ kept). A second tab of the same profile shows "open in another tab" and does not
 scripts/check-proofs.sh      # no sorry/axiom/..., axioms of the headline theorems
 scripts/test-crdt.sh         # CRDT tests (native)
 scripts/test-sync.sh         # protocol tests (native)
-scripts/wasm/check-engine.sh # wasm engine: Node smoke, native-vs-wasm replay, leak check and its
-                             # negative control, 20k-file scale, browser smoke
-scripts/test-app.sh          # the app: codec vs Lean vectors, unit tests, engine checks,
-                             # end-to-end scenarios in headless Chromium and Firefox (run in a
-                             # private network namespace: needs unprivileged user namespaces, or a
-                             # network interface; see test/e2e/run.mjs)
-node test/e2e/run.mjs --only storage-failure --browsers chromium   # one scenario, one browser
-node test/mutations.mjs      # breaks each host obligation in turn; its test must fail
+scripts/test-app.sh          # quick smoke (~2 min): unit tests, codec vs Lean vectors, a Node
+                             # smoke of the wasm engine, 6 end-to-end scenarios, one browser pair
+                             # each (headless Chromium/Firefox in a private network namespace:
+                             # needs unprivileged user namespaces, or a network interface)
 ```
+
+Optional, longer: `scripts/test-app.sh --full` (all engine checks: native-vs-wasm replay, leak
+check, 20k-file scale, browser smoke; and every e2e scenario in every browser pair, i.e.
+`node test/e2e/run.mjs --all`); `node test/e2e/run.mjs --only storage-failure --browsers chromium`
+(one scenario); `node test/mutations.mjs` (mutation audit: breaks each host obligation in turn, its
+test must fail).

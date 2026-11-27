@@ -1,5 +1,8 @@
 // Run the end-to-end scenarios in headless browsers (needs scripts/build-site.sh first).
-//   node test/e2e/run.mjs [--only name,name] [--browsers chromium,firefox,firefox-esr] [--list] [--host-network]
+//   node test/e2e/run.mjs [--all | --only name,name] [--browsers chromium,firefox,firefox-esr] [--list] [--host-network]
+// Default: the smoke set, i.e. the scenarios that name a `quick` browser combination, each run once
+// in that combination. --all: every scenario in every combination. --only: the named scenarios in
+// every combination.
 // Starts the static dev server (127.0.0.1, random port) and stops it at the end. Prints, per
 // scenario and configuration, the browsers and versions used and the result.
 //
@@ -40,13 +43,15 @@ const { cleanupAll, reportCleanup } = await import('../proc.mjs');
 
 const opt = (n) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : null; };
 const only = opt('--only')?.split(',');
+const all = args.includes('--all');
 const allowed = new Set((opt('--browsers') ?? 'chromium,firefox,firefox-esr').split(',').filter(hasBrowser));
 const TIMEOUT = Number(opt('--timeout') ?? 300000);
 
 const todo = [];
 for (const s of scenarios) {
   if (only && !only.includes(s.name)) continue;
-  for (const kinds of s.kinds) if (kinds.every((k) => allowed.has(k))) todo.push({ s, kinds });
+  if (!only && !all && !s.quick) continue;
+  for (const kinds of (only || all ? s.kinds : [s.quick])) if (kinds.every((k) => allowed.has(k))) todo.push({ s, kinds });
 }
 if (args.includes('--list')) { for (const t of todo) console.log(t.s.name, t.kinds.join('+')); process.exit(0); }
 if (only && !todo.length) { console.error(`no run matches --only ${only.join(',')} with browsers ${[...allowed].join(',')}`); process.exit(3); }   // 3: nothing ran (not a pass, not a failure)
